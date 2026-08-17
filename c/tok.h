@@ -532,7 +532,23 @@ static void pretok_chunk_kimi(Tok *T, const unsigned char *p, int a, int b, int 
     free(cp); free(off);
 }
 
-/* ---------- encode: testo -> id (split sugli added token, poi pretok+BPE) ---------- */
+/* nucleo BPE condiviso: pretokenizza p[i,end) SENZA cercare added token.
+ * E' il corpo di ogni chunk di tok_encode ed il canale diretto di
+ * tok_encode_raw. */
+static void tok_bpe_span(Tok *T, const unsigned char *p, int i, int end,
+                         int *out, int *no, int max){
+    if(T->kimi)       pretok_chunk_kimi(T,p,i,end,out,no,max);
+    else if(T->o200k) pretok_chunk_o200k(T,p,i,end,out,no,max);
+    else              pretok_chunk(T,p,i,end,out,no,max);
+}
+
+/* ---------- encode: testo -> id (split sugli added token, poi pretok+BPE) ----------
+ * SEC (#8): questo encode riconosce gli added token OVUNQUE nei byte, inclusi
+ * i token di controllo ("special":true). E' il comportamento giusto per testo
+ * FIDATO -- template di chat, prompt da CLI -- e quello sbagliato per
+ * contenuto dell'utente: un messaggio che contiene "<|system|>" diventerebbe
+ * un vero marcatore di ruolo. Il contenuto non fidato passa da
+ * tok_encode_raw qui sotto. */
 static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
     const unsigned char *p=(const unsigned char*)text; int no=0; int i=0;
     while(i<len){
@@ -545,15 +561,22 @@ static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
             }
         }
         int chunk_end = (hitpos<0) ? len : hitpos;
-        if(chunk_end>i){
-            if(T->kimi)       pretok_chunk_kimi(T,p,i,chunk_end,out,&no,max);
-            else if(T->o200k) pretok_chunk_o200k(T,p,i,chunk_end,out,&no,max);
-            else              pretok_chunk(T,p,i,chunk_end,out,&no,max);
-        }
+        if(chunk_end>i) tok_bpe_span(T,p,i,chunk_end,out,&no,max);
         if(hitpos<0) break;
         if(no<max) out[no++]=hitid;
         i=hitpos+hitlen;
     }
+    return no;
+}
+
+/* SEC (#8): encode per contenuto NON FIDATO. Nessun added token viene mai
+ * riconosciuto: ogni byte passa dal pre-tokenizzatore + BPE byte-level, cosi'
+ * "<|system|>" dentro un messaggio utente resta testo letterale (decodifica
+ * agli stessi byte) invece di diventare un token di controllo. I costruttori
+ * di template emettono i marcatori strutturali per id e il contenuto da qui. */
+static int tok_encode_raw(Tok *T, const char *text, int len, int *out, int max){
+    int no=0;
+    if(len>0) tok_bpe_span(T,(const unsigned char*)text,0,len,out,&no,max);
     return no;
 }
 
