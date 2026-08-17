@@ -683,6 +683,7 @@ void coli_v4_engine_attach_session(ColiV4Engine *engine);
 void coli_v4_engine_detach_session(ColiV4Engine *engine);
 
 #include "tok.h"
+#include "guard_wire.h"
 #include "kv_prefix.h"
 
 struct ColiV4Session {

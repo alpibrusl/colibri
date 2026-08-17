@@ -7209,6 +7209,7 @@ int coli_v4_prompt_build(char **output, size_t *output_length,
 #include "json.h"
 #include "native_quant.h"
 #include "tok.h"
+#include "guard_wire.h"
 
 static int load_embedding(float *state, const ColiSafetensorsIndex *index,
                           const ColiDeepSeekV4Config *config, int token) {
@@ -8296,8 +8297,11 @@ int coli_v4_session_generate(ColiV4Session *session,
     if (max_new > session->max_new_tokens_cap)
         max_new = session->max_new_tokens_cap;
     int prompt_capacity = session->max_prompt_tokens + 16;
-    int prompt_count = tok_encode(&session->tokenizer, prompt, prompt_length,
-                                  session->prompt_ids, prompt_capacity);
+    int prompt_count = tok_encode_guarded(&session->tokenizer, prompt,
+                                          (int)prompt_length,
+                                          options->guard_spans,
+                                          options->guard_nspans,
+                                          session->prompt_ids, prompt_capacity);
     if (prompt_count < 1 || prompt_count > session->max_prompt_tokens) {
         if (error && error_size)
             snprintf(error, error_size,
@@ -9016,9 +9020,17 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         fprintf(stderr, "[V4] top_p %.3g ignored; target engine is greedy\n",
                 request->top_p);
 
-    int prompt_count = tok_encode(&session->tokenizer, request->prompt,
-                                  request->prompt_bytes, session->prompt_ids,
-                                  session->max_prompt_tokens + 16);
+    /* SEC (#8): CGUARD1 payloads carry the gateway's untrusted-content byte
+     * ranges; a malformed guard table is refused, never downgraded to an
+     * unguarded encode. Legacy flat payloads pass through unchanged. */
+    const char *gtx; int gtl, gns, *gsp;
+    if (gw_parse(request->prompt, request->prompt_bytes, &gtx, &gtl, &gsp, &gns) < 0) {
+        v4_serve_error(request->id, "bad guard table");
+        return;
+    }
+    int prompt_count = tok_encode_guarded(&session->tokenizer, gtx, gtl,
+                                          gsp, gns, session->prompt_ids,
+                                          session->max_prompt_tokens + 16);
     int context = engine->runtime.context_tokens;
     if (prompt_count < 1 || prompt_count > session->max_prompt_tokens ||
         prompt_count + 1 > context) {
@@ -9038,6 +9050,7 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         snprintf(message, sizeof(message), "CONTEXT_EXCEEDED %d %d",
                  prompt_count, prompt_capacity);
         v4_serve_error(request->id, message);
+        free(gsp);
         return;
     }
     /* max_tokens is a CEILING, not a target (#260/#382): generation ends at
@@ -9068,13 +9081,16 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
     char error[512] = {0};
     double started = spec_now();
     int result = coli_v4_session_generate(
-        session, request->prompt, (size_t)request->prompt_bytes,
+        session, gtx, (size_t)gtl,
         &(ColiV4SessionGenerateOptions){
             .max_new_tokens = request->max_tokens,
             .stop_at_sentence = 0,
             .no_dspark = 0,
+            .guard_spans = gsp,
+            .guard_nspans = gns,
         },
         v4_serve_token, &stream, &stats, error, sizeof(error));
+    free(gsp);
     double elapsed = spec_now() - started;
     if (result) {
         v4_serve_error(request->id, error);

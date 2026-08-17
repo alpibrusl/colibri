@@ -123,6 +123,12 @@ typedef struct {
     int max_new_tokens;      /* required; clamped by session cap */
     int stop_at_sentence;
     int no_dspark;           /* disable speculative draft/verification */
+    /* SEC (#8): byte ranges of `prompt` that are untrusted content --
+     * added-token matches starting inside them are suppressed at encode
+     * time (tok_encode_guarded). NULL/0 = whole prompt trusted (the
+     * historical behavior). Pairs [2i]=start, [2i+1]=end, sorted. */
+    const int *guard_spans;
+    int guard_nspans;
 } ColiV4SessionGenerateOptions;
 
 typedef struct {

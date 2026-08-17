@@ -550,12 +550,39 @@ static void tok_bpe_span(Tok *T, const unsigned char *p, int i, int end,
  * contenuto dell'utente: un messaggio che contiene "<|system|>" diventerebbe
  * un vero marcatore di ruolo. Il contenuto non fidato passa da
  * tok_encode_raw qui sotto. */
-static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
+static int tok_encode(Tok *T, const char *text, int len, int *out, int max);
+
+/* SEC (#8): come tok_encode, ma un match di added token che INIZIA dentro uno
+ * degli intervalli [spans[2i], spans[2i+1]) viene soppresso: quei byte restano
+ * testo letterale (pretok+BPE), mentre i marcatori del template -- fuori dagli
+ * intervalli -- tokenizzano normalmente. La tokenizzazione resta un passaggio
+ * UNICO sull'intera stringa, quindi per contenuto benigno (nessun added token
+ * dentro gli intervalli) gli id sono IDENTICI a tok_encode: i merge BPE a
+ * cavallo del confine template/contenuto non cambiano. E' la proprieta' che
+ * un build per frammenti separati non puo' dare.
+ * Intervalli: ordinati, non sovrapposti, dentro [0,len]. Tabella malformata o
+ * OOM => 0 (il chiamante lo tratta come prompt vuoto e rifiuta rumorosamente:
+ * mai degradare a un encode non protetto). nspans==0 == tok_encode. */
+static int tok_encode_guarded(Tok *T, const char *text, int len,
+                              const int *spans, int nspans, int *out, int max){
     const unsigned char *p=(const unsigned char*)text; int no=0; int i=0;
+    unsigned char *g=NULL;
+    if(nspans>0){
+        int prev=0;
+        g=(unsigned char*)calloc(len?(size_t)len:1,1);
+        if(!g){ fprintf(stderr,"tok_encode_guarded: OOM guard mask\n"); return 0; }
+        for(int si=0;si<nspans;si++){
+            int a=spans[2*si], b=spans[2*si+1];
+            if(a<prev||b<a||b>len){ free(g);
+                fprintf(stderr,"tok_encode_guarded: malformed span table\n"); return 0; }
+            memset(g+a,1,(size_t)(b-a)); prev=b;
+        }
+    }
     while(i<len){
-        /* prossima occorrenza di un added-token a partire da >= i (match piu' lungo) */
+        /* prossima occorrenza NON SOPPRESSA di un added-token da >= i */
         int hitpos=-1, hitlen=0, hitid=-1;
         for(int j=i;j<len && hitpos<0;j++){
+            if(g && g[j]) continue;
             for(int k=0;k<T->nsp;k++){
                 int sl=T->sp[k].len;
                 if(sl>0 && j+sl<=len && !memcmp(p+j,T->sp[k].str,sl)){ hitpos=j; hitlen=sl; hitid=T->sp[k].id; break; }
@@ -567,7 +594,12 @@ static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
         if(no<max) out[no++]=hitid;
         i=hitpos+hitlen;
     }
+    free(g);
     return no;
+}
+
+static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
+    return tok_encode_guarded(T,text,len,NULL,0,out,max);
 }
 
 /* SEC (#8): encode per contenuto NON FIDATO. Nessun added token viene mai

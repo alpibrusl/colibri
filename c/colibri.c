@@ -57,6 +57,7 @@
 #include "uring.h"
 #endif
 #include "tok.h"
+#include "guard_wire.h"
 #include "tier.h"
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
 #include "abl.h"                                   /* per-expert causal-ablation harness — inert unless g_abl.mode set (ABLATE_SCORE=<manifest>) */
@@ -7367,7 +7368,18 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
      * mid-markup and emitted a bare "<". Retries were identical because the surviving *head*
      * never changes when a client appends to the end (hence "prefill 0" on every retry).
      * Refuse loudly instead; the gateway turns this into a 400 context_length_exceeded. */
-    int nt=tok_encode(T,raw,(int)sub.bytes,tmp,maxctx-1);
+    /* SEC (#8): CGUARD1 payloads carry the byte ranges the gateway spliced
+     * untrusted content into; added-token matches starting inside them are
+     * suppressed, so a chat message containing "<|system|>"/"<|user|>" text
+     * cannot become a real role marker. Legacy flat payloads (standalone
+     * wire clients) keep the historical behavior; a malformed guard table
+     * is refused, never downgraded to an unguarded encode. */
+    const char *gtx; int gtl, gns, *gsp;
+    int gwrc=gw_parse(raw,(int)sub.bytes,&gtx,&gtl,&gsp,&gns);
+    if(gwrc<0){ free(raw); free(line); free(tmp);
+        printf("ERROR %llu BAD_GUARD_TABLE\n",sub.id); fflush(stdout); return 0; }
+    int nt=tok_encode_guarded(T,gtx,gtl,gsp,gns,tmp,maxctx-1);
+    free(gsp);
     free(raw); free(line);
     if(nt<1){ free(tmp); printf("ERROR %llu EMPTY_PROMPT\n",sub.id); fflush(stdout); return 0; }
     if(nt>maxctx-2){
