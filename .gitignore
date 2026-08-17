@@ -60,6 +60,7 @@ c/tests/fuzz_*
 !c/tests/fuzz_*.cu
 !c/tests/fuzz_*.mm
 !c/tests/fuzz_*.py
+!c/tests/fuzz_*.h
 result
 c/tests/test_cap_precedence
 c/tests/test_cap_precedence.exe

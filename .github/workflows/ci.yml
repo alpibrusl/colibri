@@ -78,6 +78,28 @@ jobs:
         # Already sanitized and already asserting byte identity across every
         # compiled decode arm; it just had no job to run in.
         run: make -C c fuzz-rans
+      - name: Parser fuzz (json + grammar + safetensors header)
+        # The three untrusted-input parsers fuzz-rans never covered: json.h
+        # (safetensors headers + tokenizer.json/config from model mirrors),
+        # grammar.h (the client-supplied GBNF the server accepts), and st.h's
+        # header parse. Structured mutants in exactly-sized buffers so a read
+        # past a parsed string's end is an ASan report, not silent slack.
+        run: make -C c fuzz-parsers
+
+  # ThreadSanitizer over the lock-free concurrency the engine is built on.
+  # ASan+UBSan (above) are blind to data races; TSan is the tool for the
+  # pilot ring, eslot leases, and loader pools -- the code whose correctness
+  # the audit found rests on convention rather than structure. Built without
+  # -fopenmp (GCC libtsan doesn't model libgomp, so an OpenMP build reports
+  # the runtime's own barriers as races); the tests drive the lock-free
+  # primitives with their own pthreads and never enter an omp region.
+  tsan:
+    name: ThreadSanitizer (concurrency)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Concurrent tests under TSan
+        run: make -C c test-tsan
 
   # The Vulkan backend, COMPILED AND RUN. Before this job, `grep -rn "VK=1\|glslc\|vulkan"
   # .github/workflows/` returned nothing: backend_vulkan.c and the four GLSL shaders were

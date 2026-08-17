@@ -858,6 +858,33 @@ fuzz-rans: tests/fuzz_rans.c rans.h
 	  tests/fuzz_rans.c -o tests/fuzz_rans -lm
 	./tests/fuzz_rans
 
+# Structured-mutation fuzz for the three untrusted-input parsers the rANS
+# harness never covered: json.h (safetensors headers + tokenizer.json /
+# config from model mirrors), grammar.h (the client-supplied GBNF string
+# the server accepts), and st.h's safetensors header parse. Same shape as
+# fuzz-rans -- ASan+UBSan, non-recoverable, seeded and bounded, mutants in
+# exactly-sized buffers via tests/fuzz_mut.h -- and, like fuzz-rans, NOT a
+# TEST_BINS gate because the sanitizer flags differ from the normal build.
+#   make fuzz-parsers   (runs all three)
+FUZZ_CFLAGS = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+  -Wall -Wextra -Wno-unused-parameter -Wno-unused-function
+FUZZ_ENV = ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+
+fuzz-json: tests/fuzz_json.c tests/fuzz_mut.h json.h
+	$(CC) $(FUZZ_CFLAGS) tests/fuzz_json.c -o tests/fuzz_json -lm
+	@$(FUZZ_ENV) ./tests/fuzz_json
+
+fuzz-grammar: tests/fuzz_grammar.c tests/fuzz_mut.h grammar.h
+	$(CC) $(FUZZ_CFLAGS) tests/fuzz_grammar.c -o tests/fuzz_grammar -lm
+	@$(FUZZ_ENV) ./tests/fuzz_grammar
+
+fuzz-st-header: tests/fuzz_st_header.c tests/fuzz_mut.h st.h json.h
+	$(CC) $(FUZZ_CFLAGS) tests/fuzz_st_header.c -o tests/fuzz_st_header -lm
+	@$(FUZZ_ENV) ./tests/fuzz_st_header
+
+fuzz-parsers: fuzz-json fuzz-grammar fuzz-st-header
+	@echo "fuzz-parsers: json + grammar + safetensors-header parsers clean under ASan + UBSan"
+
 tests/test_int3$(EXE): tests/test_int3.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -1072,6 +1099,36 @@ test-asan:
 	@$(ASAN_ENV) $(MAKE) test-c EXTRA_CFLAGS="$(ASAN_CFLAGS)" EXTRA_LDFLAGS="$(ASAN_LDFLAGS)"
 	@echo "test-asan: suite clean under ASan + UBSan"
 
+# --- ThreadSanitizer ----------------------------------------------------
+# The engine's differentiator is a concurrent tiered cache built on
+# hand-rolled lock-free structures (the pilot ring, eslot acquire/release,
+# the loader pools). ASan+UBSan above catch memory and UB but are blind to
+# data races -- so this target runs the genuinely-multithreaded tests under
+# TSan, starting with the SPMC pilot-ring claim (test_pilot_ring: 8 workers
+# draining one producer, every item claimed exactly once).
+#
+# Built WITHOUT -fopenmp on purpose: GCC's libtsan does not model libgomp's
+# synchronisation, so an OpenMP build reports the runtime's own barriers as
+# races and buries any real finding. These tests drive the lock-free
+# primitives with their own pthreads and never enter an omp parallel region,
+# so the pragmas are correctly compiled out (-Wno-unknown-pragmas) with no
+# loss of coverage. As the tier cache is extracted from the monolith
+# (fork plan phase 2), its race-prone paths join TSAN_TESTS here.
+#
+# -O1 + frame pointers: TSan, like ASan, needs readable stacks.
+TSAN_CFLAGS  = -O1 -g -fno-omit-frame-pointer -fsanitize=thread -Wno-unknown-pragmas
+TSAN_ENV     = TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1
+TSAN_TESTS   = tests/test_pilot_ring.c
+
+test-tsan:
+	@for t in $(TSAN_TESTS); do \
+	  echo "  tsan: $$t"; \
+	  b=$${t%.c}.tsan; \
+	  $(CC) $(TSAN_CFLAGS) -pthread $$t -o $$b -lm || exit 1; \
+	  $(TSAN_ENV) ./$$b || exit 1; \
+	done
+	@echo "test-tsan: concurrent tests clean under ThreadSanitizer"
+
 # Local validation: one portable CPU build and dependency-free tests.
 check:
 	$(MAKE) clean
@@ -1117,6 +1174,8 @@ bench: iobench$(EXE)
 # Own line: see the TEST_RULES note above on shared .PHONY lines.
 .PHONY: bench-omp-grain
 .PHONY: test-asan
+.PHONY: test-tsan
+.PHONY: fuzz-json fuzz-grammar fuzz-st-header fuzz-parsers
 
 tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 	$(CC) $(CFLAGS) tests/test_kv_prefix.c -o tests/test_kv_prefix$(EXE) $(LDFLAGS)
