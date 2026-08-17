@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 #include "json.h"
 #include "fse_coli.h"
 
@@ -33,10 +34,30 @@ static int cmp_off(const void *x,const void *y){
 
 static char *read_file(const char *path, size_t *n){
     FILE *f=fopen(path,"rb"); if(!f){perror(path);exit(1);}
-    fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
+    if(fseek(f,0,SEEK_END)!=0){perror(path);exit(1);}
+    long sz=ftell(f);
+    if(sz<0){perror(path);exit(1);}
+    if(fseek(f,0,SEEK_SET)!=0){perror(path);exit(1);}
     char *b=xmalloc((size_t)sz);
     if(fread(b,1,(size_t)sz,f)!=(size_t)sz){perror("fread");exit(1);}
     fclose(f); *n=(size_t)sz; return b;
+}
+
+/* data_offsets di un header NON FIDATO: entrambi J_NUM, finiti, interi,
+ * 0 <= a <= b <= payload (i byte del file dopo l'header). Senza questi check
+ * il cast double->int64 e' UB su NaN/inf/>=2^63 (stessa regola degli shape in
+ * st.h), un b<a fa avvolgere rn=b-a a un size_t enorme, e un offset oltre EOF
+ * indicizza fuori dal buffer del file (in+ds+a / ob+ods+a). */
+static int off_pair_ok(const jval *off, size_t payload, int64_t *a_out, int64_t *b_out){
+    const jval *ja=off->kids[0], *jb=off->kids[1];
+    if(!ja||ja->t!=J_NUM||!jb||jb->t!=J_NUM) return 0;
+    double da=ja->num, db=jb->num;
+    if(!isfinite(da)||!isfinite(db)||da<0.0||db<0.0) return 0;
+    if(da>=ldexp(1.0,63)||db>=ldexp(1.0,63)) return 0;
+    if(floor(da)!=da||floor(db)!=db) return 0;
+    int64_t a=(int64_t)da, b=(int64_t)db;
+    if(b<a||(uint64_t)b>(uint64_t)payload) return 0;
+    *a_out=a; *b_out=b; return 1;
 }
 
 static int parse_shard(char *buf, size_t n, jval **root_out, char **arena_out,
@@ -54,7 +75,8 @@ static int parse_shard(char *buf, size_t n, jval **root_out, char **arena_out,
         jval *dt=json_get(m,"dtype"), *off=json_get(m,"data_offsets"), *shp=json_get(m,"shape");
         if(!dt||dt->t!=J_STR||!off||off->t!=J_ARR||off->len<2||!shp||shp->t!=J_ARR) return -1;
         ents[ne].name=root->keys[i]; ents[ne].dtype=dt->str; ents[ne].shape=shp;
-        ents[ne].a=(int64_t)off->kids[0]->num; ents[ne].b=(int64_t)off->kids[1]->num; ne++;
+        if(!off_pair_ok(off, n-(8+(size_t)hlen), &ents[ne].a, &ents[ne].b)) return -1;
+        ne++;
     }
     qsort(ents,(size_t)ne,sizeof(TEnt),cmp_off);
     *root_out=root; *arena_out=arena; *ents_out=ents; *nents_out=ne; *data_start_out=8+hlen;
@@ -70,7 +92,13 @@ static void emit_json_shape(FILE *o, jval *shp){
 
 static int do_cert(const char *inp){
     FILE *f=fopen(inp,"rb"); if(!f){perror(inp);return 1;}
+    if(fseek(f,0,SEEK_END)!=0){perror(inp);return 1;}
+    long fsz=ftell(f);
+    if(fsz<8){fprintf(stderr,"%s: troppo piccolo\n",inp);return 1;}
+    if(fseek(f,0,SEEK_SET)!=0){perror(inp);return 1;}
     uint64_t hlen; if(fread(&hlen,8,1,f)!=1){fprintf(stderr,"%s: header\n",inp);return 1;}
+    if(hlen>(uint64_t)fsz-8){fprintf(stderr,"%s: header length %llu oltre EOF (%ld byte)\n",
+        inp,(unsigned long long)hlen,fsz);return 1;}
     char *hdr=xmalloc(hlen+1);
     if(fread(hdr,1,hlen,f)!=hlen){fprintf(stderr,"%s: header troncato\n",inp);return 1;}
     hdr[hlen]=0;
@@ -81,7 +109,10 @@ static int do_cert(const char *inp){
         if(!strcmp(root->keys[i],"__metadata__")) continue;
         jval *m=root->kids[i]; jval *off=json_get(m,"data_offsets");
         if(!off||off->t!=J_ARR||off->len<2){fprintf(stderr,"%s: offsets %s\n",inp,root->keys[i]);return 1;}
-        size_t a=(size_t)off->kids[0]->num, b=(size_t)off->kids[1]->num, rn=b-a;
+        int64_t a64,b64;
+        if(!off_pair_ok(off,(size_t)fsz-ds,&a64,&b64)){
+            fprintf(stderr,"%s: offsets %s fuori dai limiti del file\n",inp,root->keys[i]);return 1;}
+        size_t a=(size_t)a64, rn=(size_t)(b64-a64);
         uint8_t *raw=xmalloc(rn?rn:1), *c=xmalloc(cfse_bound(rn)), *d=xmalloc(rn?rn:1);
         if(fseek(f,(long)(ds+a),SEEK_SET)||fread(raw,1,rn,f)!=rn){fprintf(stderr,"%s: read %s\n",inp,root->keys[i]);return 1;}
         size_t cs=cfse_compress(raw,rn,c,cfse_bound(rn)); size_t rl=0;

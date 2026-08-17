@@ -512,12 +512,27 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
                 !shp || shp->t != J_ARR || shp->len > ST_MAX_RANK) {
                 fprintf(stderr, "%s: tensor '%s' has malformed dtype/data_offsets/shape\n",
                         files[fi], name); exit(1); }
-            int64_t a0 = (int64_t)off->kids[0]->num, b0 = (int64_t)off->kids[1]->num;
+            /* SEC: come lo shape qui sotto, anche data_offsets arriva da un file
+             * non fidato e va validato PRIMA del cast double->int64: su NaN/inf/
+             * >=2^63 e' il cast stesso a essere UB, quindi il vecchio check
+             * "a0 < 0" girava gia' su un valore indeterminato. */
+            jval *o0 = off->kids[0], *o1 = off->kids[1];
+            if (!o0 || o0->t != J_NUM || !isfinite(o0->num) || o0->num < 0.0 ||
+                o0->num >= ldexp(1.0, 63) || floor(o0->num) != o0->num ||
+                !o1 || o1->t != J_NUM || !isfinite(o1->num) || o1->num < 0.0 ||
+                o1->num >= ldexp(1.0, 63) || floor(o1->num) != o1->num) {
+                fprintf(stderr, "%s: tensor '%s' has non-integer data_offsets â refusing (hostile or corrupt file)\n",
+                        files[fi], name); exit(1); }
+            int64_t a0 = (int64_t)o0->num, b0 = (int64_t)o1->num;
             /* offset dichiarati dal file: non-negativi, ordinati e dentro al
              * file. Altrimenti nbytes=b0-a0 diventa negativo -> malloc((size_t))
              * gigante e la memcpy in st_read_f32 sfora il buffer del chiamante;
-             * oppure off punta fuori dal file. */
-            if (a0 < 0 || b0 < a0 || data_start + b0 > fsz) {
+             * oppure off punta fuori dal file. Il confronto e' riscritto senza
+             * addizione: con b0 vicino a INT64_MAX, data_start+b0 traboccherebbe
+             * (UB, avvolge negativo) e il check passerebbe; fsz>=data_start e'
+             * gia' garantito dal check sulla header length, quindi fsz-data_start
+             * non puo' traboccare. */
+            if (a0 < 0 || b0 < a0 || b0 > fsz - data_start) {
                 fprintf(stderr, "%s: tensor '%s' data_offsets [%lld,%lld] out of file bounds (%lld)\n",
                         files[fi], name, (long long)a0, (long long)b0, (long long)fsz); exit(1); }
             /* SEC: lo shape viene da un file non fidato (mirror). Senza il guard

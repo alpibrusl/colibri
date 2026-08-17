@@ -783,6 +783,18 @@ tests/test_st_pread$(EXE): tests/test_st_pread.c st.h json.h compat.h
 tests/test_st_shape$(EXE): tests/test_st_shape.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_st_offsets$(EXE): tests/test_st_offsets.c st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# White-box include of the cfse_pack tool itself (main renamed), so the
+# offsets hardening in parse_shard/do_cert is a gate even though the tool
+# has no build rule of its own.
+tests/test_cfse_bounds$(EXE): tests/test_cfse_bounds.c cfse_pack.c fse_coli.h json.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_kv_persist_errors$(EXE): tests/test_kv_persist_errors.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_st$(EXE): tests/test_st.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
