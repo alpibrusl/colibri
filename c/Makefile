@@ -769,6 +769,9 @@ tests/test_ue8m0$(EXE): tests/test_ue8m0.c st.h json.h compat.h
 tests/test_json$(EXE): tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_json_strict$(EXE): tests/test_json_strict.c json.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_tok_o200k$(EXE): tests/test_tok_o200k.c tok.h tok_unicode.h tok_unicode_o200k.h json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

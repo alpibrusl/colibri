@@ -1277,6 +1277,7 @@ static jval* cfg_root(const char *snap, char **arena){
 static int gi(jval*r,const char*k){ jval*v=json_get(r,k); return v?(int)v->num:0; }
 static void load_cfg(Cfg *c, const char *snap){
     char *ar=NULL; jval *r=cfg_root(snap,&ar);
+    if(!r){ fprintf(stderr,"config.json: malformed JSON\n"); exit(1); }
     c->hidden=gi(r,"hidden_size"); c->n_layers=gi(r,"num_hidden_layers");
     c->n_heads=gi(r,"num_attention_heads"); c->n_experts=gi(r,"n_routed_experts");
     c->topk=gi(r,"num_experts_per_tok"); c->moe_inter=gi(r,"moe_intermediate_size");
