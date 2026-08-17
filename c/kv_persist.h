@@ -8,6 +8,22 @@
 static int g_kvsave=1;
 #define KV_MAGIC "COLIKV1\0"
 
+/* Un write fallito non e' un evento ignorabile: il contatore di record
+ * nell'header e' l'ancora della crash-safety (i record si scrivono PRIMA del
+ * contatore, cosi' un append troncato e' invisibile al reload). Se un
+ * write/flush fallisce si smette di persistere per il resto del processo --
+ * il file conserva il suo ultimo prefisso consistente -- invece di avanzare
+ * il contatore sopra byte mai arrivati su disco (con ENOSPC si persisterebbe
+ * un header che dichiara record il cui payload e' spazzatura, e kv_disk_load
+ * riprenderebbe una conversazione corrotta). */
+static void kv_disk_fail(KVState *k, const char *what){
+    fprintf(stderr,"[KV] %s failed (%s): disabling KV persistence for this run; "
+                   "the file keeps its last consistent %d records\n",
+            what, strerror(errno), k->disk_nrec);
+    if(k->disk_fp){ fclose(k->disk_fp); k->disk_fp=NULL; }
+    g_kvsave=0;
+}
+
 static void kv_hdr(Model *m, int32_t *h, int nrec){
     Cfg *c=&m->c; int nic=0;
     for(int i=0;i<c->n_layers;i++) if(m->Ic && m->Ic[i]) nic++;
@@ -30,9 +46,12 @@ static int kv_disk_open(Model *m){
         k->disk_fp=fopen(k->disk_path,"wb");
         if(!k->disk_fp) return 0;
         int32_t h[8]; kv_hdr(m,h,0);
-        fwrite(KV_MAGIC,1,8,k->disk_fp); fwrite(h,4,8,k->disk_fp);
-        fflush(k->disk_fp);
-        fclose(k->disk_fp);
+        int ok = fwrite(KV_MAGIC,1,8,k->disk_fp)==8 && fwrite(h,4,8,k->disk_fp)==8 &&
+                 fflush(k->disk_fp)==0;
+        if(fclose(k->disk_fp)!=0) ok=0;
+        k->disk_fp=NULL;
+        /* un header semiscritto non deve poter essere ripreso al prossimo open */
+        if(!ok){ remove(k->disk_path); return 0; }
         k->disk_fp=fopen(k->disk_path,"r+b");
         if(!k->disk_fp) return 0;
     }
@@ -45,9 +64,15 @@ static void kv_disk_truncate(Model *m, int nrec){
     if(k->disk_fp){ fclose(k->disk_fp); k->disk_fp=NULL; }
     FILE *f=fopen(k->disk_path,"r+b");
     if(!f){ k->disk_nrec=0; return; }
+    int32_t nr=nrec;
+    int ok = fseek(f,8+6*4,SEEK_SET)==0 && fwrite(&nr,4,1,f)==1 && fflush(f)==0;
+    if(fclose(f)!=0) ok=0;
+    if(!ok){
+        fprintf(stderr,"[KV] truncate failed (%s): disabling KV persistence for this run\n",
+                strerror(errno));
+        g_kvsave=0; k->disk_nrec=0; return;
+    }
     k->disk_nrec=nrec;
-    int32_t nr=nrec; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f);
-    fflush(f); fclose(f);
 }
 
 static void kv_disk_reset(Model *m){ kv_disk_truncate(m,0); }
@@ -64,7 +89,7 @@ static void kv_disk_append(Model *m, const int *hist, int len){
         if(!nb) return;
         k->disk_buf=nb; k->disk_buf_cap=rec;
     }
-    fseek(f, 8+8*4 + (int64_t)k->disk_nrec*rec, SEEK_SET);
+    if(fseek(f, 8+8*4 + (int64_t)k->disk_nrec*rec, SEEK_SET)!=0){ kv_disk_fail(k,"seek"); return; }
     for(int p=k->disk_nrec;p<len;p++){
         uint8_t *b=k->disk_buf;
         *(int32_t*)b = hist[p]; b+=4;
@@ -75,11 +100,14 @@ static void kv_disk_append(Model *m, const int *hist, int len){
         if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]){
             memcpy(b, m->Ic[i]+(int64_t)p*c->index_hd, (size_t)c->index_hd*4); b+=c->index_hd*4;
         }
-        fwrite(k->disk_buf, 1, (size_t)rec, f);
+        if(fwrite(k->disk_buf, 1, (size_t)rec, f)!=(size_t)rec){ kv_disk_fail(k,"record write"); return; }
     }
-    fflush(f);
-    int32_t nr=len; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f);
-    fflush(f);
+    /* flush dei record PRIMA di avanzare il contatore: se fallisce, l'header
+     * continua a nominare il vecchio prefisso, integralmente scritto */
+    if(fflush(f)!=0){ kv_disk_fail(k,"record flush"); return; }
+    int32_t nr=len;
+    if(fseek(f,8+6*4,SEEK_SET)!=0 || fwrite(&nr,4,1,f)!=1 || fflush(f)!=0){
+        kv_disk_fail(k,"header update"); return; }
     k->disk_nrec=len;
 }
 
