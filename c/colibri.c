@@ -375,10 +375,29 @@ static void eslot_release(ESlot *s){
 }
 static int eslot_busy(const ESlot *s){ return __atomic_load_n(&s->in_flight,__ATOMIC_ACQUIRE)!=0; }
 static void eslots_acquire(ESlot **slots,int n){ for(int i=0;i<n;i++) eslot_acquire(slots[i]); }
+
+/* Disciplina dei campi cross-thread (#9). I pilot worker toccano gli slot del
+ * layer L+1 sotto g_pilot_mx mentre moe() percorre quelli del layer L senza
+ * lock -- layer disgiunti per l'invariante g_cur_moe_layer, ma la macchina
+ * astratta C non lo sa: una load semplice che il compilatore puo' spezzare o
+ * rileggere e' formalmente in gara con la store dell'altro lato non appena una
+ * finestra (rss_guard, repin fra i turni) si sovrappone. Ogni accesso
+ * cross-thread a eid/used/ecn e ai contatori heat/recency passa da questi
+ * accessor RELAXED (disciplina READ_ONCE/WRITE_ONCE, la stessa dei cursori
+ * del pool PIPE); l'ORDINAMENTO fra campi resta garantito da g_pilot_mx e dal
+ * protocollo di prenotazione pubblicato, non da qui. I campi toccati solo dal
+ * thread proprietario (gli slot ws[] di staging prima della pubblicazione)
+ * restano accessi semplici. */
+static inline int      sl_eid(const ESlot *s){ return __atomic_load_n(&s->eid,__ATOMIC_RELAXED); }
+static inline void     sl_eid_set(ESlot *s,int v){ __atomic_store_n(&s->eid,v,__ATOMIC_RELAXED); }
+static inline uint64_t sl_used(const ESlot *s){ return __atomic_load_n(&s->used,__ATOMIC_RELAXED); }
+static inline void     sl_used_set(ESlot *s,uint64_t v){ __atomic_store_n(&s->used,v,__ATOMIC_RELAXED); }
+static inline uint32_t u32_ld(const uint32_t *p){ return __atomic_load_n(p,__ATOMIC_RELAXED); }
+static inline void     u32_st(uint32_t *p,uint32_t v){ __atomic_store_n(p,v,__ATOMIC_RELAXED); }
 static void eslots_release(ESlot **slots,int n){ for(int i=0;i<n;i++) eslot_release(slots[i]); }
 static int eslot_lru_victim(ESlot *slots,int n){
     int lru=-1;
-    for(int i=0;i<n;i++) if(!eslot_busy(&slots[i])&&(lru<0||slots[i].used<slots[lru].used)) lru=i;
+    for(int i=0;i<n;i++) if(!eslot_busy(&slots[i])&&(lru<0||sl_used(&slots[i])<sl_used(&slots[lru]))) lru=i;
     return lru;
 }
 
@@ -2279,7 +2298,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
         qt_from_disk(m,nm[2],D,I,b,g_drop,&s->d);
         atomic_fetch_add_explicit(&g_prof_io,
             st_nbytes(&m->S,nm[0])+st_nbytes(&m->S,nm[1])+st_nbytes(&m->S,nm[2]),memory_order_relaxed);
-        s->eid=eid; return 0;
+        sl_eid_set(s,eid); return 0;
     }
     st_tensor *tw[3], *tq[3];
     for(int k=0;k<3;k++){
@@ -2341,7 +2360,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
                 atomic_fetch_add_explicit(&g_mir_bytes[rep],tw[k]->nbytes+tq[k]->nbytes,memory_order_relaxed);
             }
             atomic_fetch_add_explicit(&g_mir_nread[rep],1,memory_order_relaxed);
-            s->eid=eid; return 0;
+            sl_eid_set(s,eid); return 0;
         }
     }
     int64_t wtot=tw[0]->nbytes+tw[1]->nbytes+tw[2]->nbytes;
@@ -2513,7 +2532,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
     }
-    s->eid=eid; return 0;
+    sl_eid_set(s,eid); return 0;
 }
 /* Every expert read goes through here: time the whole load (pread/fault +
  * bookkeeping) on the thread that runs it, into the disk-service counter. */
@@ -2712,7 +2731,7 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+l->pos[k]); qt[k]->q4=s->slab+l->pos[k]; qt[k]->s=fp[k];
     }
-    if(publish_eid) s->eid=l->eid;
+    if(publish_eid) sl_eid_set(s,l->eid);
     l->finalized=1; return 0;
 }
 static int uring_wait_all(UringBatch *b){
@@ -3860,7 +3879,7 @@ static void *vk2_issue_worker(void *p){
 /* pin ∪ LRU residency probe (used by CACHE_ROUTE max-rank fill). */
 static int expert_is_resident(Model *m, int layer, int eid){
     ESlot *P=m->pin[layer];
-    for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid) return 1;
+    for(int z=0;z<m->npin[layer];z++) if(sl_eid(&P[z])==eid) return 1;
     ESlot *Sl=m->ecache[layer];
     for(int z=0;z<m->ecn[layer];z++) if(Sl[z].eid==eid) return 1;
     return 0;
@@ -4135,8 +4154,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 if(!touched[idx[kk]]){ m->elast_pre[layer][idx[kk]]=m->elast_dc[layer][idx[kk]]; touched[idx[kk]]=1; }
                 m->elast_dc[layer][idx[kk]]=++m->eaccess_clock_dc;
             }
-            if(m->eheat[layer][idx[kk]]<UINT32_MAX) m->eheat[layer][idx[kk]]++;
-            m->elast[layer][idx[kk]]=++m->eaccess_clock;
+            { uint32_t h=u32_ld(&m->eheat[layer][idx[kk]]);   /* relaxed: un update perso e'
+                 tollerabile su un contatore euristico; una load/stor spezzata no (#9) */
+              if(h<UINT32_MAX) u32_st(&m->eheat[layer][idx[kk]],h+1); }
+            u32_st(&m->elast[layer][idx[kk]],
+                   __atomic_add_fetch(&m->eaccess_clock,1,__ATOMIC_RELAXED));
         }
         if(c->norm_topk){ float sm=0; for(int kk=0;kk<Ke;kk++) sm+=w[kk]; sm+=1e-20f; for(int kk=0;kk<Ke;kk++) w[kk]/=sm; }
         for(int kk=0;kk<Ke;kk++) w[kk]*=c->routed_scale;
@@ -4192,7 +4214,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         for(int j=0;j<nu;j++){ int eid=uniq[j];
             int found=0;
             ESlot *P=m->pin[layer];
-            for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ found=1; break; }
+            for(int z=0;z<m->npin[layer];z++) if(sl_eid(&P[z])==eid){ found=1; break; }
             if(!found){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
                 for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ found=1; break; } }
             if(found){ is_hit[j]=1; nhits++; }
@@ -4318,9 +4340,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             }
 #endif
             ESlot *P=m->pin[layer];
-            for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ m->hits++; m->hit_pin++; use[j]=&P[z]; break; }
-            if(!use[j]){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
-                for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; m->hit_ecache++; Sl[z].used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); use[j]=&Sl[z]; break; } }
+            for(int z=0;z<m->npin[layer];z++) if(sl_eid(&P[z])==eid){ m->hits++; m->hit_pin++; use[j]=&P[z]; break; }
+            if(!use[j]){ ESlot *Sl=m->ecache[layer]; int nn=__atomic_load_n(&m->ecn[layer],__ATOMIC_RELAXED);
+                for(int z=0;z<nn;z++) if(sl_eid(&Sl[z])==eid){ m->hits++; m->hit_ecache++; sl_used_set(&Sl[z],(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED)); use[j]=&Sl[z]; break; } }
             if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++;
                 if(g_disk_split){ if(m->ld_ctx==1) m->miss_draft++; else if(m->ld_ctx==2) m->miss_absorb++; } }
         }
@@ -4433,7 +4455,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
 #ifdef COLI_VULKAN
                 if(vk_active && vk_reg_served(layer,eid)) found=1;   /* VK-tier-served at decode */
 #endif
-                for(int z=0;z<m->npin[layer] && !found;z++) if(P[z].eid==eid) found=1;
+                for(int z=0;z<m->npin[layer] && !found;z++) if(sl_eid(&P[z])==eid) found=1;
                 ESlot *Sl=m->ecache[layer];
                 for(int z=0;z<m->ecn[layer] && !found;z++) if(Sl[z].eid==eid) found=1;
                 if(!found) expert_prefetch(m,layer,eid);
@@ -4965,16 +4987,17 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * dispatched miss slot, before the nr==0 skip) already waited on all ws[] loads
          * for this block, so they are complete before the LRU swap — and the gen-tagged
          * cursor keeps any still-spinning worker off a wrong-generation slot. */
-        { ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];   /* promozione LRU (swap buffer) */
+        { ESlot *Sl=m->ecache[layer];                            /* promozione LRU (swap buffer) */
+          int nn=__atomic_load_n(&m->ecn[layer],__ATOMIC_RELAXED);
           int promo = nmiss<m->ecap ? nmiss : m->ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
-              if(*nn<m->ecap) dst=&Sl[(*nn)++];
-              else { int lru=eslot_lru_victim(Sl,*nn);
+              if(nn<m->ecap){ dst=&Sl[nn]; __atomic_store_n(&m->ecn[layer],nn+1,__ATOMIC_RELAXED); nn++; }
+              else { int lru=eslot_lru_victim(Sl,nn);
                      if(lru<0){ static int warned;
                          if(!warned){ warned=1; fprintf(stderr,"[CUDA] all LRU expert slots are in flight; skipping cache promotion\n"); }
                          continue; }
                      dst=&Sl[lru]; }
-              ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); }
+              ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; sl_used_set(dst,(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED)); }
         }
     }
     /* ---- FASE E: shared expert (PIPE2: gia' sul device; Metal CB: gia' sommata) ---- */
@@ -5140,52 +5163,76 @@ static Model *pilot_m=NULL;
 /* PILOT_REAL: load VERO dell'expert predetto dentro la LRU del layer FUTURO. Vedi
  * l'invariante di sicurezza accanto a g_pilot_real. Il pread (lento) gira FUORI dal lock;
  * il lock protegge solo la scelta/pubblicazione dello slot e l'handshake col main. */
+/* Sonda di residenza (#9): eid e' pinnato, residente, o prenotato in volo su
+ * `layer`? UNA definizione per lo scan che era ricopiato a mano in ogni punto
+ * d'ingresso del prefetch (pilot_realload, pilot_uring_batch, couple_prefetch,
+ * pilot_prefetch, repin) -- lo "scan di residenza sicuro per convenzione su ~6
+ * siti" segnalato dall'audit. Il locking e' del CHIAMANTE: ogni chiamante
+ * attuale tiene g_pilot_mx. */
+static int expert_resident_or_reserved(Model *m,int layer,int eid){
+#ifdef COLI_VULKAN
+    if(vk_reg_served(layer,eid)) return 1;               /* VK-tier-served: no load */
+#endif
+    ESlot *P=m->pin[layer];
+    for(int z=0;z<m->npin[layer];z++) if(sl_eid(&P[z])==eid) return 1;
+    ESlot *Sl=m->ecache[layer]; int nn=__atomic_load_n(&m->ecn[layer],__ATOMIC_RELAXED);
+    for(int z=0;z<nn;z++){ int e=sl_eid(&Sl[z]); if(e==eid||e==-(eid+2)) return 1; }
+    return 0;
+}
+
+/* Scelta della vittima + LFRU eviction guard (#441, ristretto da #497): UNA
+ * definizione per le due copie identiche di pilot_realload e pilot_uring_batch.
+ * Ritorna l'indice dello slot, o -1 (tutti in volo, oppure il guard ha protetto
+ * la vittima: il chiamante conta un drop in entrambi i casi). Il chiamante
+ * tiene g_pilot_mx. */
+static int pilot_pick_slot(Model *m,int layer,int eid,ESlot *Sl,int nn){
+    int slot=-1;
+    for(int z=0;z<nn;z++){
+        if(eslot_busy(&Sl[z])) continue;                 /* borrowed by an async GPU read */
+        int e=sl_eid(&Sl[z]);
+        if(e==-1){ slot=z; break; }                      /* riusa uno slot libero/fallito */
+        if(e<-1) continue;                               /* prenotazione di un altro worker */
+        if(slot<0 || sl_used(&Sl[z])<sl_used(&Sl[slot])) slot=z;
+    }
+    if(slot<0) return -1;
+    /* proteggi la vittima solo se davvero CALDA (>=2 accessi demand) e chiaramente
+     * piu' calda della speculazione, con l'isteresi 25%+4-freq di tier_pick_lfru */
+    if(g_pilot_evict_guard && m->eheat && m->elast && sl_eid(&Sl[slot])>=0){
+        int vid=sl_eid(&Sl[slot]); uint32_t vh=u32_ld(&m->eheat[layer][vid]);
+        if(vh>=2){
+            uint32_t clk=__atomic_load_n(&m->eaccess_clock,__ATOMIC_RELAXED);
+            uint64_t vs=tier_lfru_score(vh,u32_ld(&m->elast[layer][vid]),clk);
+            uint64_t cs=tier_lfru_score(u32_ld(&m->eheat[layer][eid]),u32_ld(&m->elast[layer][eid]),clk);
+            if(vs+(vs>>2)+(4u<<8)>cs) return -1;
+        }
+    }
+    return slot;
+}
+
 static void pilot_realload(Model *m, int layer, int eid){
     pthread_mutex_lock(&g_pilot_mx);
     if(layer<0 || layer>=256 || layer <= atomic_load_explicit(&g_cur_moe_layer,memory_order_acquire)){
         atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);   /* fuori range (come il ramo URING) o main gia' su questo layer */
         pthread_mutex_unlock(&g_pilot_mx); return;
     }
-    ESlot *P=m->pin[layer];                             /* gia' residente (pin o ecache)? skip */
-#ifdef COLI_VULKAN
-    if(vk_reg_served(layer,eid)){ pthread_mutex_unlock(&g_pilot_mx); return; }   /* VK-tier-served: no load */
-#endif
-    for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ pthread_mutex_unlock(&g_pilot_mx); return; }
-    ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];   /* dedup contro residenti E prenotazioni in volo -(eid+2) */
-    for(int z=0;z<nn;z++) if(Sl[z].eid==eid || Sl[z].eid==-(eid+2)){ pthread_mutex_unlock(&g_pilot_mx); return; }
+    if(expert_resident_or_reserved(m,layer,eid)){ pthread_mutex_unlock(&g_pilot_mx); return; }
+    ESlot *Sl=m->ecache[layer]; int nn=__atomic_load_n(&m->ecn[layer],__ATOMIC_RELAXED);
     /* SPMC (PILOT_WORKERS>1): scegli lo slot sotto lock e MARCALO prenotato prima di
      * rilasciarlo, cosi' gli altri worker non lo scelgono come vittima ne' ricaricano
      * lo stesso eid. Stesso schema del ramo URING (prenotazione visibile -(eid+2),
-     * ecn bumpato subito, scan-vittima che salta le prenotazioni). */
+     * ecn bumpato subito, scan-vittima che salta le prenotazioni). Vittima +
+     * eviction guard: pilot_pick_slot (#9, una definizione per i due rami). */
     int slot,isnew=0;
-    if(nn<m->ecap){ slot=nn; isnew=1; m->ecn[layer]=nn+1; }   /* cresci: pubblica subito lo slot (marcato prenotato) */
+    if(nn<m->ecap){ slot=nn; isnew=1; __atomic_store_n(&m->ecn[layer],nn+1,__ATOMIC_RELAXED); }   /* cresci: pubblica subito lo slot (marcato prenotato) */
     else {
-        slot=-1;
-        for(int z=0;z<nn;z++){
-            if(eslot_busy(&Sl[z])) continue;             /* borrowed by an async GPU read */
-            if(Sl[z].eid==-1){ slot=z; break; }         /* riusa uno slot libero/fallito */
-            if(Sl[z].eid< -1) continue;                 /* prenotazione di un ALTRO worker: mai vittima */
-            if(slot<0 || Sl[z].used<Sl[slot].used) slot=z;
-        }
+        slot=pilot_pick_slot(m,layer,eid,Sl,nn);
         if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
-                    pthread_mutex_unlock(&g_pilot_mx); return; }   /* tutti gli slot sono in volo */
-        /* LFRU eviction guard (#441, narrowed by #497 — folded into the SPMC selection):
-         * protect the victim only when genuinely WARM (>=2 demand accesses) AND clearly
-         * hotter than the speculation by tier_pick_lfru's 25%+4-freq hysteresis; the
-         * un-narrowed #474 test dropped ~all speculations on a full cache (#490).
-         * Skips free slots (eid==-1). Cache placement only -> output unchanged. */
-        if(g_pilot_evict_guard && m->eheat && m->elast && Sl[slot].eid>=0){
-            int vid=Sl[slot].eid; uint32_t vh=m->eheat[layer][vid];
-            if(vh>=2){
-                uint64_t vs=tier_lfru_score(vh,m->elast[layer][vid],m->eaccess_clock);
-                uint64_t cs=tier_lfru_score(m->eheat[layer][eid],m->elast[layer][eid],m->eaccess_clock);
-                if(vs+(vs>>2)+(4u<<8)>cs){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
-                                            pthread_mutex_unlock(&g_pilot_mx); return; } } }
+                    pthread_mutex_unlock(&g_pilot_mx); return; }   /* tutti in volo, o vittima protetta dal guard */
     }
     ESlot *dst=&Sl[slot];
-    dst->eid=-(eid+2);                                  /* prenotazione VISIBILE: dedup + scan-vittima degli altri worker la vedono (isnew) */
+    sl_eid_set(dst,-(eid+2));                           /* prenotazione VISIBILE: dedup + scan-vittima degli altri worker la vedono (isnew) */
     (void)isnew;
-    dst->used=(uint64_t)-1;                             /* sentinella "in carica": mai vittima LRU finche' expert_load non pubblica l'eid reale
+    sl_used_set(dst,(uint64_t)-1);                             /* sentinella "in carica": mai vittima LRU finche' expert_load non pubblica l'eid reale
                                                          * (chiude la finestra eid-reale/used-vecchio: uno snapshot di eclock si sarebbe potuto
                                                          * far superare da altri load durante il pread). used fresco ristampato al successo. */
     g_pilot_inflight[layer]++;
@@ -5195,7 +5242,7 @@ static void pilot_realload(Model *m, int layer, int eid){
 
     pthread_mutex_lock(&g_pilot_mx);
     if(rc==0){
-        dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);  /* eid gia' reale (expert_load); timbra used fresco */
+        sl_used_set(dst,(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED));  /* eid gia' reale (expert_load); timbra used fresco */
         atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
     } else {
         /* load fallito: libera la prenotazione. LO SLOT VA ANCHE RIPORTATO A used=0:
@@ -5204,8 +5251,8 @@ static void pilot_realload(Model *m, int layer, int eid){
          * mai evictable: ogni speculazione fallita (disco lento, errore I/O transitorio)
          * sottraeva ~19MB di cache in modo permanente e silenzioso. used=0 e' la stessa
          * convenzione "slot vergine" di rss_guard: diventa la PRIMA vittima, non l'ultima. */
-        dst->eid=-1;
-        dst->used=0;
+        sl_eid_set(dst,-1);
+        sl_used_set(dst,0);
         atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
     }
     g_pilot_inflight[layer]--;
@@ -5229,43 +5276,20 @@ static void pilot_uring_batch(Model *m){
             atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
             pthread_mutex_unlock(&g_pilot_mx); continue;
         }
-        int found=0; ESlot *P=m->pin[layer];
-#ifdef COLI_VULKAN
-        if(vk_reg_served(layer,eid)) found=1;               /* VK-tier-served: no load */
-#endif
-        for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){found=1;break;}
-        ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
-        for(int z=0;z<nn && !found;z++) if(Sl[z].eid==eid || Sl[z].eid==-(eid+2)) found=1;
-        if(found){ pthread_mutex_unlock(&g_pilot_mx); continue; }
+        if(expert_resident_or_reserved(m,layer,eid)){ pthread_mutex_unlock(&g_pilot_mx); continue; }
+        ESlot *Sl=m->ecache[layer]; int nn=__atomic_load_n(&m->ecn[layer],__ATOMIC_RELAXED);
         int slot;
-        if(nn<m->ecap){ slot=nn; m->ecn[layer]=nn+1; }
-        else{
-            slot=-1;
-            for(int z=0;z<nn;z++){
-                if(eslot_busy(&Sl[z])) continue;      /* borrowed by an async GPU read */
-                if(Sl[z].eid==-1){ slot=z; break; }
-                if(Sl[z].eid< -1) continue;          /* URING reservation in flight */
-                if(slot<0 || Sl[z].used<Sl[slot].used) slot=z;
-            }
-        }
+        if(nn<m->ecap){ slot=nn; __atomic_store_n(&m->ecn[layer],nn+1,__ATOMIC_RELAXED); }
+        else slot=pilot_pick_slot(m,layer,eid,Sl,nn);    /* vittima + eviction guard (#9) */
         if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); pthread_mutex_unlock(&g_pilot_mx); continue; }
-        /* LFRU eviction guard (#441, narrowed by #497): protect only a genuinely WARM
-         * resident (>=2 accesses) that is clearly hotter (see pilot_realload) */
-        if(g_pilot_evict_guard && m->eheat && m->elast && Sl[slot].eid>=0){
-            int vid=Sl[slot].eid; uint32_t vh=m->eheat[layer][vid];
-            if(vh>=2){
-                uint64_t vs=tier_lfru_score(vh,m->elast[layer][vid],m->eaccess_clock);
-                uint64_t cs=tier_lfru_score(m->eheat[layer][eid],m->elast[layer][eid],m->eaccess_clock);
-                if(vs+(vs>>2)+(4u<<8)>cs){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
-                                            pthread_mutex_unlock(&g_pilot_mx); continue; } } }
         ESlot *dst=&Sl[slot];
-        dst->eid=-(eid+2);                         /* visible reservation; never considered resident/evictable */
+        sl_eid_set(dst,-(eid+2));                  /* visible reservation; never considered resident/evictable */
         g_pilot_inflight[layer]++;
         pthread_mutex_unlock(&g_pilot_mx);
 
         int li=uring_load_add(&g_ub_pilot,m,layer,eid,dst,0);
         if(li<0){
-            pthread_mutex_lock(&g_pilot_mx); dst->eid=-1; g_pilot_inflight[layer]--;
+            pthread_mutex_lock(&g_pilot_mx); sl_eid_set(dst,-1); g_pilot_inflight[layer]--;
             pthread_cond_broadcast(&g_pilot_cv); pthread_mutex_unlock(&g_pilot_mx);
             atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); continue;
         }
@@ -5284,11 +5308,11 @@ static void pilot_uring_batch(Model *m){
         int rc=uring_finalize_load(&g_ub_pilot,d->li,0);
         pthread_mutex_lock(&g_pilot_mx);
         if(rc==0){
-            d->dst->eid=d->eid;
-            d->dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);
+            sl_eid_set(d->dst,d->eid);
+            sl_used_set(d->dst,(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED));
             atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
         }else{
-            d->dst->eid=-1;
+            sl_eid_set(d->dst,-1);
             atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
         }
         g_pilot_inflight[d->layer]--;
@@ -5410,16 +5434,8 @@ static void couple_prefetch(Model *m, int layer, const int *idx, int Ke){
             for(int e=0;e<E;e++) if(sc[e]>bv){bv=sc[e];best=e;}
             if(best<0) break;
             sc[best]=0;
-            int found=0;                            /* residency scan, same locking as pilot */
-            pthread_mutex_lock(&g_pilot_mx);
-            ESlot *P=m->pin[lt];
-#ifdef COLI_VULKAN
-            if(vk_reg_served(lt,best)) found=1;             /* VK-tier-served: no load */
-#endif
-            for(int z=0;z<m->npin[lt] && !found;z++) if(P[z].eid==best) found=1;
-            ESlot *Sl=m->ecache[lt];
-            for(int z=0;z<m->ecn[lt] && !found;z++)
-                if(Sl[z].eid==best || Sl[z].eid==-(best+2)) found=1;
+            pthread_mutex_lock(&g_pilot_mx);        /* residency scan, same locking as pilot */
+            int found=expert_resident_or_reserved(m,lt,best);
             pthread_mutex_unlock(&g_pilot_mx);
             if(!found){
                 unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
@@ -5475,16 +5491,8 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
              * lock-free (pilot_w/pilot_r atomics, not g_pilot_mx) so there is no
              * re-entrant double-lock, and the worker re-checks residency under the
              * lock anyway, making a racing redundant enqueue harmless. */
-            int found=0;
             pthread_mutex_lock(&g_pilot_mx);
-            ESlot *P=m->pin[lnext];
-#ifdef COLI_VULKAN
-            if(vk_reg_served(lnext,best)) found=1;          /* VK-tier-served: no load */
-#endif
-            for(int z=0;z<m->npin[lnext] && !found;z++) if(P[z].eid==best) found=1;
-            ESlot *Sl=m->ecache[lnext];
-            for(int z=0;z<m->ecn[lnext] && !found;z++)
-                if(Sl[z].eid==best || Sl[z].eid==-(best+2)) found=1;
+            int found=expert_resident_or_reserved(m,lnext,best);
             pthread_mutex_unlock(&g_pilot_mx);
             if(!found){
                 unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
@@ -6995,7 +7003,7 @@ static int repin_pick(Model *m, RepinCand *out, int maxc){
 #endif
         ESlot *P=m->pin[l]; int ids[4096], zp, eu; long g;
         int np=m->npin[l]; if(np>4096) np=4096;
-        for(int z=0;z<np;z++) ids[z]=P[z].eid;
+        for(int z=0;z<np;z++) ids[z]=sl_eid(&P[z]);
         if(!tier_pick_lfru(m->eheat[l],m->elast[l],m->eaccess_clock,
                            c->n_experts,ids,np,&zp,&eu,&g)) continue;
         if(nb<maxc){ out[nb]=(RepinCand){g,l,zp,eu,0}; nb++; }
@@ -7037,15 +7045,15 @@ static void rss_guard(Model *m){
         for(int l=0; l<=c->n_layers && freed<need; l++){
             if(!m->ecache || !m->ecache[l]) continue;
             pthread_mutex_lock(&g_pilot_mx);
-            int nn=m->ecn[l], lru=-1;
+            int nn=__atomic_load_n(&m->ecn[l],__ATOMIC_RELAXED), lru=-1;
             for(int z=0;z<nn;z++){                        /* solo slot pubblicati e con slab */
                 ESlot *cand=&m->ecache[l][z];
-                if(cand->eid<0 || !cand->slab || eslot_busy(cand)) continue;
-                if(lru<0 || cand->used<m->ecache[l][lru].used) lru=z;
+                if(sl_eid(cand)<0 || !cand->slab || eslot_busy(cand)) continue;
+                if(lru<0 || sl_used(cand)<sl_used(&m->ecache[l][lru])) lru=z;
             }
             if(lru<0){ pthread_mutex_unlock(&g_pilot_mx); continue; }
             ESlot *s=&m->ecache[l][lru];
-            s->eid=-1;                                    /* nascosto: nessun hit/evict altrui */
+            sl_eid_set(s,-1);                             /* nascosto: nessun hit/evict altrui */
             int64_t sb=s->slab_cap + s->fslab_cap*4;
 #ifdef COLI_METAL
             if(s->slab && g_metal_enabled) coli_metal_unregister(s->slab);
@@ -7059,7 +7067,7 @@ static void rss_guard(Model *m){
             s->slab=NULL; s->fslab=NULL; s->slab_cap=s->fslab_cap=0;
             QT *q[3]={&s->g,&s->u,&s->d};
             for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->s=NULL; }
-            s->used=0;                                    /* primo candidato al riuso */
+            sl_used_set(s,0);                             /* primo candidato al riuso */
             pthread_mutex_unlock(&g_pilot_mx);
             freed += sb; dropped++;
         }
@@ -7094,13 +7102,13 @@ static void repin_pass_limit(Model *m,int limit){
 #endif
     for(int b=0;b<nb;b++){
         ESlot *s=&m->pin[cd[b].l][cd[b].slot];
-        int old=s->eid;
-        uint32_t old_heat=m->eheat[cd[b].l][old], new_heat=m->eheat[cd[b].l][cd[b].eid];
+        int old=sl_eid(s);
+        uint32_t old_heat=u32_ld(&m->eheat[cd[b].l][old]), new_heat=u32_ld(&m->eheat[cd[b].l][cd[b].eid]);
 #ifdef COLI_CUDA
         if(cd[b].gpu_swap){
             ESlot *hot=NULL;
             for(int z=0;z<m->npin[cd[b].l];z++)
-                if(m->pin[cd[b].l][z].eid==cd[b].eid){hot=&m->pin[cd[b].l][z];break;}
+                if(sl_eid(&m->pin[cd[b].l][z])==cd[b].eid){hot=&m->pin[cd[b].l][z];break;}
             if(!hot||hot->g.cuda_eligible) continue;
             double t0=now_s();
             QT *cq[3]={&s->g,&s->u,&s->d},*hq[3]={&hot->g,&hot->u,&hot->d};
