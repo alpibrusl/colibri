@@ -21,6 +21,9 @@
 #undef main
 #ifndef _WIN32
 #include <unistd.h>
+#else
+#include <direct.h>
+#define rmdir _rmdir
 #endif
 
 #define CHECK(condition) do { \
