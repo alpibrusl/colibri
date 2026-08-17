@@ -223,6 +223,92 @@ import re
 
 BOX_START, BOX_END = "<tool_call>", "</tool_call>"
 TR_OPEN,  TR_CLOSE = "<tool_response>", "</tool_response>"
+
+# ---- guarded prompts (#8) -----------------------------------------------------
+# The engines' tokenizers match added/special tokens anywhere in the raw bytes,
+# so client-controlled text spliced into a chat template ("<|system|>",
+# "<|end_message|>", the OLMoE boundary marker) used to tokenize into REAL
+# control tokens: role spoofing from inside a message. The fix keeps rendering
+# exactly as it is and adds one bit of information: WHICH byte ranges of the
+# rendered prompt are untrusted content. Renderers wrap every client-derived
+# splice in guard(); the sentinels are stripped at render exit and the byte
+# ranges ride along on a GuardedStr; generate() prepends a CGUARD1 header the
+# engines feed to tok_encode_guarded, which suppresses added-token matches
+# starting inside those ranges -- one-pass tokenization of the same flat
+# string, byte-identical ids for benign content. COLI_GUARD=0 disables the
+# header (flat legacy payloads) as an escape hatch for older engine binaries.
+GUARD_OPEN, GUARD_CLOSE = "\x02", "\x03"
+GUARD_ENABLED = os.environ.get("COLI_GUARD", "1") != "0"
+
+
+def guard(text):
+    """Mark client-derived text as untrusted content for the engine tokenizer.
+
+    STX/ETX sentinels are stripped from the content itself (they cannot appear
+    legitimately in chat text, and the engine wire protocol already reserves
+    \x01), so a client cannot forge or unbalance the markers."""
+    if not text:
+        return ""
+    return (GUARD_OPEN
+            + text.replace(GUARD_OPEN, "").replace(GUARD_CLOSE, "")
+            + GUARD_CLOSE)
+
+
+class GuardedStr(str):
+    """A rendered prompt plus the byte ranges of its untrusted content.
+
+    Equal to the plain rendered string in every way (tests, hashing, len);
+    string operations return plain str, dropping the ranges -- generate()
+    then sends a flat legacy payload, which is the pre-guard behavior."""
+    guard_spans = ()
+
+    def __new__(cls, text, spans=()):
+        obj = super().__new__(cls, text)
+        obj.guard_spans = tuple(spans)
+        return obj
+
+
+def guarded_payload(prompt):
+    """Encode a rendered prompt for the SUBMIT wire.
+
+    A GuardedStr with spans (and guarding enabled) becomes a CGUARD1 payload:
+    header naming the untrusted-content byte ranges, then the template bytes.
+    Anything else -- kimi's K3CHAT1 payloads, raw legacy strings, spans lost
+    to string surgery -- stays a flat prompt, the pre-guard wire format."""
+    payload = prompt.encode("utf-8")
+    gspans = getattr(prompt, "guard_spans", ())
+    if gspans and GUARD_ENABLED:
+        payload = ("CGUARD1\n%d\n" % len(gspans)
+                   + "".join("%d %d\n" % ab for ab in gspans)).encode() + payload
+    return payload
+
+
+def guard_finalize(s):
+    """Strip guard sentinels; return GuardedStr with UTF-8 byte spans."""
+    if GUARD_OPEN not in s:
+        return GuardedStr(s, ())
+    out, spans, off, i = [], [], 0, 0
+    while i < len(s):
+        a = s.find(GUARD_OPEN, i)
+        if a < 0:
+            out.append(s[i:])
+            break
+        lit = s[i:a]
+        out.append(lit)
+        off += len(lit.encode("utf-8"))
+        b = s.find(GUARD_CLOSE, a + 1)
+        if b < 0:                        # guard() strips sentinels from content,
+            raise APIError(500,          # so this is a renderer bug, not input
+                           "internal: unbalanced guard sentinel", None,
+                           "engine_error", "server_error")
+        seg = s[a + 1:b]
+        blen = len(seg.encode("utf-8"))
+        if blen:
+            spans.append((off, off + blen))
+        out.append(seg)
+        off += blen
+        i = b + 1
+    return GuardedStr("".join(out), spans)
 THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
 
 _BOX_RE  = re.compile(re.escape(BOX_START) + r"(.*?)" + re.escape(BOX_END), re.DOTALL)
@@ -801,6 +887,7 @@ def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools
                                f"messages.{index}.reasoning_content")
             raw = message.get("content")
             content = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+            content = guard(content)
             merged.append({"role": role, "content": content,
                            "reasoning_content": message.get("reasoning_content"),
                            "tool_calls": message.get("tool_calls")})
@@ -808,22 +895,22 @@ def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools
         raw = message.get("content")
         text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
         if role == "tool":
-            block = "<tool_result>" + text + "</tool_result>"
+            block = "<tool_result>" + guard(text) + "</tool_result>"
             if merged and merged[-1].get("_parts") is not None:
                 merged[-1]["_parts"].append(block)
             else:
                 merged.append({"role": "user", "_parts": [block]})
         elif role == "user":
             if merged and merged[-1].get("_parts") is not None:
-                merged[-1]["_parts"].append(text)
+                merged[-1]["_parts"].append(guard(text))
             else:
-                merged.append({"role": "user", "content": text})
+                merged.append({"role": "user", "content": guard(text)})
         else:                                     # system / developer
-            merged.append({"role": role, "content": text})
+            merged.append({"role": role, "content": guard(text)})
     if tools:
-        tools_text = _dsv4_tools_block(tools)
+        tools_text = guard(_dsv4_tools_block(tools))
         if forced:
-            tools_text += f"\n\nYou must call the function `{forced}`. Do not answer directly."
+            tools_text += "\n\nYou must call the function `" + guard(forced) + "`. Do not answer directly."
         elif tool_choice == "required":
             tools_text += "\n\nYou must call one of the functions above. Do not answer directly."
         for msg in merged:
@@ -859,15 +946,15 @@ def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools
             reasoning = message.get("reasoning_content")
             parts.append(assistant)
             if reasoning:
-                parts.extend(("<think>", reasoning, "</think>"))
+                parts.extend(("<think>", guard(reasoning), "</think>"))
             else:
                 parts.append("</think>")
             parts.append(message["content"])
             if message.get("tool_calls"):
-                parts.append(_dsv4_tool_calls(message["tool_calls"]))
+                parts.append(guard(_dsv4_tool_calls(message["tool_calls"])))
             parts.append(eos)
     parts.extend((assistant, "<think>" if enable_thinking else "</think>"))
-    return "".join(parts)
+    return guard_finalize("".join(parts))
 
 
 def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, tools=None,
@@ -897,15 +984,15 @@ def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, to
         raw = message.get("content")
         text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
         if role in ("system", "developer"):
-            parts.append(f"<|system|>\n{text}\n")
+            parts.append("<|system|>\n" + guard(text) + "\n")
         elif role == "user":
-            parts.append(f"<|user|>\n{text}\n")
+            parts.append("<|user|>\n" + guard(text) + "\n")
         else:
-            parts.append(f"<|assistant|>\n{text}{boundary}")
+            parts.append("<|assistant|>\n" + guard(text) + boundary)
             if index != last:
                 parts.append("\n")
     parts.append("<|assistant|>\n")
-    return "".join(parts)
+    return guard_finalize("".join(parts))
 
 
 def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, tools=None,
@@ -958,13 +1045,13 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
             # those embeddings with the frames appended to audio_out.
             for kind, val in inkling_content_segments(raw, f"messages.{index}.content", audio_out):
                 if kind == "text":
-                    prompt.append(f"{rtok}<|content_text|>{val}<|end_message|>")
+                    prompt.append(rtok + "<|content_text|>" + guard(val) + "<|end_message|>")
                 else:
                     prompt.append(f"{rtok}<|content_audio_input|>"
                                   + "<|audio|>" * val + "<|audio_end|><|end_message|>")
         else:
             text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
-            prompt.append(f"{rtok}<|content_text|>{text}<|end_message|>")
+            prompt.append(rtok + "<|content_text|>" + guard(text) + "<|end_message|>")
         if role == "assistant":
             prompt.append("<|content_model_end_sampling|>")
     if not effort_emitted:                       # all-system edge case: fallback
@@ -978,7 +1065,7 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
     # mode; it is exactly the sequence every non-thinking turn is trained on.
     if eff == 0.0:
         prompt.append("<|content_text|>")
-    return "".join(prompt)
+    return guard_finalize("".join(prompt))
 
 
 def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None,
@@ -1020,13 +1107,13 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
         for tool in tools:
             fn = tool.get("function", tool) if isinstance(tool, dict) else {}
             clean = {k: v for k, v in fn.items() if k not in ("defer_loading", "strict")}
-            prompt.append(json.dumps(clean, ensure_ascii=False) + "\n")
+            prompt.append(guard(json.dumps(clean, ensure_ascii=False)) + "\n")
         prompt.append("</tools>\n\nFor each function call, output the function name and arguments "
                       "within the following XML format:\n<tool_call>{function-name}"
                       "<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>"
                       "<arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>")
         if forced:
-            prompt.append(f"\n\nYou must call the function `{forced}`. Do not answer directly.")
+            prompt.append("\n\nYou must call the function `" + guard(forced) + "`. Do not answer directly.")
         elif tool_choice == "required":
             prompt.append("\n\nYou must call one of the functions above. Do not answer directly.")
     prev_tool = False
@@ -1035,9 +1122,9 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
         role = message.get("role")
         if role in ("system", "developer"):
-            prompt.append(f"<|system|>{content_text(message.get('content'), f'messages.{index}.content')}")
+            prompt.append("<|system|>" + guard(content_text(message.get('content'), f'messages.{index}.content')))
         elif role == "user":
-            prompt.append(f"<|user|>{content_text(message.get('content'), f'messages.{index}.content')}")
+            prompt.append("<|user|>" + guard(content_text(message.get('content'), f'messages.{index}.content')))
         elif role == "assistant":
             # content may be null when the message is purely tool_calls
             raw = message.get("content")
@@ -1048,7 +1135,7 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
             elif not isinstance(reasoning, str):
                 raise APIError(400, "`reasoning_content` must be a string.",
                                f"messages.{index}.reasoning_content")
-            prompt.append(f"<|assistant|><think>{reasoning}</think>{text.strip()}")
+            prompt.append("<|assistant|><think>" + guard(reasoning) + "</think>" + guard(text.strip()))
             for tc in (message.get("tool_calls") or []):
                 fn = tc.get("function", tc) if isinstance(tc, dict) else {}
                 args = fn.get("arguments", "{}")
@@ -1057,23 +1144,23 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
                         args = json.loads(args)
                     except (json.JSONDecodeError, TypeError):
                         args = {}
-                prompt.append(BOX_START + (fn.get("name") or ""))
+                prompt.append(BOX_START + guard(fn.get("name") or ""))
                 for key, value in (args or {}).items():
-                    prompt.append(f"<arg_key>{key}</arg_key><arg_value>"
-                                  + (value if isinstance(value, str)
-                                     else json.dumps(value, ensure_ascii=False)) + "</arg_value>")
+                    prompt.append("<arg_key>" + guard(key) + "</arg_key><arg_value>"
+                                  + guard(value if isinstance(value, str)
+                                          else json.dumps(value, ensure_ascii=False)) + "</arg_value>")
                 prompt.append(BOX_END)
         elif role == "tool":
             if not prev_tool:                       # one <|observation|> per consecutive tool run
                 prompt.append("<|observation|>")
-            prompt.append(TR_OPEN + content_text(message.get("content"), f"messages.{index}.content") + TR_CLOSE)
+            prompt.append(TR_OPEN + guard(content_text(message.get("content"), f"messages.{index}.content")) + TR_CLOSE)
         else:
             raise APIError(400, f"Unsupported message role: {role!r}.",
                            f"messages.{index}.role", "unsupported_role")
         prev_tool = (role == "tool")
     prompt.append("<|assistant|><think>" if enable_thinking else
                   "<|assistant|><think></think>")
-    return "".join(prompt)
+    return guard_finalize("".join(prompt))
 
 
 def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None, tools=None,
@@ -1836,7 +1923,10 @@ class Engine:
                  cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
-        payload = prompt.encode("utf-8")
+        # guarded prompt (#8): ship the untrusted-content byte ranges ahead of
+        # the template so the engine can tokenize with added-token matching
+        # suppressed inside them (guarded_payload); flat for legacy strings.
+        payload = guarded_payload(prompt)
         if b"\0" in payload:
             raise APIError(400, "NUL bytes are not supported in prompts.", "messages")
         gpayload = grammar.encode("utf-8") if grammar else b""
@@ -3052,7 +3142,9 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "Colibri currently requires `prompt` to be a string.", "prompt")
         if not prompt:
             raise APIError(400, "`prompt` must not be empty.", "prompt")
-        self.generation(body, prompt, request_id, False)
+        # raw completion text is wholly client-controlled: guard all of it, so
+        # special-token text in a completion prompt stays literal text
+        self.generation(body, guard_finalize(guard(prompt)), request_id, False)
 
 
 def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,

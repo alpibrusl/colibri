@@ -33,6 +33,7 @@
 #endif
 #include "st.h"
 #include "tok.h"
+#include "guard_wire.h"
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -1864,7 +1865,14 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     Cfg *c = &m->c;
     int cap = q->plen + 16;
     int *ids = malloc((size_t)cap * sizeof(int));
-    int np = tok_encode(T, q->payload, q->plen, ids, cap);
+    /* SEC (#8): CGUARD1 -- suppress added-token matches inside untrusted
+     * content ranges (role/content/end markers are all added tokens in this
+     * template); refuse malformed guard tables, never downgrade. */
+    const char *ptxt; int ptl, ngw, *gsp;
+    int gw = gw_parse(q->payload, q->plen, &ptxt, &ptl, &gsp, &ngw);
+    if (gw < 0) { printf("ERROR %s bad guard table\n", q->id); fflush(stdout); free(ids); return; }
+    int np = tok_encode_guarded(T, ptxt, ptl, gsp, ngw, ids, cap);
+    free(gsp);
     if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
     const char *bad = prompt_reject(np, q->max_tok);
     if (bad) { printf("ERROR %s %s\n", q->id, bad); fflush(stdout); free(ids); return; }

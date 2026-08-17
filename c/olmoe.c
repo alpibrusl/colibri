@@ -146,6 +146,7 @@ static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fpr
 static float g_temp = 0.7f;   /* TEMP env overrides */
 static float g_nuc  = 0.95f;  /* NUCLEUS env overrides */
 #include "sample.h"
+#include "guard_wire.h"
 
 /* y[S,O] = x[S,I] @ W^T,  W e' [O,I] row-major */
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
@@ -1166,7 +1167,16 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     Cfg *c = &m->c;
     int cap = q->plen + 16;
     int *ids = malloc((size_t)cap * sizeof(int));
-    int np = tok_encode(T, q->payload, q->plen, ids, cap);
+    /* SEC (#8): CGUARD1 payloads carry the byte ranges of untrusted content;
+     * added-token matches starting inside them are suppressed, so message
+     * text cannot become the |||IP_ADDRESS||| boundary marker. Legacy flat
+     * payloads keep the historical behavior. A malformed guard table is
+     * refused, never downgraded to an unguarded encode. */
+    const char *ptxt; int ptl, ngw, *gsp;
+    int gw = gw_parse(q->payload, q->plen, &ptxt, &ptl, &gsp, &ngw);
+    if (gw < 0) { printf("ERROR %s bad guard table\n", q->id); fflush(stdout); free(ids); return; }
+    int np = tok_encode_guarded(T, ptxt, ptl, gsp, ngw, ids, cap);
+    free(gsp);
     if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
     if (np + q->max_tok > ctx_cap) {
         printf("ERROR %s context exceeds CTX (%d + %d > %d)\n", q->id, np, q->max_tok, ctx_cap);
