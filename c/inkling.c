@@ -484,6 +484,7 @@ static void load_cfg(Cfg *c, const char *snap) {
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
     char *buf = malloc(n+1); if(fread(buf,1,n,f)!=(size_t)n){} buf[n]=0; fclose(f);
     char *arena=NULL; jval *root = json_parse(buf, &arena);
+    if (!root) { fprintf(stderr, "config.json: malformed JSON\n"); exit(1); }
     jval *r = json_get(root, "text_config"); if (!r) r = root;
 
     c->hidden      = (int)jnum(r,"hidden_size",6144);
@@ -2222,6 +2223,7 @@ int main(int argc, char **argv) {
     int *tfref = read_int_array(ref,"tf_pred",&ntf);
     /* optional audio oracle: "dmel" = flattened [n_frames, mel_bins] levels */
     int *dmint = read_int_array(ref,"dmel",&ndm);
+    if(!pids||!full||np<1||nfull<np){ fprintf(stderr,"ref file missing prompt_ids/full_ids or malformed\n"); return 1; }
     int ngen = nfull - np;
 
     Model m; model_init(&m, snap, cap, bits);

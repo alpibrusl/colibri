@@ -265,6 +265,7 @@ static void load_cfg(Cfg *c, const char *snap) {
     char *buf = malloc((size_t)n+1); if(!buf){ fprintf(stderr,"OOM reading %s\n",path); exit(1); }
     if(fread(buf,1,(size_t)n,f)!=(size_t)n){ fprintf(stderr,"%s: short read\n",path); exit(1); } buf[n]=0; fclose(f);
     char *arena=NULL; jval *r = json_parse(buf, &arena);
+    if(!r){ fprintf(stderr,"config.json: malformed JSON\n"); exit(1); }
     c->hidden    = (int)req_num(r,"hidden_size");
     c->n_layers  = (int)req_num(r,"num_hidden_layers");
     c->n_heads   = (int)req_num(r,"num_attention_heads");
@@ -1288,6 +1289,7 @@ static void serve_loop(Model *m, Tok *T, int ctx_cap) {
 /* ---------- lettura ref.json ---------- */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
     jval *a = json_get(o, key);
+    if (!a || a->t != J_ARR) { *n_out = 0; return NULL; }   /* missing key or malformed ref: caller checks */
     int *r = malloc(a->len * sizeof(int));
     for (int i = 0; i < a->len; i++) r[i] = (int)a->kids[i]->num;
     *n_out = a->len; return r;
@@ -1377,6 +1379,7 @@ int main(int argc, char **argv) {
     char *buf=malloc(n+1); if (fread(buf,1,n,f)!=(size_t)n) {} buf[n]=0; fclose(f);
     char *arena=NULL; jval *ref = json_parse(buf, &arena);
     int np, nfull; int *prompt = read_int_array(ref,"prompt_ids",&np); int *full = read_int_array(ref,"full_ids",&nfull);
+    if(!prompt||!full||np<1||nfull<np){ fprintf(stderr,"ref file missing prompt_ids/full_ids or malformed\n"); return 1; }
     int n_new = nfull - np;
 
     Model m; model_init(&m, snap, cap, bits);

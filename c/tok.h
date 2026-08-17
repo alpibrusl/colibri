@@ -139,6 +139,7 @@ static void tok_load(Tok *T, const char *path){
     char *arena=NULL; jval *root=json_parse(buf,&arena);
     free(buf);
     (void)arena;
+    if(!root){ fprintf(stderr,"%s: malformed JSON\n",path); exit(1); }
     jval *model=json_get(root,"model");
     jval *vocab=json_get(model,"vocab");
     jval *merges=json_get(model,"merges");

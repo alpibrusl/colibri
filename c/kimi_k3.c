@@ -453,6 +453,7 @@ static void load_cfg(Cfg *c, const char *snap){
       if(fread(buf,1,(size_t)n,f)!=(size_t)n){ fprintf(stderr,"%s: short read\n",path); exit(1); }
       buf[n]=0; fclose(f); }
     char *arena=NULL; jval *root=json_parse(buf,&arena);
+    if(!root){ fprintf(stderr,"config.json: malformed JSON\n"); exit(1); }
     jval *tc=json_get(root,"text_config"); if(!tc||tc->t!=J_OBJ) tc=root;
     memset(c,0,sizeof(*c));
     c->hidden      =(int)req_num(tc,"hidden_size");

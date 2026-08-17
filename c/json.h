@@ -1,7 +1,18 @@
 /* Parser JSON minimale, header-only. Serve per:
  *  - l'header dei file safetensors (un grande oggetto nome->{dtype,shape,data_offsets})
  *  - ref.json (per leggere prompt_ids / full_ids)
- * Non e' completo (niente unicode \uXXXX, niente notazione esotica) ma copre cio' che serve. */
+ * Non e' completo (niente notazione esotica) ma copre cio' che serve.
+ *
+ * FAIL-CLOSED: json_parse ritorna NULL su input malformato (delimitatore
+ * mancante, oggetto/array non terminato, token sconosciuto, spazzatura dopo
+ * la radice, annidamento oltre J_MAX_DEPTH) e su OOM. Storicamente ritornava
+ * un albero PARZIALE senza alcun segnale d'errore -- {"a" 1} parsava, un
+ * array non chiuso diventava un array valido piu' corto, un token ignoto
+ * diventava J_NUM 0 -- e ogni chiamante doveva accorgersene da solo: con
+ * input non fidati (header safetensors da mirror, tokenizer.json, schema del
+ * client) il parse silenziosamente parziale e' esattamente il comportamento
+ * sbagliato. I chiamanti che gia' controllavano !root (st.h, cfse_pack,
+ * schema_gbnf, deepseek_v4) erano scritti per questo contratto; ora e' vero. */
 #ifndef JSON_H
 #define JSON_H
 #include <stdlib.h>
@@ -15,7 +26,7 @@ typedef struct jval {
     jtype t;
     double num;            /* J_NUM */
     int    boolean;        /* J_BOOL */
-    char  *str;            /* J_STR (NUL-terminata, dentro l'arena) */
+    char  *str;            /* J_STR (NUL-terminata, allocazione propria) */
     /* array: figli in [0..len); oggetto: chiavi[] e figli[] in parallelo */
     struct jval **kids;
     char        **keys;    /* solo per J_OBJ */
@@ -24,7 +35,7 @@ typedef struct jval {
 
 typedef struct {
     const char *s;
-    char       *arena;     /* buffer per le stringhe smontate */
+    char       *arena;     /* storico; sempre NULL (vedi j_dup) */
     size_t      acap, aoff;
     int         depth;     /* annidamento corrente: bound contro lo stack-overflow
                             * da JSON malevolo tipo [[[[...]]]] (discesa ricorsiva) */
@@ -34,12 +45,14 @@ typedef struct {
  * ~3). 1024 e' larghissimo per input legittimi e ben sotto il limite di stack. */
 #define J_MAX_DEPTH 1024
 
-static char *j_dup(jparser *p, const char *b, int n) {
+static void json_free(jval *v);
+
+static char *j_dup(const char *b, int n) {
     /* ogni stringa ha la sua allocazione: un'arena con realloc sposterebbe il
      * buffer invalidando i puntatori gia' emessi (use-after-free). */
-    (void)p;
-    char *d = (char *)malloc(n + 1);
-    memcpy(d, b, n); d[n] = 0;
+    char *d = (char *)malloc((size_t)n + 1);
+    if (!d) return NULL;                       /* OOM: propagata, non NULL-deref */
+    memcpy(d, b, (size_t)n); d[n] = 0;
     return d;
 }
 
@@ -47,6 +60,7 @@ static void j_ws(jparser *p) { while (*p->s && isspace((unsigned char)*p->s)) p-
 
 static jval *j_new(jtype t) {
     jval *v = (jval *)calloc(1, sizeof(jval));
+    if (!v) return NULL;
     v->t = t; return v;
 }
 
@@ -57,14 +71,14 @@ static char *j_parse_str_raw(jparser *p) {
      * "assume *p->s == '\"'" was violated on the object-key path, and the
      * unconditional p->s++ would step past the buffer's NUL terminator and scan
      * adjacent heap (OOB read leaking into tensor names). */
-    if (*p->s != '"') return j_dup(p, "", 0);
+    if (*p->s != '"') return NULL;
     p->s++;
     /* buffer su heap che CRESCE: niente troncamento silenzioso a 64KB (le stringhe
      * lunghe di tokenizer.json/config venivano tagliate) e niente 64KB di stack. */
     size_t cap = 64, n = 0; char *tmp = (char *)malloc(cap);
-    if (!tmp) { fprintf(stderr, "OOM parsing JSON string\n"); exit(1); }
-    #define J_PUT(ch) do{ if (n + 1 >= cap) { cap *= 2; tmp = (char *)realloc(tmp, cap); \
-        if (!tmp) { fprintf(stderr, "OOM parsing JSON string\n"); exit(1); } } tmp[n++] = (char)(ch); }while(0)
+    if (!tmp) return NULL;
+    #define J_PUT(ch) do{ if (n + 1 >= cap) { cap *= 2; char *g = (char *)realloc(tmp, cap); \
+        if (!g) { free(tmp); return NULL; } tmp = g; } tmp[n++] = (char)(ch); }while(0)
     while (*p->s && *p->s != '"') {
         char c = *p->s++;
         if (c == '\\' && *p->s) {
@@ -95,67 +109,114 @@ static char *j_parse_str_raw(jparser *p) {
         J_PUT(c);
     }
     #undef J_PUT
-    if (*p->s == '"') p->s++;
-    char *out = j_dup(p, tmp, (int)n); free(tmp);
+    /* stringa non terminata (EOF prima della chiusura): errore, non un valore */
+    if (*p->s != '"') { free(tmp); return NULL; }
+    p->s++;
+    char *out = j_dup(tmp, (int)n); free(tmp);
     return out;
 }
 
 static jval *j_parse_val(jparser *p) {
     j_ws(p);
     char c = *p->s;
-    if (c == '"') { jval *v = j_new(J_STR); v->str = j_parse_str_raw(p); return v; }
+    if (c == '"') {
+        char *str = j_parse_str_raw(p);
+        if (!str) return NULL;
+        jval *v = j_new(J_STR);
+        if (!v) { free(str); return NULL; }
+        v->str = str; return v;
+    }
     if (c == '{') {
-        if (++p->depth > J_MAX_DEPTH) { p->depth--; return j_new(J_NULL); }
+        if (++p->depth > J_MAX_DEPTH) { p->depth--; return NULL; }
         p->s++; jval *v = j_new(J_OBJ);
-        int cap = 8; v->keys = malloc(cap * sizeof(char*)); v->kids = malloc(cap * sizeof(jval*));
+        if (!v) { p->depth--; return NULL; }
+        int cap = 8;
+        v->keys = (char **)malloc(cap * sizeof(char*));
+        v->kids = (jval **)malloc(cap * sizeof(jval*));
+        if (!v->keys || !v->kids) { json_free(v); p->depth--; return NULL; }
         j_ws(p);
         if (*p->s == '}') { p->s++; p->depth--; return v; }
         for (;;) {
             j_ws(p);
-            if (*p->s != '"') break;   /* SEC (GHSA-2qrj): object key must be a quoted string; stop on malformed input */
+            /* SEC (GHSA-2qrj): object key must be a quoted string */
+            if (*p->s != '"') goto obj_fail;
             char *key = j_parse_str_raw(p);
-            j_ws(p); if (*p->s == ':') p->s++;
+            if (!key) goto obj_fail;
+            j_ws(p);
+            if (*p->s != ':') { free(key); goto obj_fail; }   /* {"a" 1} non parsa piu' */
+            p->s++;
             jval *val = j_parse_val(p);
-            if (v->len == cap) { cap *= 2; v->keys = realloc(v->keys, cap*sizeof(char*)); v->kids = realloc(v->kids, cap*sizeof(jval*)); }
+            if (!val) { free(key); goto obj_fail; }
+            if (v->len == cap) {
+                cap *= 2;
+                char **nk = (char **)realloc(v->keys, cap*sizeof(char*));
+                if (nk) v->keys = nk;
+                jval **nv = (jval **)realloc(v->kids, cap*sizeof(jval*));
+                if (nv) v->kids = nv;
+                if (!nk || !nv) { free(key); json_free(val); goto obj_fail; }
+            }
             v->keys[v->len] = key; v->kids[v->len] = val; v->len++;
             j_ws(p);
             if (*p->s == ',') { p->s++; continue; }
             if (*p->s == '}') { p->s++; break; }
-            break;
+            goto obj_fail;                     /* spazzatura o EOF dentro l'oggetto */
         }
         p->depth--;
         return v;
+obj_fail:
+        json_free(v); p->depth--; return NULL;
     }
     if (c == '[') {
-        if (++p->depth > J_MAX_DEPTH) { p->depth--; return j_new(J_NULL); }
+        if (++p->depth > J_MAX_DEPTH) { p->depth--; return NULL; }
         p->s++; jval *v = j_new(J_ARR);
-        int cap = 8; v->kids = malloc(cap * sizeof(jval*));
+        if (!v) { p->depth--; return NULL; }
+        int cap = 8; v->kids = (jval **)malloc(cap * sizeof(jval*));
+        if (!v->kids) { json_free(v); p->depth--; return NULL; }
         j_ws(p);
         if (*p->s == ']') { p->s++; p->depth--; return v; }
         for (;;) {
             jval *val = j_parse_val(p);
-            if (v->len == cap) { cap *= 2; v->kids = realloc(v->kids, cap*sizeof(jval*)); }
+            if (!val) goto arr_fail;
+            if (v->len == cap) {
+                cap *= 2;
+                jval **nv = (jval **)realloc(v->kids, cap*sizeof(jval*));
+                if (!nv) { json_free(val); goto arr_fail; }
+                v->kids = nv;
+            }
             v->kids[v->len++] = val;
             j_ws(p);
             if (*p->s == ',') { p->s++; continue; }
             if (*p->s == ']') { p->s++; break; }
-            break;
+            goto arr_fail;                     /* spazzatura o EOF dentro l'array */
         }
         p->depth--;
         return v;
+arr_fail:
+        json_free(v); p->depth--; return NULL;
     }
-    if (c == 't' && !strncmp(p->s, "true", 4))  { p->s += 4; jval *v = j_new(J_BOOL); v->boolean = 1; return v; }
-    if (c == 'f' && !strncmp(p->s, "false", 5)) { p->s += 5; jval *v = j_new(J_BOOL); v->boolean = 0; return v; }
+    if (c == 't' && !strncmp(p->s, "true", 4))  { p->s += 4; jval *v = j_new(J_BOOL); if (v) v->boolean = 1; return v; }
+    if (c == 'f' && !strncmp(p->s, "false", 5)) { p->s += 5; jval *v = j_new(J_BOOL); return v; }
     if (c == 'n' && !strncmp(p->s, "null", 4))  { p->s += 4; return j_new(J_NULL); }
-    /* numero */
-    { char *end; double d = strtod(p->s, &end); p->s = end; jval *v = j_new(J_NUM); v->num = d; return v; }
+    /* numero: strtod deve consumare almeno un carattere -- prima, qualsiasi
+     * token sconosciuto diventava silenziosamente J_NUM 0 */
+    { char *end; double d = strtod(p->s, &end);
+      if (end == p->s) return NULL;
+      p->s = end; jval *v = j_new(J_NUM);
+      if (v) v->num = d;
+      return v; }
 }
 
 /* API */
 static jval *json_parse(const char *text, char **arena_out) {
     jparser p = { text, NULL, 0, 0, 0 };
+    if (arena_out) *arena_out = NULL;
     jval *v = j_parse_val(&p);
-    if (arena_out) *arena_out = p.arena; else free(p.arena);
+    if (v) {
+        /* la radice deve esaurire l'input (spazi finali ammessi: gli header
+         * safetensors sono paddati con 0x20). "{}garbage" era accettato. */
+        j_ws(&p);
+        if (*p.s) { json_free(v); v = NULL; }
+    }
     return v;
 }
 
