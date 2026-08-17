@@ -5,9 +5,9 @@ name: check
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main, dev, next]
   pull_request:
-    branches: [main, dev]
+    branches: [main, dev, next]
 
 permissions:
   contents: read
