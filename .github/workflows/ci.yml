@@ -78,12 +78,15 @@ jobs:
         # Already sanitized and already asserting byte identity across every
         # compiled decode arm; it just had no job to run in.
         run: make -C c fuzz-rans
-      - name: Parser fuzz (json + grammar + safetensors header)
-        # The three untrusted-input parsers fuzz-rans never covered: json.h
+      - name: Parser fuzz (json + grammar + safetensors header + tokenizer)
+        # The untrusted-input parsers fuzz-rans never covered: json.h
         # (safetensors headers + tokenizer.json/config from model mirrors),
-        # grammar.h (the client-supplied GBNF the server accepts), and st.h's
-        # header parse. Structured mutants in exactly-sized buffers so a read
-        # past a parsed string's end is an ASan report, not silent slack.
+        # grammar.h (the client-supplied GBNF the server accepts), st.h's
+        # header parse, and tok.h's loader + encode paths (#5's deferred
+        # item -- fuzz-tok landed once the token-framing work, #8's CGUARD1
+        # guarded encode, stopped moving these paths weekly). Structured
+        # mutants in exactly-sized buffers so a read past a parsed string's
+        # end is an ASan report, not silent slack.
         run: make -C c fuzz-parsers
 
   # ThreadSanitizer over the lock-free concurrency the engine is built on.

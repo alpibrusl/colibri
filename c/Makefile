@@ -906,8 +906,17 @@ fuzz-st-header: tests/fuzz_st_header.c tests/fuzz_mut.h st.h json.h
 	$(CC) $(FUZZ_CFLAGS) tests/fuzz_st_header.c -o tests/fuzz_st_header -lm
 	@$(FUZZ_ENV) ./tests/fuzz_st_header
 
-fuzz-parsers: fuzz-json fuzz-grammar fuzz-st-header
-	@echo "fuzz-parsers: json + grammar + safetensors-header parsers clean under ASan + UBSan"
+# tok.h's loader (tok_load, fork-per-mutant like fuzz-st-header -- it exit()s
+# on hostile structure by design) and encode paths (tok_encode_raw,
+# tok_encode_guarded -- the #8 CGUARD1 surface, run in-process against the
+# in-repo tiny fixture). The #5 item deferred at PR #1 pending the
+# token-framing work, which has since landed.
+fuzz-tok: tests/fuzz_tok.c tests/fuzz_mut.h tok.h tests/tok_o200k_tiny.json
+	$(CC) $(FUZZ_CFLAGS) tests/fuzz_tok.c -o tests/fuzz_tok -lm
+	@$(FUZZ_ENV) ./tests/fuzz_tok
+
+fuzz-parsers: fuzz-json fuzz-grammar fuzz-st-header fuzz-tok
+	@echo "fuzz-parsers: json + grammar + safetensors-header + tokenizer parsers clean under ASan + UBSan"
 
 tests/test_int3$(EXE): tests/test_int3.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -1212,7 +1221,7 @@ bench: iobench$(EXE)
 .PHONY: bench-omp-grain
 .PHONY: test-asan
 .PHONY: test-tsan
-.PHONY: fuzz-json fuzz-grammar fuzz-st-header fuzz-parsers
+.PHONY: fuzz-json fuzz-grammar fuzz-st-header fuzz-tok fuzz-parsers
 
 tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 	$(CC) $(CFLAGS) tests/test_kv_prefix.c -o tests/test_kv_prefix$(EXE) $(LDFLAGS)
