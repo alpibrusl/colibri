@@ -39,7 +39,17 @@ near-copies -> alignment reveals what naive cosine misses).
 """
 import json
 import re
+import os
 import sys
+
+try:                          # imported as tools.expert_redundancy
+    from . import ledger
+except ImportError:           # run as a script, or loaded by file path
+    # Both are real: the documented invocation is `python3 tools/<tool>.py`,
+    # and tests/test_research_tools.py loads these modules by path, where
+    # neither the package nor the tools directory is importable on its own.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import ledger
 
 try:
     import numpy as np
@@ -205,6 +215,26 @@ def selftest():
     return 0 if ok else 1
 
 
+def report_of(model_dir, report, passed):
+    """The measurement as ledger claims (#34).
+
+    The spectra and per-group tables are kept verbatim under `detail` — the
+    whole point of `--out` is that nothing is lost — while `claims` is the
+    flat integer summary a ledger can hold and compare. Split out of main()
+    so it is testable without torch: the loader needs a real checkpoint, the
+    reporting does not, and the reporting is the part that has to agree with
+    every other tool's convention.
+    """
+    n = len(report)
+    verdict = ("prototype worth building" if passed > n // 2
+               else "close #31 with this data")
+    claims = ledger.flatten("", report, {})
+    claims["groups"] = n
+    claims["groups_pass"] = passed
+    return ledger.claims_report("expert_redundancy.py", [model_dir], verdict,
+                                report, claims)
+
+
 def main():
     args = sys.argv[1:]
     if args and args[0] == "--selftest":
@@ -242,8 +272,10 @@ def main():
     print(f"\ngate (r95_stack <= min(O,I)/4): {passed}/{n} groups pass "
           f"-> {'prototype worth building' if passed > n // 2 else 'close #31 with this data'}")
     if out:
-        json.dump(report, open(out, "w"), indent=1)
-        print(f"full report -> {out}")
+        json.dump(report_of(model_dir, report, passed), open(out, "w"), indent=1)
+        print(f"full report -> {out}  "
+              f"(record it: python3 tools/ledger.py --report={out} "
+              f"--series=expert-redundancy --attempt=1 --out=entry.json)")
 
 
 if __name__ == "__main__":
