@@ -67,6 +67,10 @@ try:                          # imported as tools.expert_layout
 except ImportError:           # run as a script, or loaded by file path
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import ledger
+try:
+    from . import trace_health
+except ImportError:
+    import trace_health
 
 # A gain smaller than this is noise dressed as a finding: the run-count metric
 # moves a little under any permutation, which is what the random control below
@@ -273,9 +277,17 @@ def gains(scored):
 
 
 # ------------------------------------------------------------------ report
-def report_of(paths, forwards, scored, g):
-    """Ledger-shaped claims (tools/ledger.py): flat, integer, comparable."""
-    worth = g["vs_identity"] > GAIN_THRESHOLD and g["vs_random"] > GAIN_THRESHOLD
+def report_of(paths, forwards, scored, g, gate=None):
+    """Ledger-shaped claims (tools/ledger.py): flat, integer, comparable.
+
+    A degenerate trace (trace_health.py) can never be "worth an engine slice",
+    however good the read reduction looks: a router that is not discriminating
+    produces predictable-looking routing out of its initialization alone, and
+    this tool measured a 21.6% reduction on exactly such a trace.
+    """
+    degenerate = gate is not None and trace_health.is_degenerate(gate)
+    worth = (not degenerate
+             and g["vs_identity"] > GAIN_THRESHOLD and g["vs_random"] > GAIN_THRESHOLD)
     claims = {
         "forwards": len(forwards),
         "read_reduction_vs_identity_micro": ledger.micro(g["vs_identity"]),
@@ -285,8 +297,14 @@ def report_of(paths, forwards, scored, g):
     for name, s in sorted(scored.items()):
         claims[f"{name}.reads"] = s["reads"]
         claims[f"{name}.experts_per_read_micro"] = ledger.micro(s["experts_per_read"])
-    verdict = ("clustered layout worth an engine slice" if worth
-               else "no layout gain beyond the control — close #36 with this data")
+    if degenerate:
+        claims.update(trace_health.claims(gate))
+        verdict = "no verdict — degenerate trace (see trace_health.py)"
+    else:
+        if gate is not None:
+            claims.update(trace_health.claims(gate))
+        verdict = ("clustered layout worth an engine slice" if worth
+                   else "no layout gain beyond the control — close #36 with this data")
     return ledger.claims_report("expert_layout.py", paths, verdict,
                                 {"scored": scored, "gains": g,
                                  "threshold": GAIN_THRESHOLD}, claims)
@@ -396,6 +414,7 @@ def main():
     forwards = parse_forwards(traces)
     if not forwards:
         sys.exit("no forwards parsed — is this a ROUTE_TRACE dump? (route_trace.h)")
+    gate = trace_health.gate_stats(traces)
     scored, placements, by_layer = evaluate(forwards)
     g = gains(scored)
 
@@ -405,11 +424,15 @@ def main():
         print(f"  {name:10s} reads {s['reads']:8d}   experts/read {s['experts_per_read']:.3f}")
     print(f"  read reduction: {g['vs_identity']:+.3f} vs identity, "
           f"{g['vs_random']:+.3f} vs the random control")
-    print(f"  -> {'worth an engine slice' if g['vs_identity'] > GAIN_THRESHOLD and g['vs_random'] > GAIN_THRESHOLD else 'no layout gain beyond the control'}")
+    warn = trace_health.warning(gate)
+    if warn:
+        print(f"  {warn}")
+    else:
+        print(f"  -> {'worth an engine slice' if g['vs_identity'] > GAIN_THRESHOLD and g['vs_random'] > GAIN_THRESHOLD else 'no layout gain beyond the control'}")
 
     if out:
         with open(out, "w") as f:
-            json.dump(report_of(traces, forwards, scored, g), f, indent=1)
+            json.dump(report_of(traces, forwards, scored, g, gate), f, indent=1)
         print(f"  report -> {out}  (record it: python3 tools/ledger.py "
               f"--report={out} --series=expert-layout --attempt=1 --out=entry.json)")
     if perm_out:

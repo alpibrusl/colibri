@@ -18,6 +18,11 @@ not runtime dependencies of the C engine.
   `expert_layout.py` scores its layout on a HELD-OUT split against both the
   current order and a random control, because a seriation heuristic scored
   in-sample reports a read reduction on routing that has no structure at all
+- `trace_health.py`: whether a ROUTE_TRACE can support a conclusion at all.
+  Both routing tools consult it and withhold their verdict on a degenerate
+  capture — a random-weight checkpoint through the real engine produced
+  +0.135 temporal gain and a 21.6% read reduction, from a router whose gates
+  were within rounding of uniform (entropy 0.9999)
 - `ledger.py`: one scaling convention and one record shape, so a measurement
   that costs a real checkpoint can be appended to a run ledger
   ([lex-notebooklab](https://github.com/alpibrusl/lex-notebooklab)) instead of

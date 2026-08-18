@@ -50,6 +50,86 @@ class ResearchToolSelftests(unittest.TestCase):
         self.assertIn("selftest: ok", proc.stdout)
 
 
+class TraceHealth(unittest.TestCase):
+    """A trace that cannot support a conclusion must not receive a verdict."""
+
+    def _mod(self, name):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(name, TOOLS / f"{name}.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _trace(self, gates, rows=40, layers=3):
+        path = HERE / "_tmp_health_trace.txt"
+        with open(path, "w") as f:
+            call = 0
+            for _ in range(rows):
+                for layer in range(layers):
+                    f.write(f"{call} 0 {layer} " +
+                            " ".join(f"{i}:{g:.4f}" for i, g in enumerate(gates)) + "\n")
+                    call += 1
+        return path
+
+    def test_selftest(self):
+        proc = _run("trace_health.py")
+        self.assertEqual(proc.returncode, 0,
+                         f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        self.assertIn("selftest: ok", proc.stdout)
+
+    def test_uniform_gates_are_degenerate(self):
+        th = self._mod("trace_health")
+        # The measurement from a random-weight OLMoE checkpoint run through the
+        # real engine: gates within 4% of each other, entropy 0.9999.
+        path = self._trace([0.1284, 0.1268, 0.1251, 0.1242,
+                            0.1241, 0.1238, 0.1238, 0.1238])
+        try:
+            stats = th.gate_stats([str(path)])
+            self.assertTrue(th.is_degenerate(stats))
+            self.assertIsNotNone(th.warning(stats))
+            self.assertEqual(th.claims(stats)["gate.degenerate"], 1)
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_peaked_gates_are_not_degenerate(self):
+        th = self._mod("trace_health")
+        path = self._trace([0.60, 0.20, 0.10, 0.04, 0.03, 0.01, 0.01, 0.01])
+        try:
+            stats = th.gate_stats([str(path)])
+            self.assertFalse(th.is_degenerate(stats))
+            self.assertIsNone(th.warning(stats))
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_degenerate_trace_suppresses_both_verdicts(self):
+        # The regression this exists for. On a random-weight trace the two
+        # tools reported +0.135 temporal gain and a 21.6% read reduction —
+        # both over their thresholds, both meaningless. The gain may still be
+        # reported; the VERDICT must not be.
+        th = self._mod("trace_health")
+        rt = self._mod("route_temporal")
+        el = self._mod("expert_layout")
+        path = self._trace([0.125] * 8)
+        try:
+            gate = th.gate_stats([str(path)])
+            self.assertTrue(th.is_degenerate(gate))
+
+            seqs = rt.parse_traces([str(path)])
+            recalls, total = rt.evaluate(seqs)
+            report = rt.report_of([str(path)], seqs, recalls, total, 1, gate)
+            self.assertEqual(report["claims"]["worth_engine_slice"], 0)
+            self.assertIn("degenerate", report["verdict"])
+            self.assertEqual(report["claims"]["gate.degenerate"], 1)
+
+            forwards = el.parse_forwards([str(path)])
+            scored, _, _ = el.evaluate(forwards)
+            report = el.report_of([str(path)], forwards, scored, el.gains(scored), gate)
+            self.assertEqual(report["claims"]["worth_engine_slice"], 0)
+            self.assertIn("degenerate", report["verdict"])
+        finally:
+            path.unlink(missing_ok=True)
+
+
 class ExpertLayout(unittest.TestCase):
     """#36: the layout tool only reports a win when there is one to report."""
 

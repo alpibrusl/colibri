@@ -56,6 +56,10 @@ except ImportError:           # run as a script, or loaded by file path
     # neither the package nor the tools directory is importable on its own.
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import ledger
+try:
+    from . import trace_health
+except ImportError:
+    import trace_health
 
 
 def parse_traces(paths):
@@ -191,7 +195,7 @@ def selftest():
 GAIN_THRESHOLD = 0.05
 
 
-def report_of(paths, sequences, recalls, total, budget_mult):
+def report_of(paths, sequences, recalls, total, budget_mult, gate=None):
     """The measurement as ledger claims: integers, flat, and comparable.
 
     Recalls are rates in [0,1] and travel as millionths; the verdict travels
@@ -199,16 +203,24 @@ def report_of(paths, sequences, recalls, total, budget_mult):
     someone can query rather than a sentence someone has to re-read.
     """
     gap = max(recalls["identity"], recalls["conditional"]) - recalls["heat"]
+    # A degenerate trace cannot be worth an engine slice however large the gap:
+    # a router that is not discriminating is predictable from its
+    # initialization alone, and this tool measured +0.135 on exactly such a
+    # trace (see trace_health.py).
+    degenerate = gate is not None and trace_health.is_degenerate(gate)
     claims = {
         "sequences": len(sequences),
         "scores": total,
         "budget_mult": budget_mult,
         "temporal_gain_micro": ledger.micro(gap),
-        "worth_engine_slice": ledger.bit(gap > GAIN_THRESHOLD),
+        "worth_engine_slice": ledger.bit(gap > GAIN_THRESHOLD and not degenerate),
     }
     for name in ("heat", "identity", "conditional"):
         claims[f"recall.{name}_micro"] = ledger.micro(recalls[name])
-    verdict = ("worth an engine slice" if gap > GAIN_THRESHOLD
+    if gate is not None:
+        claims.update(trace_health.claims(gate))
+    verdict = ("no verdict — degenerate trace (see trace_health.py)" if degenerate
+               else "worth an engine slice" if gap > GAIN_THRESHOLD
                else "no temporal signal worth chasing")
     return ledger.claims_report(
         "route_temporal.py", paths, verdict,
@@ -234,17 +246,21 @@ def main():
     if not args:
         raise SystemExit(__doc__)
     sequences = parse_traces(args)
+    gate = trace_health.gate_stats(args)
     recalls, total = evaluate(sequences, budget_mult)
     print(f"{len(sequences)} sequence(s), {total} (transition, layer) scores, "
           f"budget = true-set size x{budget_mult}")
     for name in ("heat", "identity", "conditional"):
         print(f"  recall@K {name:12s} {recalls[name]:.4f}")
     gap = max(recalls["identity"], recalls["conditional"]) - recalls["heat"]
+    warn = trace_health.warning(gate)
     print(f"  temporal gain over marginal: {gap:+.4f}"
           f"  ({'worth an engine slice' if gap > GAIN_THRESHOLD else 'no temporal signal worth chasing'})")
+    if warn:
+        print(f"  {warn}")
     if out:
         with open(out, "w") as f:
-            json.dump(report_of(args, sequences, recalls, total, budget_mult),
+            json.dump(report_of(args, sequences, recalls, total, budget_mult, gate),
                       f, indent=1)
         print(f"  report -> {out}  "
               f"(record it: python3 tools/ledger.py --report={out} "
