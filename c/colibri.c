@@ -558,7 +558,7 @@ static int g_cuda_fp8_ready;  /* e4m3 LUT published to the devices (see cuda_boo
 #ifdef COLI_VULKAN
 /* Drop a QT's Vulkan-resident copy (slot reused for a different expert). */
 static void qt_vk_reset(QT *t){
-    if(t->vk){ coli_vk_tensor_free(t->vk); t->vk=NULL; }
+    if(t->vk){ g_gops->tensor_free(t->vk); t->vk=NULL; }
     t->vk_eligible=0;
 }
 /* Dense matmul on the Vulkan tier: y[S,O] = x[S,I] @ dequant(t)^T. Uploads the resident
@@ -568,15 +568,15 @@ static void qt_vk_reset(QT *t){
 static int vk_matmul_qt(QT *t, float *y, const float *x, int S){
     if(!g_vk_dense || !VK_FMT_OK(t)) return 0;
     const void *w = t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
-    return coli_vk_matmul(&t->vk, y, x, w, t->s, t->fmt, S, t->I, t->O, t->gs);
+    return g_gops->matmul((void**)&t->vk, y, x, w, t->s, t->fmt, S, t->I, t->O, t->gs);
 }
 /* Two same-input resident matmuls in one submit (q_a + kv_a read the same x). */
 static int vk_matmul_pair_qt(QT *a, float *ya, QT *b, float *yb, const float *x, int S){
     if(!g_vk_dense || a->fmt!=b->fmt || !VK_FMT_OK(a) || a->gs!=b->gs || a->I!=b->I) return 0;
     const void *wa = a->fmt==1 ? (const void*)a->q8 : (const void*)a->q4;
     const void *wb = b->fmt==1 ? (const void*)b->q8 : (const void*)b->q4;
-    return coli_vk_matmul_pair(&a->vk, ya, wa, a->s, a->O,
-                               &b->vk, yb, wb, b->s, b->O, a->fmt, x, S, a->I, a->gs);
+    return g_gops->matmul_pair((void**)&a->vk, ya, wa, a->s, a->O,
+                               (void**)&b->vk, yb, wb, b->s, b->O, a->fmt, x, S, a->I, a->gs);
 }
 #endif
 #ifdef COLI_CUDA
@@ -3374,10 +3374,10 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         if(g_vk_qprep==2){ dbgQ=falloc((int64_t)S*l->q_b.O); dbgC=falloc((int64_t)S*l->kv_a.O); }
         if(g_vk_qprep && g_vk_dense && l->q_a.fmt==l->kv_a.fmt && l->q_a.fmt==l->q_b.fmt && VK_FMT_OK(&l->q_a)
            && l->q_a.gs==l->kv_a.gs && l->q_a.gs==l->q_b.gs)
-            vk_qp=coli_vk_attn_qprep(layer,
-                &l->q_a.vk, l->q_a.fmt==1?(const void*)l->q_a.q8:(const void*)l->q_a.q4, l->q_a.s, l->q_a.O,
-                &l->kv_a.vk, l->kv_a.fmt==1?(const void*)l->kv_a.q8:(const void*)l->kv_a.q4, l->kv_a.s, l->kv_a.O,
-                &l->q_b.vk, l->q_b.fmt==1?(const void*)l->q_b.q8:(const void*)l->q_b.q4, l->q_b.s, l->q_b.O,
+            vk_qp=g_gops->attn_qprep(layer,
+                (void**)&l->q_a.vk, l->q_a.fmt==1?(const void*)l->q_a.q8:(const void*)l->q_a.q4, l->q_a.s, l->q_a.O,
+                (void**)&l->kv_a.vk, l->kv_a.fmt==1?(const void*)l->kv_a.q8:(const void*)l->kv_a.q4, l->kv_a.s, l->kv_a.O,
+                (void**)&l->q_b.vk, l->q_b.fmt==1?(const void*)l->q_b.q8:(const void*)l->q_b.q4, l->q_b.s, l->q_b.O,
                 l->q_a.fmt, l->q_a.gs, l->q_a_ln, c->eps, x, S, l->q_a.I,
                 g_vk_qprep==2?dbgQ:Q, g_vk_qprep==2?dbgC:comp,
                 g_vk_qprep==2?NULL:QR);   /* the DSA indexer reads the NORMED latent from QR */
@@ -3652,23 +3652,23 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                                                 * mirror learns fp8 */
             int dsa_on=0; if(dnsel) for(int s=0;s<S;s++) if(dnsel[s]>0) dsa_on=1;
             int st0=m->kv_start[layer], T=pos_base+S;
-            if(!dsa_on&&T<=m->max_t&&coli_vk_kv_ensure(layer,m->max_t,kvl,c->qk_rope)){
+            if(!dsa_on&&T<=m->max_t&&g_gops->kv_ensure(layer,m->max_t,kvl,c->qk_rope)){
                 int ok=1;
                 for(int t=m->vk_kv_valid[layer];t<T&&ok;t++)
-                    ok=coli_vk_kv_row(layer,t,coli_kv_row(m->Lc[layer],t,kvl),
+                    ok=g_gops->kv_row(layer,t,coli_kv_row(m->Lc[layer],t,kvl),
                                       coli_kv_row(m->Rc[layer],t,c->qk_rope));
                 if(ok){
                     m->vk_kv_valid[layer]=T;
                     const void *kw=l->kv_b.fmt==1?(const void*)l->kv_b.q8:(const void*)l->kv_b.q4;
                     /* fused absorb + o-projection: ctx never leaves the device */
                     if(VK_FMT_OK(&l->o)&&
-                       coli_vk_attention_absorb_project(&l->kv_b.vk,kw,l->kv_b.s,l->kv_b.fmt,l->kv_b.gs,
-                            &l->o.vk,l->o.fmt==1?(const void*)l->o.q8:(const void*)l->o.q4,
+                       g_gops->attn_absorb_project((void**)&l->kv_b.vk,kw,l->kv_b.s,l->kv_b.fmt,l->kv_b.gs,
+                            (void**)&l->o.vk,l->o.fmt==1?(const void*)l->o.q8:(const void*)l->o.q4,
                             l->o.s,l->o.fmt,l->o.gs,out,Q,layer,S,H,c->qk_nope,c->qk_rope,
                             vh,kvl,st0,T,c->attn_scale,D))
                         vk_core=vk_projected=1;
                     if(!vk_core)
-                        vk_core=coli_vk_attention_absorb(&l->kv_b.vk,kw,
+                        vk_core=g_gops->attn_absorb((void**)&l->kv_b.vk,kw,
                             l->kv_b.s,l->kv_b.fmt,l->kv_b.gs,ctx,Q,layer,S,H,c->qk_nope,c->qk_rope,
                             vh,kvl,st0,T,c->attn_scale);
                 }
@@ -4309,9 +4309,9 @@ static void moe_shared(Layer *l, int D, int sI, float *x, int S, float *out,
         if(g_vk_dense && !omp_in_parallel() && (fsh==1||fsh==2||fsh==5) &&
            l->sh_up.fmt==fsh && l->sh_down.fmt==fsh){
             #define SW_(t) ((t).fmt==1?(const void*)(t).q8:(const void*)(t).q4)
-            if(coli_vk_tensor_ensure(&l->sh_gate.vk,SW_(l->sh_gate),l->sh_gate.s,fsh,D,sI,l->sh_gate.gs)&&
-               coli_vk_tensor_ensure(&l->sh_up.vk,  SW_(l->sh_up),  l->sh_up.s,  fsh,D,sI,l->sh_up.gs)&&
-               coli_vk_tensor_ensure(&l->sh_down.vk,SW_(l->sh_down),l->sh_down.s,fsh,sI,D,l->sh_down.gs)){
+            if(g_gops->tensor_ensure((void**)&l->sh_gate.vk,SW_(l->sh_gate),l->sh_gate.s,fsh,D,sI,l->sh_gate.gs,0)&&
+               g_gops->tensor_ensure((void**)&l->sh_up.vk,  SW_(l->sh_up),  l->sh_up.s,  fsh,D,sI,l->sh_up.gs,0)&&
+               g_gops->tensor_ensure((void**)&l->sh_down.vk,SW_(l->sh_down),l->sh_down.s,fsh,sI,D,l->sh_down.gs,0)){
                 ColiVkTensor *vg=l->sh_gate.vk,*vu=l->sh_up.vk,*vd=l->sh_down.vk;
                 int rows1[1]={S};
                 if(g_gops && g_gops->expert_group((void *const*)&vg,(void *const*)&vu,
@@ -4728,7 +4728,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 if(!nr){ if(g_pipe && qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_ewait += now_s()-tw; } continue; }
                 if(vk_hit[j]){          /* registry-served: no RAM slot, no disk load */
                     ColiVkTensor **reg=vk_reg_at(layer,eid);
-                    if(vk2_on && coli_vk_tensor_dev(reg[0])==1){   /* dev2 tier expert */
+                    if(vk2_on && g_gops->tensor_dev(reg[0])==1){   /* dev2 tier expert */
                         voff2[nvk2]=vtot2;
                         for(int r=0;r<nr;r++){ memcpy(vk_xh2+(int64_t)(vtot2+r)*D, x+(int64_t)rows[r]*D, D*sizeof(float));
                             vrmap2[nvk2*S+r]=rows[r]; vwmap2[nvk2*S+r]=rw[r]; }
@@ -5789,7 +5789,7 @@ static void kv_alloc(Model *m, int max_t){
 #endif
 #ifdef COLI_VULKAN
     if(g_vulkan&&m->vk_kv_valid){                        /* dimensioni cambiate: cache VK da rifare */
-        coli_vk_kv_reset();
+        g_gops->kv_reset();
         for(int i=0;i<c->n_layers+1;i++) m->vk_kv_valid[i]=0;
     }
 #endif
@@ -7794,11 +7794,11 @@ static void vk_dense_preload(Model *m){
             if(t->vk || !VK_FMT_OK(t) || t->I<=0 || t->O<=0) continue;
             const void *w = t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
             if(!w || !t->s) continue;
-            if(!coli_vk_tensor_ensure(&t->vk,w,t->s,t->fmt,t->I,t->O,t->gs)){
+            if(!g_gops->tensor_ensure((void**)&t->vk,w,t->s,t->fmt,t->I,t->O,t->gs,0)){
                 fprintf(stderr,"[VK] dense preload: VRAM full at layer %d — remaining tensors stay lazy\n",i);
                 full=1; break;
             }
-            bytes+=coli_vk_tensor_bytes(t->vk); nt++;
+            bytes+=g_gops->tensor_bytes(t->vk); nt++;
         }
     }
     if(nt) fprintf(stderr,"[VK] dense preloaded: %d tensors, %.2f GB VRAM in %.1fs\n",
@@ -7832,7 +7832,7 @@ static void vk_registry_fill(Model *m){
     int64_t i2=0;
     coli_vk_alloc_priority(0.4f);
     for(;i2<n && g_vk_reg_n<g_vk_budget;i2++){
-        if(vkr_reserve>0 && (g_vk_reg_n&7)==0 && coli_vk_mem_budget(&vkr_used,&vkr_budget)
+        if(vkr_reserve>0 && (g_vk_reg_n&7)==0 && g_gops->mem_budget(0,&vkr_used,&vkr_budget)
            && vkr_budget-vkr_used < vkr_reserve){ vkr_stopped=1; break; }
         int layer=cand[i2].layer, eid=cand[i2].eid; tried++;
         ESlot *src=NULL, *P=m->tc.pin[layer];
@@ -7850,15 +7850,15 @@ static void vk_registry_fill(Model *m){
                 layer,eid,src->g.fmt,src->u.fmt,src->d.fmt,src==&tmp?"load":"pin");
             continue; }
         ColiVkTensor **slot=vk_reg_at(layer,eid);
-        if(!coli_vk_tensor_ensure(&slot[0],src->g.q4,src->g.s,xf,c->hidden,c->moe_inter,src->g.gs)||
-           !coli_vk_tensor_ensure(&slot[1],src->u.q4,src->u.s,xf,c->hidden,c->moe_inter,src->u.gs)||
-           !coli_vk_tensor_ensure(&slot[2],src->d.q4,src->d.s,src->d.fmt,c->moe_inter,c->hidden,src->d.gs)){
-            if(slot[0]){coli_vk_tensor_free(slot[0]);slot[0]=NULL;}
-            if(slot[1]){coli_vk_tensor_free(slot[1]);slot[1]=NULL;}
+        if(!g_gops->tensor_ensure((void**)&slot[0],src->g.q4,src->g.s,xf,c->hidden,c->moe_inter,src->g.gs,0)||
+           !g_gops->tensor_ensure((void**)&slot[1],src->u.q4,src->u.s,xf,c->hidden,c->moe_inter,src->u.gs,0)||
+           !g_gops->tensor_ensure((void**)&slot[2],src->d.q4,src->d.s,src->d.fmt,c->moe_inter,c->hidden,src->d.gs,0)){
+            if(slot[0]){g_gops->tensor_free(slot[0]);slot[0]=NULL;}
+            if(slot[1]){g_gops->tensor_free(slot[1]);slot[1]=NULL;}
             fprintf(stderr,"[VK] expert tier: VRAM full after %d experts\n",g_vk_reg_n);
             break;
         }
-        bytes+=coli_vk_tensor_bytes(slot[0])+coli_vk_tensor_bytes(slot[1])+coli_vk_tensor_bytes(slot[2]);
+        bytes+=g_gops->tensor_bytes(slot[0])+g_gops->tensor_bytes(slot[1])+g_gops->tensor_bytes(slot[2]);
         g_vk_reg_n++;
     }
     coli_vk_alloc_priority(0.75f);               /* back to the dense/default class */
@@ -7869,12 +7869,12 @@ static void vk_registry_fill(Model *m){
                 g_vk_reg_n,vkr_used,vkr_budget,vkr_reserve);
     /* DEV2 tier: continue down the heat ranking onto the second GPU (COLI_VK_DEV2),
      * starting at the candidate dev0 stopped on. Same fmt gates, its own budget. */
-    if(g_vk_budget2>0 && coli_vk_dev2_available()){
+    if(g_vk_budget2>0 && g_gops->dev_available(1)){
         double t20=now_s(); int64_t bytes2=0; int tried2=0;
         double vkr2_reserve = getenv("COLI_VK_RESERVE2_GB")?atof(getenv("COLI_VK_RESERVE2_GB")):0.5;
         int vkr2_stopped=0; double u2=0,b2=0;
         for(;i2<n && g_vk_reg_n2<g_vk_budget2;i2++){
-            if(vkr2_reserve>0 && (g_vk_reg_n2&7)==0 && coli_vk_mem_budget2(&u2,&b2)
+            if(vkr2_reserve>0 && (g_vk_reg_n2&7)==0 && g_gops->mem_budget(1,&u2,&b2)
                && b2-u2 < vkr2_reserve){ vkr2_stopped=1; break; }
             int layer=cand[i2].layer, eid=cand[i2].eid; tried2++;
             ESlot *src=NULL, *P=m->tc.pin[layer];
@@ -7888,15 +7888,15 @@ static void vk_registry_fill(Model *m){
                ||(xf==4&&(src->g.gs<8||src->g.gs%8))||(src->d.fmt==4&&(src->d.gs<8||src->d.gs%8)))
                 continue;
             ColiVkTensor **slot=vk_reg_at(layer,eid);
-            if(!coli_vk_tensor_ensure2(&slot[0],src->g.q4,src->g.s,xf,c->hidden,c->moe_inter,src->g.gs)||
-               !coli_vk_tensor_ensure2(&slot[1],src->u.q4,src->u.s,xf,c->hidden,c->moe_inter,src->u.gs)||
-               !coli_vk_tensor_ensure2(&slot[2],src->d.q4,src->d.s,src->d.fmt,c->moe_inter,c->hidden,src->d.gs)){
-                if(slot[0]){coli_vk_tensor_free(slot[0]);slot[0]=NULL;}
-                if(slot[1]){coli_vk_tensor_free(slot[1]);slot[1]=NULL;}
+            if(!g_gops->tensor_ensure((void**)&slot[0],src->g.q4,src->g.s,xf,c->hidden,c->moe_inter,src->g.gs,1)||
+               !g_gops->tensor_ensure((void**)&slot[1],src->u.q4,src->u.s,xf,c->hidden,c->moe_inter,src->u.gs,1)||
+               !g_gops->tensor_ensure((void**)&slot[2],src->d.q4,src->d.s,src->d.fmt,c->moe_inter,c->hidden,src->d.gs,1)){
+                if(slot[0]){g_gops->tensor_free(slot[0]);slot[0]=NULL;}
+                if(slot[1]){g_gops->tensor_free(slot[1]);slot[1]=NULL;}
                 fprintf(stderr,"[VK] dev2 tier: VRAM full after %d experts\n",g_vk_reg_n2);
                 break;
             }
-            bytes2+=coli_vk_tensor_bytes(slot[0])+coli_vk_tensor_bytes(slot[1])+coli_vk_tensor_bytes(slot[2]);
+            bytes2+=g_gops->tensor_bytes(slot[0])+g_gops->tensor_bytes(slot[1])+g_gops->tensor_bytes(slot[2]);
             g_vk_reg_n2++;
         }
         fprintf(stderr,"[VK] dev2 tier: %d experts resident (%.2f GB VRAM, %.1fs, next-%d of history)\n",

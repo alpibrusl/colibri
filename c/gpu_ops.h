@@ -72,6 +72,43 @@ typedef struct ColiGpuOps {
     int (*expert_group_issue)(void *const *g, void *const *u, void *const *d,
                               const int *rows, int n, const float *x, int dev);
     int (*expert_group_take)(float *y, int dev);
+
+    /* ---- dense matmul pair ----
+     * Two resident matmuls sharing one input x in ONE submit (the q_a + kv_a
+     * attention prologue). Same fmt/gs/I on both. 0 -> per-matmul fallback. */
+    int (*matmul_pair)(void **t1, float *y1, const void *w1, const float *s1, int O1,
+                       void **t2, float *y2, const void *w2, const float *s2, int O2,
+                       int fmt, const float *x, int S, int I, int gs);
+
+    /* ---- decode-attention family (MLA absorb core, slice 2) ----
+     * Device KV mirror: per-layer persistent latent/rope caches. ensure
+     * allocates a layer's cache at max_rows (0 -> unsupported here); row
+     * mirrors one host row at an absolute position; reset drops all layers
+     * (the caller keeps a valid-watermark and re-mirrors). */
+    int  (*kv_ensure)(int layer, int max_rows, int K, int Rd);
+    int  (*kv_row)(int layer, int pos, const float *L, const float *R);
+    void (*kv_reset)(void);
+    /* Absorb attention over cache rows [st0,T): q [S,H*(Qn+R)] roped, kv_b
+     * resident via *kvb, ctx out [S,H*V]. The _project variant fuses the
+     * o-projection ([Dout,H*V], resident via *ot) so ctx never leaves the
+     * device. 0 -> CPU path. */
+    int (*attn_absorb)(void **kvb, const void *w, const float *sc, int fmt, int gs,
+                       float *ctx, const float *q, int layer, int S, int H,
+                       int Qn, int R, int V, int K, int st0, int T, float scale);
+    int (*attn_absorb_project)(void **kvb, const void *w, const float *sc, int fmt, int gs,
+                               void **ot, const void *ow, const float *osc, int ofmt, int ogs,
+                               float *out, const float *q, int layer, int S, int H,
+                               int Qn, int R, int V, int K, int st0, int T, float scale, int Dout);
+    /* q-prep chain: [q_a+kv_a pair] -> rmsnorm(q latent) -> q_b in one
+     * submit; lnw = q-latent RMS-norm weights [Oqa]; lat_out (NULLable)
+     * receives the normed latent for the DSA indexer. 0 -> split path. */
+    int (*attn_qprep)(int layer,
+                      void **qa,  const void *wqa,  const float *sqa,  int Oqa,
+                      void **kva, const void *wkva, const float *skva, int Okva,
+                      void **qb,  const void *wqb,  const float *sqb,  int Oqb,
+                      int fmt, int gs, const float *lnw, float eps,
+                      const float *x, int S, int I,
+                      float *q_out, float *kv_out, float *lat_out);
 } ColiGpuOps;
 
 /* ======================= Vulkan adapter ======================= */
@@ -113,6 +150,40 @@ static int vkops_expert_group_issue(void *const *g, void *const *u, void *const 
 static int vkops_expert_group_take(float *y, int dev){
     return dev ? coli_vk_expert_group_take2(y) : coli_vk_expert_group_take(y);
 }
+static int vkops_matmul_pair(void **t1, float *y1, const void *w1, const float *s1, int O1,
+                             void **t2, float *y2, const void *w2, const float *s2, int O2,
+                             int fmt, const float *x, int S, int I, int gs){
+    return coli_vk_matmul_pair((ColiVkTensor**)t1,y1,w1,s1,O1,
+                               (ColiVkTensor**)t2,y2,w2,s2,O2,fmt,x,S,I,gs);
+}
+static int  vkops_kv_ensure(int layer,int max_rows,int K,int Rd){ return coli_vk_kv_ensure(layer,max_rows,K,Rd); }
+static int  vkops_kv_row(int layer,int pos,const float *L,const float *R){ return coli_vk_kv_row(layer,pos,L,R); }
+static void vkops_kv_reset(void){ coli_vk_kv_reset(); }
+static int vkops_attn_absorb(void **kvb, const void *w, const float *sc, int fmt, int gs,
+                             float *ctx, const float *q, int layer, int S, int H,
+                             int Qn, int R, int V, int K, int st0, int T, float scale){
+    return coli_vk_attention_absorb((ColiVkTensor**)kvb,w,sc,fmt,gs,ctx,q,layer,S,H,Qn,R,V,K,st0,T,scale);
+}
+static int vkops_attn_absorb_project(void **kvb, const void *w, const float *sc, int fmt, int gs,
+                                     void **ot, const void *ow, const float *osc, int ofmt, int ogs,
+                                     float *out, const float *q, int layer, int S, int H,
+                                     int Qn, int R, int V, int K, int st0, int T, float scale, int Dout){
+    return coli_vk_attention_absorb_project((ColiVkTensor**)kvb,w,sc,fmt,gs,
+                                            (ColiVkTensor**)ot,ow,osc,ofmt,ogs,
+                                            out,q,layer,S,H,Qn,R,V,K,st0,T,scale,Dout);
+}
+static int vkops_attn_qprep(int layer,
+                            void **qa,  const void *wqa,  const float *sqa,  int Oqa,
+                            void **kva, const void *wkva, const float *skva, int Okva,
+                            void **qb,  const void *wqb,  const float *sqb,  int Oqb,
+                            int fmt, int gs, const float *lnw, float eps,
+                            const float *x, int S, int I,
+                            float *q_out, float *kv_out, float *lat_out){
+    return coli_vk_attn_qprep(layer,(ColiVkTensor**)qa,wqa,sqa,Oqa,
+                              (ColiVkTensor**)kva,wkva,skva,Okva,
+                              (ColiVkTensor**)qb,wqb,sqb,Oqb,
+                              fmt,gs,lnw,eps,x,S,I,q_out,kv_out,lat_out);
+}
 
 static const ColiGpuOps coli_vk_gpu_ops = {
     .name               = "vulkan",
@@ -126,6 +197,13 @@ static const ColiGpuOps coli_vk_gpu_ops = {
     .expert_group       = vkops_expert_group,
     .expert_group_issue = vkops_expert_group_issue,
     .expert_group_take  = vkops_expert_group_take,
+    .matmul_pair        = vkops_matmul_pair,
+    .kv_ensure          = vkops_kv_ensure,
+    .kv_row             = vkops_kv_row,
+    .kv_reset           = vkops_kv_reset,
+    .attn_absorb        = vkops_attn_absorb,
+    .attn_absorb_project= vkops_attn_absorb_project,
+    .attn_qprep         = vkops_attn_qprep,
 };
 
 #endif /* COLI_VULKAN */
