@@ -116,15 +116,21 @@ jobs:
   vulkan:
     name: Vulkan (Lavapipe, software)
     runs-on: ubuntu-latest
+    # The apt install below has twice hung on a runner mirror for 20-40+
+    # minutes (a ~40-second job otherwise): the first run on the json.h PR
+    # and the FORK.md PR both sat in `apt-get` until superseded or merged
+    # around. Fail fast instead of blocking a PR for hours; Acquire::Retries
+    # covers the transient mirror errors that DO return instead of hanging.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Install the Vulkan toolchain and a software driver
         run: |
-          sudo apt-get update
+          sudo apt-get -o Acquire::Retries=3 update
           # libvulkan-dev: headers + loader. glslc: compiles the .comp shaders to SPIR-V --
           # neither is present on the runner by default, which is half of why VK=1 was
           # never built here. mesa-vulkan-drivers carries Lavapipe (lvp).
-          sudo apt-get install -y --no-install-recommends \
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
             libvulkan-dev glslc mesa-vulkan-drivers
       - name: Build with VK=1
         run: |
