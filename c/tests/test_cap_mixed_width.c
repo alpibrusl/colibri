@@ -167,10 +167,10 @@ int main(void){
         /* Cost of ADDING the MTP row -- the whole of #856. Measured twice the same
          * way, so nothing here duplicates cap_for_ram's slack formula. */
         g_mem_avail_boot=512.0;
-        g.has_mtp=0; g.resident_bytes=0; g.ecap=1<<20; cap_for_ram(&g,242.0,4,4096);
-        int cap_no=g.ecap;
-        g.has_mtp=1; g.resident_bytes=0; g.ecap=1<<20; cap_for_ram(&g,242.0,4,4096);
-        int cap_yes=g.ecap;
+        g.has_mtp=0; g.resident_bytes=0; g.tc.ecap=1<<20; cap_for_ram(&g,242.0,4,4096);
+        int cap_no=g.tc.ecap;
+        g.has_mtp=1; g.resident_bytes=0; g.tc.ecap=1<<20; cap_for_ram(&g,242.0,4,4096);
+        int cap_yes=g.tc.ecap;
         printf("A. cap %d -> %d on adding one MTP row to 75 (%.1f%% lost)\n",
             cap_no,cap_yes,100.0*(1.0-(double)cap_yes/(double)cap_no));
         CHECK(cap_no>0 && cap_yes>0);
@@ -250,10 +250,10 @@ int main(void){
      * must cost (4u+2u)/4u = 1.5x of the cap. v1.5.0 charged (4+2)*2u against 4u --
      * 3x -- because the MTP row both widened every other row AND counted twice. */
     g_mem_avail_boot=64.0;
-    m.has_mtp=0; m.resident_bytes=0; m.ecap=1<<20; cap_for_ram(&m,8.0,m.ebits,128);
-    int cap_routed_only=m.ecap;
-    m.has_mtp=1; m.resident_bytes=0; m.ecap=1<<20; cap_for_ram(&m,8.0,m.ebits,128);
-    int cap_with_mtp=m.ecap;
+    m.has_mtp=0; m.resident_bytes=0; m.tc.ecap=1<<20; cap_for_ram(&m,8.0,m.ebits,128);
+    int cap_routed_only=m.tc.ecap;
+    m.has_mtp=1; m.resident_bytes=0; m.tc.ecap=1<<20; cap_for_ram(&m,8.0,m.ebits,128);
+    int cap_with_mtp=m.tc.ecap;
     double cost=(double)cap_routed_only/(double)cap_with_mtp;
     printf("  cap %d (routed only) -> %d (+MTP row) = %.2fx\n",
         cap_routed_only,cap_with_mtp,cost);
