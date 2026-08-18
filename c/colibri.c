@@ -5105,26 +5105,17 @@ static void pilot_realload(Model *m, int layer, int eid){
         atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);   /* fuori range (come il ramo URING) o main gia' su questo layer */
         pthread_mutex_unlock(&g_pilot_mx); return;
     }
-    if(expert_resident_or_reserved(&m->tc,layer,eid)){ pthread_mutex_unlock(&g_pilot_mx); return; }
-    ESlot *Sl=m->tc.ecache[layer]; int nn=__atomic_load_n(&m->tc.ecn[layer],__ATOMIC_RELAXED);
-    /* SPMC (PILOT_WORKERS>1): scegli lo slot sotto lock e MARCALO prenotato prima di
-     * rilasciarlo, cosi' gli altri worker non lo scelgono come vittima ne' ricaricano
-     * lo stesso eid. Stesso schema del ramo URING (prenotazione visibile -(eid+2),
-     * ecn bumpato subito, scan-vittima che salta le prenotazioni). Vittima +
-     * eviction guard: pilot_pick_slot (#9, una definizione per i due rami). */
-    int slot,isnew=0;
-    if(nn<m->tc.ecap){ slot=nn; isnew=1; __atomic_store_n(&m->tc.ecn[layer],nn+1,__ATOMIC_RELAXED); }   /* cresci: pubblica subito lo slot (marcato prenotato) */
-    else {
-        slot=pilot_pick_slot(&m->tc,layer,eid,Sl,nn,g_pilot_evict_guard);
-        if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
-                    pthread_mutex_unlock(&g_pilot_mx); return; }   /* tutti in volo, o vittima protetta dal guard */
-    }
-    ESlot *dst=&Sl[slot];
-    sl_eid_set(dst,-(eid+2));                           /* prenotazione VISIBILE: dedup + scan-vittima degli altri worker la vedono (isnew) */
-    (void)isnew;
-    sl_used_set(dst,(uint64_t)-1);                             /* sentinella "in carica": mai vittima LRU finche' expert_load non pubblica l'eid reale
-                                                         * (chiude la finestra eid-reale/used-vecchio: uno snapshot di eclock si sarebbe potuto
-                                                         * far superare da altri load durante il pread). used fresco ristampato al successo. */
+    /* SPMC (PILOT_WORKERS>1): prenota sotto lock, cosi' gli altri worker non
+     * scelgono lo slot come vittima ne' ricaricano lo stesso eid. Tutta la
+     * meccanica (dedup, crescita, vittima+guard, sentinelle) e' tier_reserve
+     * (#10); used_sentinel=1 perche' questo ramo pubblica l'eid dentro
+     * expert_load, fuori dal lock -- vedi il commento del protocollo in
+     * tier_cache.h. */
+    ESlot *dst;
+    int rr=tier_reserve(&m->tc,layer,eid,g_pilot_evict_guard,/*used_sentinel=*/1,&dst);
+    if(rr==TIER_RESIDENT){ pthread_mutex_unlock(&g_pilot_mx); return; }
+    if(rr==TIER_NO_SLOT){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
+                          pthread_mutex_unlock(&g_pilot_mx); return; }   /* tutti in volo, o vittima protetta dal guard */
     g_pilot_inflight[layer]++;
     pthread_mutex_unlock(&g_pilot_mx);
 
@@ -5132,17 +5123,12 @@ static void pilot_realload(Model *m, int layer, int eid){
 
     pthread_mutex_lock(&g_pilot_mx);
     if(rc==0){
-        sl_used_set(dst,(uint64_t)__atomic_add_fetch(&m->tc.eclock,1,__ATOMIC_RELAXED));  /* eid gia' reale (expert_load); timbra used fresco */
+        tier_publish(&m->tc,dst,-1);            /* eid gia' reale (expert_load); timbra used fresco */
         atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
     } else {
-        /* load fallito: libera la prenotazione. LO SLOT VA ANCHE RIPORTATO A used=0:
-         * la prenotazione lo aveva marcato used=(uint64_t)-1 ("in carica", mai vittima),
-         * e lasciarlo cosi' lo rendeva invisibile agli hit ma ULTIMO in ogni scan LRU —
-         * mai evictable: ogni speculazione fallita (disco lento, errore I/O transitorio)
-         * sottraeva ~19MB di cache in modo permanente e silenzioso. used=0 e' la stessa
-         * convenzione "slot vergine" di rss_guard: diventa la PRIMA vittima, non l'ultima. */
-        sl_eid_set(dst,-1);
-        sl_used_set(dst,0);
+        tier_fail(&m->tc,dst,/*reset_used=*/1); /* prenotazione liberata E used=0: la storia del
+                                                 * perche' (speculazioni fallite che sequestravano
+                                                 * ~19MB per sempre) e' sul protocollo, tier_cache.h */
         atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
     }
     g_pilot_inflight[layer]--;
@@ -5166,20 +5152,18 @@ static void pilot_uring_batch(Model *m){
             atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
             pthread_mutex_unlock(&g_pilot_mx); continue;
         }
-        if(expert_resident_or_reserved(&m->tc,layer,eid)){ pthread_mutex_unlock(&g_pilot_mx); continue; }
-        ESlot *Sl=m->tc.ecache[layer]; int nn=__atomic_load_n(&m->tc.ecn[layer],__ATOMIC_RELAXED);
-        int slot;
-        if(nn<m->tc.ecap){ slot=nn; __atomic_store_n(&m->tc.ecn[layer],nn+1,__ATOMIC_RELAXED); }
-        else slot=pilot_pick_slot(&m->tc,layer,eid,Sl,nn,g_pilot_evict_guard);    /* vittima + eviction guard (#9) */
-        if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); pthread_mutex_unlock(&g_pilot_mx); continue; }
-        ESlot *dst=&Sl[slot];
-        sl_eid_set(dst,-(eid+2));                  /* visible reservation; never considered resident/evictable */
+        /* used_sentinel=0: questo ramo pubblica eid+used nello stesso lock
+         * hold (vedi il protocollo in tier_cache.h) */
+        ESlot *dst;
+        int rr=tier_reserve(&m->tc,layer,eid,g_pilot_evict_guard,/*used_sentinel=*/0,&dst);
+        if(rr==TIER_RESIDENT){ pthread_mutex_unlock(&g_pilot_mx); continue; }
+        if(rr==TIER_NO_SLOT){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); pthread_mutex_unlock(&g_pilot_mx); continue; }
         g_pilot_inflight[layer]++;
         pthread_mutex_unlock(&g_pilot_mx);
 
         int li=uring_load_add(&g_ub_pilot,m,layer,eid,dst,0);
         if(li<0){
-            pthread_mutex_lock(&g_pilot_mx); sl_eid_set(dst,-1); g_pilot_inflight[layer]--;
+            pthread_mutex_lock(&g_pilot_mx); tier_fail(&m->tc,dst,0); g_pilot_inflight[layer]--;
             pthread_cond_broadcast(&g_pilot_cv); pthread_mutex_unlock(&g_pilot_mx);
             atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); continue;
         }
@@ -5198,11 +5182,10 @@ static void pilot_uring_batch(Model *m){
         int rc=uring_finalize_load(&g_ub_pilot,d->li,0);
         pthread_mutex_lock(&g_pilot_mx);
         if(rc==0){
-            sl_eid_set(d->dst,d->eid);
-            sl_used_set(d->dst,(uint64_t)__atomic_add_fetch(&m->tc.eclock,1,__ATOMIC_RELAXED));
+            tier_publish(&m->tc,d->dst,d->eid);
             atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
         }else{
-            sl_eid_set(d->dst,-1);
+            tier_fail(&m->tc,d->dst,0);
             atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
         }
         g_pilot_inflight[d->layer]--;
@@ -6935,12 +6918,7 @@ static void rss_guard(Model *m){
         for(int l=0; l<=c->n_layers && freed<need; l++){
             if(!m->tc.ecache || !m->tc.ecache[l]) continue;
             pthread_mutex_lock(&g_pilot_mx);
-            int nn=__atomic_load_n(&m->tc.ecn[l],__ATOMIC_RELAXED), lru=-1;
-            for(int z=0;z<nn;z++){                        /* solo slot pubblicati e con slab */
-                ESlot *cand=&m->tc.ecache[l][z];
-                if(sl_eid(cand)<0 || !cand->slab || eslot_busy(cand)) continue;
-                if(lru<0 || sl_used(cand)<sl_used(&m->tc.ecache[l][lru])) lru=z;
-            }
+            int lru=tier_evict_pick(&m->tc,l);            /* solo slot pubblicati e con slab (#10) */
             if(lru<0){ pthread_mutex_unlock(&g_pilot_mx); continue; }
             ESlot *s=&m->tc.ecache[l][lru];
             sl_eid_set(s,-1);                             /* nascosto: nessun hit/evict altrui */
