@@ -36,6 +36,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 typedef struct ColiGpuOps {
     const char *name;                     /* "vulkan", "cuda", "metal" */
@@ -113,6 +114,88 @@ typedef struct ColiGpuOps {
                       const float *x, int S, int I,
                       float *q_out, float *kv_out, float *lat_out);
 } ColiGpuOps;
+
+/* ================= which table does a call site reach? =================
+ * (#11, slice 6 -- the decision slice 5 deliberately left open.)
+ *
+ * Slice 5 stopped at a real fork in the road: `g_gops` was ONE pointer, bound
+ * at whichever backend's init() ran. Vulkan bound it; CUDA binding it too
+ * would let whichever backend initialized LAST silently replace the table the
+ * OTHER backend's already-gated call sites still call through -- and because a
+ * backend fills only the families whose shape it shares (CUDA leaves the
+ * kv_ and attn_ family NULL by design, see below), "silently replace" means a
+ * NULL function-pointer call, not a slow path.
+ *
+ * The decision, and the evidence for it: this engine never asks a runtime
+ * "which backend is active?" question, so the seam must not invent one. Every
+ * engine call site through this vtable sits inside `#ifdef COLI_VULKAN` (all
+ * 36 of them when this was written) behind g_vulkan; the CUDA sites sit inside
+ * `#ifdef COLI_CUDA` behind g_cuda_enabled. The backend is STATICALLY known
+ * wherever the engine calls -- the preprocessor picked it, and the resident
+ * handle passed in lives in that backend's own field (QT::vk vs QT::cuda). One
+ * shared pointer answered a question nobody asked, and answered it wrong the
+ * moment two backends were live at once.
+ *
+ * So: ONE SLOT PER BACKEND, bound by that backend at its own init, read by
+ * that backend's own call sites. What this vtable buys is the op SHAPE -- one
+ * signature per operation instead of three vendor APIs woven through the
+ * engine -- not a single mutable binding. Genuinely backend-agnostic code
+ * (bullet 5: the small engines reaching GPU through this seam) takes a
+ * `const ColiGpuOps *` as a PARAMETER from a caller that knows which backend
+ * it means; it never reads a global to find out.
+ *
+ * Two invariants bind time enforces, so a later edit cannot quietly
+ * reintroduce the failure modes above:
+ *   1. A table binds only into its OWN slot -- checked against ops->name, so
+ *      coli_gops_bind(COLI_GPU_VULKAN, &coli_cuda_gpu_ops) is a rejected call
+ *      instead of a corrupted engine.
+ *   2. A bound slot is never silently REPLACED by a different table (binding
+ *      the same table again is the idempotent no-op an init retry wants).
+ * Plus a floor on sparseness (coli_gops_complete): lifecycle + the whole
+ * resident-tensor family. Above that floor an unfilled op is NULL by contract
+ * -- that is how CUDA declines the families whose shape it does not share --
+ * and generic code asks COLI_GOPS_HAS before calling.
+ *
+ * The engine reads its slots through GOPS_VK / GOPS_CUDA (colibri.c): the call
+ * site names its backend in the same breath its #ifdef already does.
+ */
+enum { COLI_GPU_VULKAN = 0, COLI_GPU_CUDA = 1, COLI_GPU_METAL = 2, COLI_GPU_BACKENDS = 3 };
+
+/* Slot i belongs to the backend named here; ops->name must match to bind. */
+static const char *const coli_gops_slot_name[COLI_GPU_BACKENDS] = { "vulkan", "cuda", "metal" };
+
+static const ColiGpuOps *coli_gops_tbl[COLI_GPU_BACKENDS];
+
+/* Non-NULL only for a backend that actually initialized. */
+static inline const ColiGpuOps *coli_gops(int id){
+    return (id >= 0 && id < COLI_GPU_BACKENDS) ? coli_gops_tbl[id] : NULL;
+}
+
+/* An op left NULL means "this backend does not do that" -- the question to ask
+ * of any `const ColiGpuOps *` whose backend you do not know statically. */
+#define COLI_GOPS_HAS(ops, fn) ((ops) != NULL && (ops)->fn != NULL)
+
+/* The floor. A table missing any of these is not a sparse backend, it is an
+ * incomplete one: every consumer of this seam assumes it can at least ask "is
+ * this device up" and place, size, locate and free a resident tensor. */
+static inline int coli_gops_complete(const ColiGpuOps *o){
+    return o && o->name && o->dev_available && o->tensor_ensure &&
+           o->tensor_free && o->tensor_bytes && o->tensor_dev;
+}
+
+/* 1 = the slot now holds `ops`. 0 = rejected with the slot untouched: bad id,
+ * incomplete table, wrong slot for this backend, or a different table already
+ * bound there. Call at backend init and treat 0 as fatal -- it can only mean
+ * the caller wired up the wrong table, a build-time mistake wearing a
+ * run-time disguise. */
+static inline int coli_gops_bind(int id, const ColiGpuOps *ops){
+    if(id < 0 || id >= COLI_GPU_BACKENDS) return 0;
+    if(!coli_gops_complete(ops)) return 0;
+    if(strcmp(ops->name, coli_gops_slot_name[id]) != 0) return 0;
+    if(coli_gops_tbl[id] && coli_gops_tbl[id] != ops) return 0;
+    coli_gops_tbl[id] = ops;
+    return 1;
+}
 
 /* ======================= Vulkan adapter ======================= */
 #ifdef COLI_VULKAN
@@ -245,18 +328,32 @@ static const ColiGpuOps coli_vk_gpu_ops = {
  *     already manages) -- architecturally distinct from Vulkan's persistent
  *     per-layer mirror-and-fuse design, not a narrower version of it.
  *
- * NOT WIRED into colibri.c in this slice, on purpose: `g_gops` is one
- * global, bound to whichever backend's init() ran (today: Vulkan only, at
- * coli_vk_init success). CUDA and Vulkan are independently
- * #ifdef/runtime-flag gated throughout colibri.c and CAN be compiled and
- * initialized together -- binding CUDA to the same g_gops would let
- * whichever backend initializes LAST silently override the pointer table
- * the OTHER backend's already-gated call sites still call through (e.g. a
- * VULKAN-gated attn_qprep call left holding CUDA's NULL attn_qprep after
- * CUDA initializes second). Wiring CUDA needs a real answer to "which
- * global(s)" first -- a second g_gops_cuda, a per-tensor backend tag, or
- * something else -- which is a deliberate design decision for the next
- * slice, not a default to fall into here. */
+ * WIRED into colibri.c as of slice 6, once the "which global(s)" question
+ * slice 5 raised got its answer (see the registry comment above): CUDA binds
+ * its own COLI_GPU_CUDA slot at coli_cuda_init success and the CUDA-gated call
+ * sites read GOPS_CUDA, so the two backends can be live together without
+ * either one's table standing where the other's call sites look. The families
+ * routed through this table are exactly the filled ones -- the resident-tensor
+ * family (including qt_cuda_upload's fmt==4 dispatch, which lived in colibri.c
+ * AND here until this slice collapsed it to one copy), dense matmul, and
+ * tensor_dev.
+ *
+ * Three CUDA sites stay native on purpose, and the reason is the same each
+ * time -- their shape is not this vtable's shape, so routing them would change
+ * behavior or lose information rather than collapse an #ifdef:
+ *   - coli_cuda_mem_info in the expert-tier planner: mem_budget reports
+ *     used/budget GB as doubles; the planner does byte arithmetic against
+ *     g_cuda_dense_projected and CUDA_RESERVE_GB and needs FREE bytes. A
+ *     round-trip through GB doubles to recover them would be a worse call than
+ *     leaving one line native.
+ *   - coli_cuda_tensor_upload_compressed (COLI_ANS) and coli_cuda_tensor_update:
+ *     no member exists for either; an in-place refresh of an already-resident
+ *     tensor has no Vulkan counterpart to share a signature with yet.
+ *   - layer_cuda_shard_kvb's upload: it calls the GROUPED upload for every
+ *     format, while qt_cuda_upload (and therefore this adapter) uses it only
+ *     for fmt==4. Two live dispatch policies, one of which is presumably
+ *     wrong; routing this site would silently pick a side on hardware nobody
+ *     here can run. Named, not "fixed" blind -- see the issue. */
 #ifdef COLI_CUDA
 
 static int cuops_dev_available(int dev){
