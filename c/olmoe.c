@@ -37,6 +37,7 @@
 #endif
 #include "omp_tune.h"
 #include "route_trace.h"                    /* shared routing telemetry (#700) */
+#include "tier.h"                           /* shared LFRU scorer (#10): one definition, not five */
 
 #ifdef _WIN32
 #include <windows.h>
@@ -107,10 +108,13 @@ static int g_wide  = 1;  /* IMPROVEMENT 4: top-K * g_wide candidates prefetched 
 static int g_pilot_evict_guard = 1; /* PILOT_EVICT_GUARD=0 to disable LFRU prefetch eviction guard */
 static int g_expert_drop = 0;       /* EXPERT_DROP=1 restores fadvise(DONTNEED) after expert reads */
 
+/* LFRU scoring comes from tier.h (tier_lfru_score) -- the same definition the
+ * GLM engine's eviction guard uses, instead of a per-engine copy. The u32
+ * casts truncate this engine's u64 clocks; age (clock-last) is what the score
+ * reads and it is identical mod 2^32 -- the same wrap semantics the GLM
+ * engine's native u32 clock already has. */
 static uint64_t lfru_score(uint32_t heat, uint64_t last, uint64_t clock) {
-    uint64_t age = (clock > last) ? (clock - last) : 0;
-    uint64_t recent = (age < 255) ? (255 - age) : 0;
-    return ((uint64_t)heat << 8) | recent;
+    return tier_lfru_score(heat, (uint32_t)last, (uint32_t)clock);
 }
 
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S);
