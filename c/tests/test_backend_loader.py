@@ -2197,7 +2197,9 @@ class LoaderProductionStructureTest(unittest.TestCase):
         load = self._index("g_cuda.dll = coli_hip_load_backend();")
         verify = self.src.find('coli_hip_verify_bound(&cfg, runtime, "post-backend', load)
         self.assertNotEqual(verify, -1, "no post-backend verification after the load")
-        resolve = self.src.find("RESOLVE(init,", verify)
+        # Since #11 the first resolution is the ABI-version gate; the bulk of
+        # the symbols follow via the generated COLI_CUDA_ABI_LIST expansion.
+        resolve = self.src.find("RESOLVE_OPT(abi_version, fn_abi_version)", verify)
         self.assertNotEqual(resolve, -1, "no symbol resolution after verification")
         self.assertLess(load, verify)
         self.assertLess(verify, resolve)
@@ -2241,7 +2243,9 @@ class LoaderProductionStructureTest(unittest.TestCase):
         """g_cuda.hip_runtime is assigned once, past the last failure gate."""
         self.assertEqual(self.src.count("g_cuda.hip_runtime = runtime;"), 1)
         transfer = self._index("g_cuda.hip_runtime = runtime;")
-        self.assertLess(self._index("RESOLVE(tensor_update, fn_tensor_update)"), transfer)
+        self.assertLess(
+            self._index("COLI_CUDA_ABI_LIST(COLI_ABI_RESOLVE, COLI_ABI_RESOLVE_OPT)"),
+            transfer)
         self.assertLess(transfer, self._index("g_cuda.available = 1;"))
 
     def test_shutdown_releases_backend_before_runtime(self):
