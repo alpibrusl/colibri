@@ -161,6 +161,15 @@ jobs:
           grep -q "expert tier active" vk.log || {
             echo "FAIL: Vulkan initialised but the expert tier did not activate"; exit 1; }
           echo "OK: shaders compiled, device negotiated, expert tier active"
+      # Engine-free behavioral gate (#11): int8 tensors up, the fused expert
+      # group (sync + async, dev0 + dev2-same-device mode) actually EXECUTES
+      # on Lavapipe and is checked against a CPU reference. Before this, the
+      # upload/compute paths -- including the dev2 family -- had no CI beyond
+      # compiling; the init probe above never dispatches a shader.
+      - name: Expert-group compute vs CPU reference (Lavapipe)
+        run: |
+          cd c
+          VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json make test-vk
 
   engines-all-platforms:
     name: All engines (${{ matrix.name }})

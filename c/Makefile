@@ -1153,6 +1153,19 @@ test-tsan:
 	done
 	@echo "test-tsan: concurrent tests clean under ThreadSanitizer"
 
+# Engine-free Vulkan backend test (#11): uploads int8 tensors, runs the fused
+# expert group (sync + async, dev0 + dev2-same-device mode) on a REAL Vulkan
+# implementation and checks against a CPU reference -- the behavioral gate the
+# backend never had (compile + init was all CI covered). Needs the VK=1
+# toolchain (libvulkan-dev, glslc) at build time and any ICD at runtime
+# (Lavapipe in CI); with no device the binary prints "skip" and exits 0.
+VK_SPV_ALL = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv \
+             shaders/attention_absorb.spv shaders/rmsnorm.spv
+test-vk: backend_vulkan.o $(VK_SPV_ALL)
+	$(CC) $(CFLAGS) tests/test_vk_expert_group.c backend_vulkan.o \
+	  -o tests/test_vk_expert_group -lvulkan -lm -lpthread
+	./tests/test_vk_expert_group shaders/qmatmul.spv
+
 # Local validation: one portable CPU build and dependency-free tests.
 check:
 	$(MAKE) clean
