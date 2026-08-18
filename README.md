@@ -1,3 +1,10 @@
+> [!NOTE]
+> **This is a development fork** ([`alpibrusl/colibri`](https://github.com/alpibrusl/colibri)) of
+> [**JustVugg/colibri**](https://github.com/JustVugg/colibri) — see **[FORK.md](FORK.md)** for what
+> has diverged (security hardening, structural refactor, provenance layers) and how the fork tracks
+> upstream. Everything below this banner is the original project's README: its links, badges,
+> Discord and releases are **upstream's**, not this fork's.
+
 <p align="center">
   <img src="assets/colibri-logo.svg" width="560" alt="colibrì — tiny engine, immense model">
 </p>
