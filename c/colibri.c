@@ -85,13 +85,20 @@ static inline void omp_set_num_threads(int n){ (void)n; }
 #include "backend_vulkan.h"
 #endif
 #include "gpu_ops.h"
-/* The active GPU backend, as the one boundary the engine calls through (#11).
- * NULL = no GPU backend initialized (CPU-only). Slice 1 routes the Vulkan
- * expert-group family through it; the remaining #ifdef sites migrate family
- * by family. Declared unconditionally so portable code can test it; unused
- * (and warned about) only on builds with no GPU backend compiled in, hence
- * the attribute (same pattern as compat.h's compat_pread_lasterr). */
-static const ColiGpuOps *g_gops __attribute__((unused));
+/* The GPU backends, reached through ONE op shape (#11). Each backend binds its
+ * OWN registry slot at its own init (gpu_ops.h) and each call site reads the
+ * slot its #ifdef already named -- there is deliberately no single "active
+ * backend" pointer, because the engine has no runtime question that a single
+ * pointer would answer. The full argument, and the two bind-time invariants
+ * that keep it true, are in gpu_ops.h's registry comment.
+ *
+ * NULL = that backend never initialized. The engine relies on the converse
+ * where it is already gated: g_vulkan implies GOPS_VK, g_cuda_enabled implies
+ * GOPS_CUDA -- main() fails the run if a bind is ever rejected, so a gated
+ * site never has to re-ask. Code that is NOT so gated (qt_cuda_upload, called
+ * from paths that predate the CUDA flag) tests the slot itself. */
+#define GOPS_VK   (coli_gops_tbl[COLI_GPU_VULKAN])
+#define GOPS_CUDA (coli_gops_tbl[COLI_GPU_CUDA])
 /* Declared unconditionally (not just under COLI_METAL): on a non-Metal build it just sits
  * at 0 forever, which is the correct value there (no Metal backend => never enabled). Kept
  * outside the #ifdef so portable code — e.g. kvb_fmt_gate_notice below — can read "is Metal
@@ -526,7 +533,7 @@ static int g_cuda_raw_experts=-1;   /* experimental ANS tier: keep this global h
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
-    if(t->cuda){ coli_cuda_tensor_free(t->cuda); t->cuda=NULL; }
+    if(t->cuda){ GOPS_CUDA->tensor_free(t->cuda); t->cuda=NULL; }
     t->cuda_fail_s=0;
 }
 /* #687: a resident tensor that fails to upload falls back to CPU silently. The
@@ -558,7 +565,7 @@ static int g_cuda_fp8_ready;  /* e4m3 LUT published to the devices (see cuda_boo
 #ifdef COLI_VULKAN
 /* Drop a QT's Vulkan-resident copy (slot reused for a different expert). */
 static void qt_vk_reset(QT *t){
-    if(t->vk){ g_gops->tensor_free(t->vk); t->vk=NULL; }
+    if(t->vk){ GOPS_VK->tensor_free(t->vk); t->vk=NULL; }
     t->vk_eligible=0;
 }
 /* Dense matmul on the Vulkan tier: y[S,O] = x[S,I] @ dequant(t)^T. Uploads the resident
@@ -568,19 +575,20 @@ static void qt_vk_reset(QT *t){
 static int vk_matmul_qt(QT *t, float *y, const float *x, int S){
     if(!g_vk_dense || !VK_FMT_OK(t)) return 0;
     const void *w = t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
-    return g_gops->matmul((void**)&t->vk, y, x, w, t->s, t->fmt, S, t->I, t->O, t->gs, 0);
+    return GOPS_VK->matmul((void**)&t->vk, y, x, w, t->s, t->fmt, S, t->I, t->O, t->gs, 0);
 }
 /* Two same-input resident matmuls in one submit (q_a + kv_a read the same x). */
 static int vk_matmul_pair_qt(QT *a, float *ya, QT *b, float *yb, const float *x, int S){
     if(!g_vk_dense || a->fmt!=b->fmt || !VK_FMT_OK(a) || a->gs!=b->gs || a->I!=b->I) return 0;
     const void *wa = a->fmt==1 ? (const void*)a->q8 : (const void*)a->q4;
     const void *wb = b->fmt==1 ? (const void*)b->q8 : (const void*)b->q4;
-    return g_gops->matmul_pair((void**)&a->vk, ya, wa, a->s, a->O,
-                               (void**)&b->vk, yb, wb, b->s, b->O, a->fmt, x, S, a->I, a->gs);
+    return GOPS_VK->matmul_pair((void**)&a->vk, ya, wa, a->s, a->O,
+                                (void**)&b->vk, yb, wb, b->s, b->O, a->fmt, x, S, a->I, a->gs);
 }
 #endif
 #ifdef COLI_CUDA
 static int qt_cuda_upload(QT *t){
+    if(!GOPS_CUDA) return 0;   /* CUDA never came up: no slot, nothing resident */
     if(t->fmt==5) return 0;   /* int3-g64: no CUDA kernel yet — tensor stays CPU-side */
     if(t->fmt==6 && !g_cuda_e8_ready) return 0;   /* E8 without its codebook would decode garbage */
     if(t->fmt==8 && !g_cuda_fp8_ready) return 0;  /* same idiom: fp8 without its e4m3 LUT stays
@@ -588,12 +596,11 @@ static int qt_cuda_upload(QT *t){
                                                    * leaves the flag 0, exactly like fmt=6) */
     const void *weights = t->fmt==0 ? (const void*)t->qf
                         : (t->fmt==1||t->fmt==8) ? (const void*)t->q8 : (const void*)t->q4;
-    if(t->fmt==4)   /* grouped int4 (#334): scales are [O, ceil(I/gs)] — the plain
-                     * upload would truncate them to O floats and the group kernels
-                     * would read garbage. An old DLL without the _g symbol returns 0
-                     * and the tensor simply stays CPU-side. */
-        return coli_cuda_tensor_upload_g(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device,t->gs);
-    return coli_cuda_tensor_upload(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device);
+    /* The fmt==4 grouped-scale dispatch (#334) used to be written out here AND
+     * in the adapter; it now lives once, in cuops_tensor_ensure. `dev` is the
+     * CUDA ordinal this tensor was placed on, which is what every other family
+     * already passes. */
+    return GOPS_CUDA->tensor_ensure((void**)&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->gs,t->cuda_device);
 }
 #ifdef COLI_ANS
 static int qt_cuda_upload_compressed(QT *t){
@@ -896,7 +903,7 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
        w->fmt!=5 && (w->fmt!=8 || g_cuda_fp8_ready) && !omp_in_parallel()){
         const void *weights = w->fmt==0 ? (const void*)w->qf
                             : (w->fmt==1||w->fmt==8) ? (const void*)w->q8 : (const void*)w->q4;
-        if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device,w->gs)){
+        if(GOPS_CUDA->matmul((void**)&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->gs,w->cuda_device)){
             w->cuda_fail_s=0;          /* it fits again: forget the width that did not */
             return;
         }
@@ -1764,6 +1771,10 @@ static void layer_cuda_shard_kvb(Layer *l,int H,int Q,int V){
         int hn=H/g_cuda_ndev+(d<H%g_cuda_ndev),rows=hn*(Q+V);
         const void *part=weights+(int64_t)h0*(Q+V)*rb;
         const float *scale=l->kv_b.s+(int64_t)h0*(Q+V)*(l->kv_b.gs>0?(l->kv_b.I+l->kv_b.gs-1)/l->kv_b.gs:1);
+        /* NOT routed through GOPS_CUDA->tensor_ensure, deliberately: this site
+         * calls the GROUPED upload for every format, while qt_cuda_upload (and
+         * so the adapter) reserves it for fmt==4. Two live dispatch policies —
+         * routing here would silently pick one on hardware we cannot run. */
         if(!coli_cuda_tensor_upload_g(&l->kv_b_shard[d],part,scale,l->kv_b.fmt,l->kv_b.I,rows,g_cuda_devices[d],l->kv_b.gs))return;
         l->shard_h0[d]=h0;l->shard_hn[d]=hn;l->n_kv_b_shard++;h0+=hn;
     }
@@ -3181,7 +3192,7 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
             #pragma omp parallel for schedule(static) reduction(&:ok_sh)
             for(int d2=0;d2<n;d2++){
                 int hn=l->shard_hn[d2], h0=l->shard_h0[d2];
-                int sdev=coli_cuda_tensor_device(l->kv_b_shard[d2]);
+                int sdev=GOPS_CUDA->tensor_dev(l->kv_b_shard[d2]);
                 float *st=stage+(size_t)d2*(stage_one/4);
                 size_t qsb=(size_t)S*hn*qh*4, csb=(size_t)S*hn*vh*4;
                 float *qs_r=coli_cuda_pipe_scratch(sdev,18,qsb);
@@ -3374,7 +3385,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         if(g_vk_qprep==2){ dbgQ=falloc((int64_t)S*l->q_b.O); dbgC=falloc((int64_t)S*l->kv_a.O); }
         if(g_vk_qprep && g_vk_dense && l->q_a.fmt==l->kv_a.fmt && l->q_a.fmt==l->q_b.fmt && VK_FMT_OK(&l->q_a)
            && l->q_a.gs==l->kv_a.gs && l->q_a.gs==l->q_b.gs)
-            vk_qp=g_gops->attn_qprep(layer,
+            vk_qp=GOPS_VK->attn_qprep(layer,
                 (void**)&l->q_a.vk, l->q_a.fmt==1?(const void*)l->q_a.q8:(const void*)l->q_a.q4, l->q_a.s, l->q_a.O,
                 (void**)&l->kv_a.vk, l->kv_a.fmt==1?(const void*)l->kv_a.q8:(const void*)l->kv_a.q4, l->kv_a.s, l->kv_a.O,
                 (void**)&l->q_b.vk, l->q_b.fmt==1?(const void*)l->q_b.q8:(const void*)l->q_b.q4, l->q_b.s, l->q_b.O,
@@ -3652,23 +3663,23 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                                                 * mirror learns fp8 */
             int dsa_on=0; if(dnsel) for(int s=0;s<S;s++) if(dnsel[s]>0) dsa_on=1;
             int st0=m->kv_start[layer], T=pos_base+S;
-            if(!dsa_on&&T<=m->max_t&&g_gops->kv_ensure(layer,m->max_t,kvl,c->qk_rope)){
+            if(!dsa_on&&T<=m->max_t&&GOPS_VK->kv_ensure(layer,m->max_t,kvl,c->qk_rope)){
                 int ok=1;
                 for(int t=m->vk_kv_valid[layer];t<T&&ok;t++)
-                    ok=g_gops->kv_row(layer,t,coli_kv_row(m->Lc[layer],t,kvl),
-                                      coli_kv_row(m->Rc[layer],t,c->qk_rope));
+                    ok=GOPS_VK->kv_row(layer,t,coli_kv_row(m->Lc[layer],t,kvl),
+                                       coli_kv_row(m->Rc[layer],t,c->qk_rope));
                 if(ok){
                     m->vk_kv_valid[layer]=T;
                     const void *kw=l->kv_b.fmt==1?(const void*)l->kv_b.q8:(const void*)l->kv_b.q4;
                     /* fused absorb + o-projection: ctx never leaves the device */
                     if(VK_FMT_OK(&l->o)&&
-                       g_gops->attn_absorb_project((void**)&l->kv_b.vk,kw,l->kv_b.s,l->kv_b.fmt,l->kv_b.gs,
+                       GOPS_VK->attn_absorb_project((void**)&l->kv_b.vk,kw,l->kv_b.s,l->kv_b.fmt,l->kv_b.gs,
                             (void**)&l->o.vk,l->o.fmt==1?(const void*)l->o.q8:(const void*)l->o.q4,
                             l->o.s,l->o.fmt,l->o.gs,out,Q,layer,S,H,c->qk_nope,c->qk_rope,
                             vh,kvl,st0,T,c->attn_scale,D))
                         vk_core=vk_projected=1;
                     if(!vk_core)
-                        vk_core=g_gops->attn_absorb((void**)&l->kv_b.vk,kw,
+                        vk_core=GOPS_VK->attn_absorb((void**)&l->kv_b.vk,kw,
                             l->kv_b.s,l->kv_b.fmt,l->kv_b.gs,ctx,Q,layer,S,H,c->qk_nope,c->qk_rope,
                             vh,kvl,st0,T,c->attn_scale);
                 }
@@ -3814,8 +3825,8 @@ typedef struct { ColiVkTensor **g,**u,**d; const int *rows; int n; const float *
 static void *vk2_issue_worker(void *p){
     Vk2Iss *j=(Vk2Iss*)p;
     double t0=now_s();
-    j->rc = g_gops->expert_group_issue((void *const*)j->g,(void *const*)j->u,
-                                       (void *const*)j->d,j->rows,j->n,j->x,1);
+    j->rc = GOPS_VK->expert_group_issue((void *const*)j->g,(void *const*)j->u,
+                                        (void *const*)j->d,j->rows,j->n,j->x,1);
     j->dt = now_s()-t0;
     return NULL;
 }
@@ -4309,13 +4320,13 @@ static void moe_shared(Layer *l, int D, int sI, float *x, int S, float *out,
         if(g_vk_dense && !omp_in_parallel() && (fsh==1||fsh==2||fsh==5) &&
            l->sh_up.fmt==fsh && l->sh_down.fmt==fsh){
             #define SW_(t) ((t).fmt==1?(const void*)(t).q8:(const void*)(t).q4)
-            if(g_gops->tensor_ensure((void**)&l->sh_gate.vk,SW_(l->sh_gate),l->sh_gate.s,fsh,D,sI,l->sh_gate.gs,0)&&
-               g_gops->tensor_ensure((void**)&l->sh_up.vk,  SW_(l->sh_up),  l->sh_up.s,  fsh,D,sI,l->sh_up.gs,0)&&
-               g_gops->tensor_ensure((void**)&l->sh_down.vk,SW_(l->sh_down),l->sh_down.s,fsh,sI,D,l->sh_down.gs,0)){
+            if(GOPS_VK->tensor_ensure((void**)&l->sh_gate.vk,SW_(l->sh_gate),l->sh_gate.s,fsh,D,sI,l->sh_gate.gs,0)&&
+               GOPS_VK->tensor_ensure((void**)&l->sh_up.vk,  SW_(l->sh_up),  l->sh_up.s,  fsh,D,sI,l->sh_up.gs,0)&&
+               GOPS_VK->tensor_ensure((void**)&l->sh_down.vk,SW_(l->sh_down),l->sh_down.s,fsh,sI,D,l->sh_down.gs,0)){
                 ColiVkTensor *vg=l->sh_gate.vk,*vu=l->sh_up.vk,*vd=l->sh_down.vk;
                 int rows1[1]={S};
-                if(g_gops && g_gops->expert_group((void *const*)&vg,(void *const*)&vu,
-                                                  (void *const*)&vd,rows1,1,hh,x,0)) shared_cuda=1;
+                if(GOPS_VK && GOPS_VK->expert_group((void *const*)&vg,(void *const*)&vu,
+                                                    (void *const*)&vd,rows1,1,hh,x,0)) shared_cuda=1;
             }
             #undef SW_
         }
@@ -4728,7 +4739,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 if(!nr){ if(g_pipe && qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_ewait += now_s()-tw; } continue; }
                 if(vk_hit[j]){          /* registry-served: no RAM slot, no disk load */
                     ColiVkTensor **reg=vk_reg_at(layer,eid);
-                    if(vk2_on && g_gops->tensor_dev(reg[0])==1){   /* dev2 tier expert */
+                    if(vk2_on && GOPS_VK->tensor_dev(reg[0])==1){   /* dev2 tier expert */
                         voff2[nvk2]=vtot2;
                         for(int r=0;r<nr;r++){ memcpy(vk_xh2+(int64_t)(vtot2+r)*D, x+(int64_t)rows[r]*D, D*sizeof(float));
                             vrmap2[nvk2*S+r]=rows[r]; vwmap2[nvk2*S+r]=rw[r]; }
@@ -4754,11 +4765,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             pthread_t iss2_th; int iss2_threaded=0;
             if(nvk2>0){
                 if(pthread_create(&iss2_th,NULL,vk2_issue_worker,&iss2)==0) iss2_threaded=1;
-                else iss2.rc = g_gops->expert_group_issue((void *const*)vg2,(void *const*)vu2,
-                                                          (void *const*)vd2,vrows2,nvk2,vk_xh2,1);
+                else iss2.rc = GOPS_VK->expert_group_issue((void *const*)vg2,(void *const*)vu2,
+                                                           (void *const*)vd2,vrows2,nvk2,vk_xh2,1);
             }
-            int vk_issued = nvk>0 && g_gops->expert_group_issue((void *const*)vg,(void *const*)vu,
-                                                               (void *const*)vd,vrows,nvk,vk_xh,0);
+            int vk_issued = nvk>0 && GOPS_VK->expert_group_issue((void *const*)vg,(void *const*)vu,
+                                                                 (void *const*)vd,vrows,nvk,vk_xh,0);
             if(g_prof) g_vkb_issue+=now_s()-t_iss0;
             /* CPU share stays SERIAL over experts with row-parallel kernels: a decode
              * block leaves only ~5-6 CPU experts (the tier absorbs the hot head), fewer
@@ -4795,7 +4806,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 }
             }
             double t_take0=now_s();
-            int vk_ok = vk_issued && g_gops->expert_group_take(vk_yh,0);
+            int vk_ok = vk_issued && GOPS_VK->expert_group_take(vk_yh,0);
             if(g_prof) m->t_egpu+=now_s()-t_take0;
             for(int c2=0;c2<nvk;c2++){ int nr=vrows[c2];
                 if(vk_ok){ int o=voff[c2];
@@ -4816,7 +4827,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
              * extra overlap; same per-expert CPU recompute fallback on failure. */
             if(iss2_threaded){ double t_j0=now_s(); pthread_join(iss2_th,NULL);
                 if(g_prof){ g_vkb_join+=now_s()-t_j0; g_vkb_wrk+=iss2.dt; } }
-            int vk2_ok = iss2.rc && g_gops->expert_group_take(vk_yh2,1);
+            int vk2_ok = iss2.rc && GOPS_VK->expert_group_take(vk_yh2,1);
             for(int c2=0;c2<nvk2;c2++){ int nr=vrows2[c2];
                 if(vk2_ok){ int o=voff2[c2];
                     for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap2[c2*S+r]*D, wgt=vwmap2[c2*S+r], *src=vk_yh2+(int64_t)(o+r)*D;
@@ -5789,7 +5800,7 @@ static void kv_alloc(Model *m, int max_t){
 #endif
 #ifdef COLI_VULKAN
     if(g_vulkan&&m->vk_kv_valid){                        /* dimensioni cambiate: cache VK da rifare */
-        g_gops->kv_reset();
+        GOPS_VK->kv_reset();
         for(int i=0;i<c->n_layers+1;i++) m->vk_kv_valid[i]=0;
     }
 #endif
@@ -7053,9 +7064,9 @@ static void repin_pass_limit(Model *m,int limit){
             continue;
         }
         int gpu=s->g.cuda_eligible;
-        int64_t old_gpu=gpu ? (int64_t)coli_cuda_tensor_bytes(s->g.cuda)
-                             +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
-                             +(int64_t)coli_cuda_tensor_bytes(s->d.cuda) : 0;
+        int64_t old_gpu=gpu ? (int64_t)GOPS_CUDA->tensor_bytes(s->g.cuda)
+                             +(int64_t)GOPS_CUDA->tensor_bytes(s->u.cuda)
+                             +(int64_t)GOPS_CUDA->tensor_bytes(s->d.cuda) : 0;
 #endif
         double t0=now_s();
         expert_load(m,cd[b].l,cd[b].eid,s,1,0);     /* disk -> RAM, same resident slot; demand=0: repin, never classified */
@@ -7063,9 +7074,9 @@ static void repin_pass_limit(Model *m,int limit){
 #ifdef COLI_CUDA
         if(gpu){                                  /* refresh the same VRAM slot now, not lazily */
             if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
-                int64_t now_gpu=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
-                               +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
-                               +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
+                int64_t now_gpu=(int64_t)GOPS_CUDA->tensor_bytes(s->g.cuda)
+                               +(int64_t)GOPS_CUDA->tensor_bytes(s->u.cuda)
+                               +(int64_t)GOPS_CUDA->tensor_bytes(s->d.cuda);
                 m->gpu_expert_bytes+=now_gpu-old_gpu; tier="VRAM";
                 if(g_cuda_release_host) expert_host_release(m,s);
             } else {
@@ -7794,11 +7805,11 @@ static void vk_dense_preload(Model *m){
             if(t->vk || !VK_FMT_OK(t) || t->I<=0 || t->O<=0) continue;
             const void *w = t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
             if(!w || !t->s) continue;
-            if(!g_gops->tensor_ensure((void**)&t->vk,w,t->s,t->fmt,t->I,t->O,t->gs,0)){
+            if(!GOPS_VK->tensor_ensure((void**)&t->vk,w,t->s,t->fmt,t->I,t->O,t->gs,0)){
                 fprintf(stderr,"[VK] dense preload: VRAM full at layer %d — remaining tensors stay lazy\n",i);
                 full=1; break;
             }
-            bytes+=g_gops->tensor_bytes(t->vk); nt++;
+            bytes+=GOPS_VK->tensor_bytes(t->vk); nt++;
         }
     }
     if(nt) fprintf(stderr,"[VK] dense preloaded: %d tensors, %.2f GB VRAM in %.1fs\n",
@@ -7832,7 +7843,7 @@ static void vk_registry_fill(Model *m){
     int64_t i2=0;
     coli_vk_alloc_priority(0.4f);
     for(;i2<n && g_vk_reg_n<g_vk_budget;i2++){
-        if(vkr_reserve>0 && (g_vk_reg_n&7)==0 && g_gops->mem_budget(0,&vkr_used,&vkr_budget)
+        if(vkr_reserve>0 && (g_vk_reg_n&7)==0 && GOPS_VK->mem_budget(0,&vkr_used,&vkr_budget)
            && vkr_budget-vkr_used < vkr_reserve){ vkr_stopped=1; break; }
         int layer=cand[i2].layer, eid=cand[i2].eid; tried++;
         ESlot *src=NULL, *P=m->tc.pin[layer];
@@ -7850,15 +7861,15 @@ static void vk_registry_fill(Model *m){
                 layer,eid,src->g.fmt,src->u.fmt,src->d.fmt,src==&tmp?"load":"pin");
             continue; }
         ColiVkTensor **slot=vk_reg_at(layer,eid);
-        if(!g_gops->tensor_ensure((void**)&slot[0],src->g.q4,src->g.s,xf,c->hidden,c->moe_inter,src->g.gs,0)||
-           !g_gops->tensor_ensure((void**)&slot[1],src->u.q4,src->u.s,xf,c->hidden,c->moe_inter,src->u.gs,0)||
-           !g_gops->tensor_ensure((void**)&slot[2],src->d.q4,src->d.s,src->d.fmt,c->moe_inter,c->hidden,src->d.gs,0)){
-            if(slot[0]){g_gops->tensor_free(slot[0]);slot[0]=NULL;}
-            if(slot[1]){g_gops->tensor_free(slot[1]);slot[1]=NULL;}
+        if(!GOPS_VK->tensor_ensure((void**)&slot[0],src->g.q4,src->g.s,xf,c->hidden,c->moe_inter,src->g.gs,0)||
+           !GOPS_VK->tensor_ensure((void**)&slot[1],src->u.q4,src->u.s,xf,c->hidden,c->moe_inter,src->u.gs,0)||
+           !GOPS_VK->tensor_ensure((void**)&slot[2],src->d.q4,src->d.s,src->d.fmt,c->moe_inter,c->hidden,src->d.gs,0)){
+            if(slot[0]){GOPS_VK->tensor_free(slot[0]);slot[0]=NULL;}
+            if(slot[1]){GOPS_VK->tensor_free(slot[1]);slot[1]=NULL;}
             fprintf(stderr,"[VK] expert tier: VRAM full after %d experts\n",g_vk_reg_n);
             break;
         }
-        bytes+=g_gops->tensor_bytes(slot[0])+g_gops->tensor_bytes(slot[1])+g_gops->tensor_bytes(slot[2]);
+        bytes+=GOPS_VK->tensor_bytes(slot[0])+GOPS_VK->tensor_bytes(slot[1])+GOPS_VK->tensor_bytes(slot[2]);
         g_vk_reg_n++;
     }
     coli_vk_alloc_priority(0.75f);               /* back to the dense/default class */
@@ -7869,12 +7880,12 @@ static void vk_registry_fill(Model *m){
                 g_vk_reg_n,vkr_used,vkr_budget,vkr_reserve);
     /* DEV2 tier: continue down the heat ranking onto the second GPU (COLI_VK_DEV2),
      * starting at the candidate dev0 stopped on. Same fmt gates, its own budget. */
-    if(g_vk_budget2>0 && g_gops->dev_available(1)){
+    if(g_vk_budget2>0 && GOPS_VK->dev_available(1)){
         double t20=now_s(); int64_t bytes2=0; int tried2=0;
         double vkr2_reserve = getenv("COLI_VK_RESERVE2_GB")?atof(getenv("COLI_VK_RESERVE2_GB")):0.5;
         int vkr2_stopped=0; double u2=0,b2=0;
         for(;i2<n && g_vk_reg_n2<g_vk_budget2;i2++){
-            if(vkr2_reserve>0 && (g_vk_reg_n2&7)==0 && g_gops->mem_budget(1,&u2,&b2)
+            if(vkr2_reserve>0 && (g_vk_reg_n2&7)==0 && GOPS_VK->mem_budget(1,&u2,&b2)
                && b2-u2 < vkr2_reserve){ vkr2_stopped=1; break; }
             int layer=cand[i2].layer, eid=cand[i2].eid; tried2++;
             ESlot *src=NULL, *P=m->tc.pin[layer];
@@ -7888,15 +7899,15 @@ static void vk_registry_fill(Model *m){
                ||(xf==4&&(src->g.gs<8||src->g.gs%8))||(src->d.fmt==4&&(src->d.gs<8||src->d.gs%8)))
                 continue;
             ColiVkTensor **slot=vk_reg_at(layer,eid);
-            if(!g_gops->tensor_ensure((void**)&slot[0],src->g.q4,src->g.s,xf,c->hidden,c->moe_inter,src->g.gs,1)||
-               !g_gops->tensor_ensure((void**)&slot[1],src->u.q4,src->u.s,xf,c->hidden,c->moe_inter,src->u.gs,1)||
-               !g_gops->tensor_ensure((void**)&slot[2],src->d.q4,src->d.s,src->d.fmt,c->moe_inter,c->hidden,src->d.gs,1)){
-                if(slot[0]){g_gops->tensor_free(slot[0]);slot[0]=NULL;}
-                if(slot[1]){g_gops->tensor_free(slot[1]);slot[1]=NULL;}
+            if(!GOPS_VK->tensor_ensure((void**)&slot[0],src->g.q4,src->g.s,xf,c->hidden,c->moe_inter,src->g.gs,1)||
+               !GOPS_VK->tensor_ensure((void**)&slot[1],src->u.q4,src->u.s,xf,c->hidden,c->moe_inter,src->u.gs,1)||
+               !GOPS_VK->tensor_ensure((void**)&slot[2],src->d.q4,src->d.s,src->d.fmt,c->moe_inter,c->hidden,src->d.gs,1)){
+                if(slot[0]){GOPS_VK->tensor_free(slot[0]);slot[0]=NULL;}
+                if(slot[1]){GOPS_VK->tensor_free(slot[1]);slot[1]=NULL;}
                 fprintf(stderr,"[VK] dev2 tier: VRAM full after %d experts\n",g_vk_reg_n2);
                 break;
             }
-            bytes2+=g_gops->tensor_bytes(slot[0])+g_gops->tensor_bytes(slot[1])+g_gops->tensor_bytes(slot[2]);
+            bytes2+=GOPS_VK->tensor_bytes(slot[0])+GOPS_VK->tensor_bytes(slot[1])+GOPS_VK->tensor_bytes(slot[2]);
             g_vk_reg_n2++;
         }
         fprintf(stderr,"[VK] dev2 tier: %d experts resident (%.2f GB VRAM, %.1fs, next-%d of history)\n",
@@ -8264,6 +8275,9 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
     double budget=g_cuda_expert_gb*1e9, safe_total=0;
     if(g_cuda_enabled&&(g_cuda_expert_gb>0||g_cuda_expert_auto)) for(int i=0;i<g_cuda_ndev;i++){
         size_t free_b=0,total_b=0;
+        /* Native, not GOPS_CUDA->mem_budget: that op reports used/budget GB as
+         * doubles and this planner needs FREE bytes to subtract dense
+         * projections and the reserve from (gpu_ops.h). */
         if(coli_cuda_mem_info(g_cuda_devices[i],&free_b,&total_b)){
             remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-g_cuda_reserve_gb*1e9;
             if(remaining[i]<0) remaining[i]=0; safe_total+=remaining[i];
@@ -8384,9 +8398,9 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
                     }
 #endif
                     if(uploaded){
-                        int64_t actual=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
-                                      +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
-                                      +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
+                        int64_t actual=(int64_t)GOPS_CUDA->tensor_bytes(s->g.cuda)
+                                      +(int64_t)GOPS_CUDA->tensor_bytes(s->u.cuda)
+                                      +(int64_t)GOPS_CUDA->tensor_bytes(s->d.cuda);
                         m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
                         remaining[best]-=actual; placed_b[best]+=actual; placed_n[best]++;
                         placed_w[best]+=(double)r[a].c;
@@ -9344,6 +9358,13 @@ int main(int argc, char **argv){
         if(g_cuda_ndev<1){ fprintf(stderr,"invalid COLI_GPUS: use a list such as 0,1,2\n"); return 2; }
         g_cuda_enabled=coli_cuda_init(g_cuda_devices,g_cuda_ndev);
         if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] requested backend is unavailable\n"); return 2; }
+        /* Same contract as Vulkan below, into CUDA's OWN slot: the two tables
+         * coexist, so initializing both no longer makes one backend's call
+         * sites read the other's table (#11 slice 6). */
+        if(!coli_gops_bind(COLI_GPU_CUDA,&coli_cuda_gpu_ops)){
+            fprintf(stderr,"[CUDA] internal error: the CUDA ops table was refused by the backend registry\n");
+            return 2;
+        }
         /* fmt=6 decodes against quant.h's codebook; publish it to every device so
          * the backend never keeps a second copy that could drift (#452). An older
          * DLL without the symbol leaves this 0 and fmt=6 tensors stay CPU-side. */
@@ -9357,7 +9378,13 @@ int main(int argc, char **argv){
     if(getenv("COLI_VULKAN") && atoi(getenv("COLI_VULKAN"))){
         char spvbuf[512]; const char *spv = vk_resolve_spv(spvbuf, sizeof(spvbuf));
         g_vulkan = coli_vk_init(spv);
-        if(g_vulkan) g_gops = &coli_vk_gpu_ops;
+        /* Bind before any gated site can run: from here g_vulkan implies GOPS_VK.
+         * A refusal is not a runtime condition to degrade around -- it means the
+         * wrong table was wired up, so say so and stop. */
+        if(g_vulkan && !coli_gops_bind(COLI_GPU_VULKAN,&coli_vk_gpu_ops)){
+            fprintf(stderr,"[VK] internal error: the Vulkan ops table was refused by the backend registry\n");
+            return 2;
+        }
         if(!g_vulkan){ fprintf(stderr,"[VK] Vulkan backend unavailable (tried %s; need libvulkan + "
                                "the compiled shaders — point COLI_VK_SHADERS at the shader directory "
                                "or the qmatmul.spv file, or run `make VK=1` to build them)\n", spv); return 2; }
