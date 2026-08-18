@@ -903,6 +903,8 @@ static int prepare_group_weights(DeviceContext *,ColiCudaTensor *const *,
  * is per-device, so this walks the contexts; the engine calls it once after init
  * rather than the backend carrying a second copy of the table that could drift
  * from the CPU decoder's (#452). Safe to call before any fmt=6 upload only. */
+extern "C" int coli_cuda_abi_version(void) { return COLI_CUDA_ABI_VERSION; }
+
 extern "C" int coli_cuda_e8_set_grid(const void *grid) {
     if (!grid || g_nctx < 1) return 0;
     for (int i = 0; i < g_nctx; i++) {

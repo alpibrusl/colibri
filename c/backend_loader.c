@@ -49,80 +49,15 @@
 #define COLI_VENDOR_TAG  "[CUDA]"
 #endif
 
-/* Function-pointer typedefs matching each exported symbol. */
-typedef int            (*fn_init)(const int *devices, int count);
-typedef void           (*fn_shutdown)(void);
-typedef int            (*fn_device_count)(void);
-typedef int            (*fn_device_at)(int index);
-typedef int            (*fn_mem_info)(int device, size_t *free_bytes, size_t *total_bytes);
-typedef int            (*fn_device_integrated)(int device);
-typedef void           (*fn_stats)(int device, size_t *tensor_count, size_t *tensor_bytes);
-typedef void           (*fn_group_stats)(uint64_t *calls, uint64_t *experts, uint64_t *rows,
-                                         double *h2d_ms, double *kernel_ms, double *d2h_ms);
-typedef void           (*fn_group_stats_device)(int device, uint64_t *calls,
-                                                uint64_t *experts, uint64_t *rows,
-                                                double *h2d_ms, double *kernel_ms,
-                                                double *d2h_ms);
-typedef int            (*fn_expert_mlp)(ColiCudaTensor *gate, ColiCudaTensor *up,
-                                        ColiCudaTensor *down, float *y, const float *x, int S);
-typedef int            (*fn_expert_group)(ColiCudaTensor *const *gates, ColiCudaTensor *const *ups,
-                                          ColiCudaTensor *const *downs, const int *rows, int count,
-                                          float *y, const float *x);
-typedef int            (*fn_expert_group_issue)(ColiCudaTensor *const *gates,
-                                                ColiCudaTensor *const *ups,
-                                                ColiCudaTensor *const *downs,
-                                                const int *rows, int count, const float *x);
-typedef const float *  (*fn_expert_group_take)(int device);
-typedef int            (*fn_attention_absorb)(ColiCudaTensor *kv_b, float *ctx, const float *q,
-                                              const float *latent, const float *rope, int H, int Q,
-                                              int R, int V, int K, int T, float attention_scale);
-typedef int            (*fn_tensor_upload)(ColiCudaTensor **tensor, const void *weights,
-                                           const float *scales, int fmt, int I, int O, int device);
-typedef int            (*fn_tensor_upload_g)(ColiCudaTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int device, int gs);
-typedef int            (*fn_e8_set_grid)(const void *grid);
-typedef int            (*fn_fp8_set_lut)(const float *lut);
-typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const float *x,
-                                    const void *weights, const float *scales,
-                                    int fmt, int S, int I, int O, int device, int gs);
-typedef void           (*fn_tensor_free)(ColiCudaTensor *tensor);
-typedef size_t         (*fn_tensor_bytes)(const ColiCudaTensor *tensor);
-typedef int            (*fn_tensor_device)(const ColiCudaTensor *tensor);
-
-/* --- #111 GPU resident pipeline additions (matched to backend_cuda.h) --- */
-
-
-/* --- #111 GPU resident pipeline additions (matched to backend_cuda.h) --- */
-typedef int (*fn_attention_absorb_batch)(ColiCudaTensor *kv_b,float *ctx,const float *q, const float *latent,const float *rope,int S, int H,int Q,int R,int V,int K,int T, float attention_scale);
-typedef int (*fn_attention_absorb_batch_dev)(ColiCudaTensor *kv_b_shard,float *ctx_dev, const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale);
-typedef int (*fn_attention_absorb_kvdev)(ColiCudaTensor *kv_b,float *ctx,const float *q, const float *latent_dev,const float *rope_dev,int H,int Q,int R,int V,int K,int T, float scale);
-typedef int (*fn_attention_project_batch)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out,const float *q,const float *latent, const float *rope,int S,int H,int Q,int R, int V,int K,int T,float attention_scale);
-typedef int (*fn_attention_project_ragged)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
-        float *out,const float *q,const void *const *keys,
-        const float *const *latent,const float *const *rope,
-        const int *lengths,int S,int H,int Q,int R,int V,int K,int max_t,float attention_scale);
-typedef int (*fn_attention_project_batch_dev)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out,const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale);
-typedef int (*fn_attention_project_batch_dev_out)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale);
-typedef int (*fn_pipe_add)(int device,float *x_dev,const float *t_dev,size_t n);
-typedef void * (*fn_pipe_alloc)(int device,size_t bytes);
-typedef int (*fn_pipe_copy2d)(int device,float *dst,int dpitch,const float *src, int spitch,int width,int height);
-typedef int (*fn_pipe_download)(int device,const void *src,void *dst,size_t bytes);
-typedef void (*fn_pipe_free)(int device,void *p);
-typedef int (*fn_pipe_gemm)(ColiCudaTensor *t,float *y_dev,const float *x_dev,int S);
-typedef int (*fn_pipe_peer_copy)(int dst_dev,float *dst,int src_dev, const float *src,size_t bytes);
-typedef int (*fn_pipe_rmsnorm)(int device,float *y_dev,const float *x_dev, const float *w_dev,int S,int D,float eps);
-typedef int (*fn_pipe_rmsnorm_s)(int device,float *y_dev,const float *x_dev, const float *w_dev,int S,int D,float eps, int xstride,int ystride);
-typedef int (*fn_group_resident_issue)(ColiCudaTensor *const *gates,ColiCudaTensor *const *ups,ColiCudaTensor *const *downs,const float *weights,int count,int home_device,const float *x_src_dev,float *partial_slot_dev);
-typedef int (*fn_group_resident_take)(int home_device,const int *devices,int n_issued,float *slots_dev,float *acc_dev,int D);
-typedef int (*fn_pipe_router)(int device,const float *x_dev,const void *rw_dev,const void *rb_dev,int D,int E,int Ksel,float topp,int norm_topk,float routed_scale,int *idx_host,float *w_host,int *keff_host);
-typedef int (*fn_pipe_rope)(int device,float *v_dev,const int *pos_dev,int rows, int stride,int offset,int R,int heads,float theta);
-typedef int (*fn_pipe_rope_base)(int device,float *v_dev,int pos_base,int rows, int stride,int offset,int R,int heads,float theta);
-typedef int (*fn_pipe_rows_add)(int device,float *x_dev,const float *partial_dev, const int *rows_dev,int nrows,int D);
-typedef float * (*fn_pipe_scratch)(int device,int slot,size_t bytes);
-typedef int (*fn_pipe_silu_mul)(int device,float *gate_dev,const float *up_dev,size_t n);
-typedef int (*fn_pipe_sync)(int device);
-typedef int (*fn_pipe_upload)(int device,void *dst,const void *src,size_t bytes);
-typedef int (*fn_shared_mlp_w4a16)(ColiCudaTensor *gate, ColiCudaTensor *up, ColiCudaTensor *down, float *y, const float *x, int S);
-typedef int (*fn_tensor_update)(ColiCudaTensor *tensor, const void *weights, const float *scales);
+/* Function-pointer typedefs, derived from backend_cuda.h's own prototypes
+ * (#11 bullet 3): __typeof__ takes each pointer type straight from the
+ * declaration the DLL side is compiled against, and COLI_CUDA_ABI_LIST names
+ * the set -- there is no hand-written signature left in this file to drift.
+ * GNU C is fine here: this translation unit is always built by GCC/MinGW
+ * (nvcc's cl.exe host only ever compiles the .cu). */
+#define COLI_ABI_TYPEDEF(name) typedef __typeof__(coli_cuda_##name) *fn_##name;
+COLI_CUDA_ABI_LIST(COLI_ABI_TYPEDEF, COLI_ABI_TYPEDEF)
+#undef COLI_ABI_TYPEDEF
 
 /* Resolved pointers, plus a flag so we attempt the load at most once. */
 static struct {
@@ -137,57 +72,10 @@ static struct {
      * reference belongs to the backend, not to us. */
     HMODULE hip_runtime;
 #endif
-    fn_init            init;
-    fn_shutdown        shutdown;
-    fn_device_count    device_count;
-    fn_device_at       device_at;
-    fn_mem_info        mem_info;
-    fn_device_integrated device_integrated;
-    fn_stats           stats;
-    fn_group_stats     group_stats;
-    fn_group_stats_device group_stats_device;
-    fn_expert_mlp      expert_mlp;
-    fn_expert_group    expert_group;
-    fn_expert_group_issue expert_group_issue;
-    fn_expert_group_take expert_group_take;
-    fn_attention_absorb attention_absorb;
-    fn_tensor_upload   tensor_upload;
-    fn_tensor_upload_g tensor_upload_g;
-    fn_e8_set_grid     e8_set_grid;
-    fn_fp8_set_lut     fp8_set_lut;
-    fn_matmul          matmul;
-    fn_tensor_free     tensor_free;
-    fn_tensor_bytes    tensor_bytes;
-    fn_tensor_device   tensor_device;
-
-    fn_attention_absorb_batch attention_absorb_batch;
-    fn_attention_absorb_batch_dev attention_absorb_batch_dev;
-    fn_attention_absorb_kvdev attention_absorb_kvdev;
-    fn_attention_project_batch attention_project_batch;
-    fn_attention_project_ragged attention_project_ragged;
-    fn_attention_project_batch_dev attention_project_batch_dev;
-    fn_attention_project_batch_dev_out attention_project_batch_dev_out;
-    fn_pipe_add pipe_add;
-    fn_pipe_alloc pipe_alloc;
-    fn_pipe_copy2d pipe_copy2d;
-    fn_pipe_download pipe_download;
-    fn_pipe_free pipe_free;
-    fn_pipe_gemm pipe_gemm;
-    fn_pipe_peer_copy pipe_peer_copy;
-    fn_pipe_rmsnorm pipe_rmsnorm;
-    fn_pipe_rmsnorm_s pipe_rmsnorm_s;
-    fn_group_resident_issue expert_group_resident_issue;
-    fn_group_resident_take expert_group_resident_take;
-    fn_pipe_router pipe_router;
-    fn_pipe_rope pipe_rope;
-    fn_pipe_rope_base pipe_rope_base;
-    fn_pipe_rows_add pipe_rows_add;
-    fn_pipe_scratch pipe_scratch;
-    fn_pipe_silu_mul pipe_silu_mul;
-    fn_pipe_sync pipe_sync;
-    fn_pipe_upload pipe_upload;
-    fn_shared_mlp_w4a16 shared_mlp_w4a16;
-    fn_tensor_update tensor_update;
+    /* one field per ABI entry, same name as the exported suffix */
+#define COLI_ABI_FIELD(name) fn_##name name;
+    COLI_CUDA_ABI_LIST(COLI_ABI_FIELD, COLI_ABI_FIELD)
+#undef COLI_ABI_FIELD
 } g_cuda;
 
 #ifdef COLI_HIP_DLL
@@ -1377,60 +1265,36 @@ static int coli_cuda_load(void){
         g_cuda.name = (type)GetProcAddress(g_cuda.dll, "coli_cuda_" #name); \
         _Pragma("GCC diagnostic pop")
 
-    RESOLVE(init,           fn_init)
-    RESOLVE(shutdown,       fn_shutdown)
-    RESOLVE(device_count,   fn_device_count)
-    RESOLVE(device_at,      fn_device_at)
-    RESOLVE(mem_info,       fn_mem_info)
-    /* Optional: a DLL predating #653 leaves this NULL; the wrapper then reports
-     * "not integrated" (0), so the RAM-budget correction simply doesn't apply
-     * rather than taking the whole GPU backend down over one missing symbol. */
-    RESOLVE_OPT(device_integrated, fn_device_integrated)
-    RESOLVE(stats,          fn_stats)
-    RESOLVE(group_stats,    fn_group_stats)
-    RESOLVE(group_stats_device, fn_group_stats_device)
-    RESOLVE(expert_mlp,     fn_expert_mlp)
-    RESOLVE(expert_group,   fn_expert_group)
-    RESOLVE(expert_group_issue, fn_expert_group_issue)
-    RESOLVE(expert_group_take, fn_expert_group_take)
-    RESOLVE(attention_absorb, fn_attention_absorb)
-    RESOLVE(tensor_upload,  fn_tensor_upload)
-    RESOLVE(tensor_upload_g, fn_tensor_upload_g)
-    RESOLVE_OPT(e8_set_grid, fn_e8_set_grid)
-    RESOLVE_OPT(fp8_set_lut, fn_fp8_set_lut)
-    RESOLVE(matmul,         fn_matmul)
-    RESOLVE(tensor_free,    fn_tensor_free)
-    RESOLVE(tensor_bytes,   fn_tensor_bytes)
-    RESOLVE(tensor_device,  fn_tensor_device)
+    /* ---- ABI gate first (#11 bullet 3): a DLL built against a different
+     * signature set must be refused BEFORE any symbol is trusted. Optional
+     * resolve: a DLL predating the stamp still loads, with a warning that
+     * the drift check is unavailable until it is rebuilt. */
+    RESOLVE_OPT(abi_version, fn_abi_version)
+    if (g_cuda.abi_version) {
+        int got = g_cuda.abi_version();
+        if (got != COLI_CUDA_ABI_VERSION) {
+            fprintf(stderr, COLI_VENDOR_TAG " " COLI_BACKEND_DLL
+                    " reports ABI version %d but this build expects %d — refusing the "
+                    "backend (rebuild the DLL from this source tree)\n",
+                    got, COLI_CUDA_ABI_VERSION);
+            FreeLibrary(g_cuda.dll); g_cuda.dll = NULL;
+            COLI_RELEASE_RUNTIME_ON_FAIL
+            return 0;
+        }
+    } else {
+        fprintf(stderr, COLI_VENDOR_TAG " " COLI_BACKEND_DLL
+                " predates coli_cuda_abi_version — signature drift cannot be "
+                "checked against this binary; rebuild it to arm the ABI gate\n");
+    }
 
-    RESOLVE(attention_absorb_batch, fn_attention_absorb_batch)
-    RESOLVE(attention_absorb_batch_dev, fn_attention_absorb_batch_dev)
-    RESOLVE(attention_absorb_kvdev, fn_attention_absorb_kvdev)
-    RESOLVE(attention_project_batch, fn_attention_project_batch)
-    RESOLVE(attention_project_ragged, fn_attention_project_ragged)
-    RESOLVE(attention_project_batch_dev, fn_attention_project_batch_dev)
-    RESOLVE(attention_project_batch_dev_out, fn_attention_project_batch_dev_out)
-    RESOLVE(pipe_add, fn_pipe_add)
-    RESOLVE(pipe_alloc, fn_pipe_alloc)
-    RESOLVE(pipe_copy2d, fn_pipe_copy2d)
-    RESOLVE(pipe_download, fn_pipe_download)
-    RESOLVE(pipe_free, fn_pipe_free)
-    RESOLVE(pipe_gemm, fn_pipe_gemm)
-    RESOLVE(pipe_peer_copy, fn_pipe_peer_copy)
-    RESOLVE(pipe_rmsnorm, fn_pipe_rmsnorm)
-    RESOLVE(pipe_rmsnorm_s, fn_pipe_rmsnorm_s)
-    RESOLVE(expert_group_resident_issue, fn_group_resident_issue)
-    RESOLVE(expert_group_resident_take, fn_group_resident_take)
-    RESOLVE(pipe_router, fn_pipe_router)
-    RESOLVE(pipe_rope, fn_pipe_rope)
-    RESOLVE(pipe_rope_base, fn_pipe_rope_base)
-    RESOLVE(pipe_rows_add, fn_pipe_rows_add)
-    RESOLVE(pipe_scratch, fn_pipe_scratch)
-    RESOLVE(pipe_silu_mul, fn_pipe_silu_mul)
-    RESOLVE(pipe_sync, fn_pipe_sync)
-    RESOLVE(pipe_upload, fn_pipe_upload)
-    RESOLVE(shared_mlp_w4a16, fn_shared_mlp_w4a16)
-    RESOLVE(tensor_update, fn_tensor_update)
+    #define COLI_ABI_RESOLVE(name)     RESOLVE(name, fn_##name)
+    #define COLI_ABI_RESOLVE_OPT(name) RESOLVE_OPT(name, fn_##name)
+    /* abi_version resolves twice (once above, once via the list) -- both are
+     * RESOLVE_OPT of the same symbol into the same field, so the second is a
+     * harmless idempotent store and the list stays the single set. */
+    COLI_CUDA_ABI_LIST(COLI_ABI_RESOLVE, COLI_ABI_RESOLVE_OPT)
+    #undef COLI_ABI_RESOLVE
+    #undef COLI_ABI_RESOLVE_OPT
     #undef RESOLVE
     #undef COLI_RELEASE_RUNTIME_ON_FAIL
 

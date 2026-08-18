@@ -92,20 +92,33 @@ class FixtureBuildError(AssertionError):
     """
 
 
-def _derive_backend_abi():
-    """Parse the loader's own RESOLVE macros for the export set it requires.
+def _derive_abi_version():
+    """COLI_CUDA_ABI_VERSION as the header defines it, for the stub's stamp."""
+    source = (HERE / "backend_cuda.h").read_text(encoding="utf-8", errors="replace")
+    m = re.search(r"^#define\s+COLI_CUDA_ABI_VERSION\s+(\d+)\s*$", source, re.M)
+    if not m:
+        raise FixtureBuildError("COLI_CUDA_ABI_VERSION not found in backend_cuda.h")
+    return int(m.group(1))
 
-    The ABI is read from c/backend_loader.c rather than restated here, so the
-    stub cannot silently drift from the contract it is meant to satisfy: add a
-    symbol to the loader and the fixture exports it on the next run.
+
+def _derive_backend_abi():
+    """Parse COLI_CUDA_ABI_LIST for the export set the loader requires.
+
+    Since #11 the ABI's single source of truth is the X-macro list in
+    c/backend_cuda.h (the loader generates its typedefs, struct and resolve
+    calls from it). The fixture reads THAT list rather than restating it, so
+    the stub cannot silently drift from the contract it is meant to satisfy:
+    add a symbol to the list and the fixture exports it on the next run.
     """
-    source = (HERE / "backend_loader.c").read_text(encoding="utf-8", errors="replace")
-    mandatory = ["coli_cuda_" + m for m in
-                 re.findall(r"^\s+RESOLVE\((\w+),", source, re.M)]
-    optional = ["coli_cuda_" + m for m in
-                re.findall(r"^\s+RESOLVE_OPT\((\w+),", source, re.M)]
+    source = (HERE / "backend_cuda.h").read_text(encoding="utf-8", errors="replace")
+    m = re.search(r"#define\s+COLI_CUDA_ABI_LIST\(X,\s*X_OPT\)\s*((?:.*\\\n)+.*)", source)
+    if not m:
+        raise FixtureBuildError("COLI_CUDA_ABI_LIST not found in backend_cuda.h")
+    body = m.group(1)
+    mandatory = ["coli_cuda_" + n for n in re.findall(r"(?<!_)X\((\w+)\)", body)]
+    optional = ["coli_cuda_" + n for n in re.findall(r"X_OPT\((\w+)\)", body)]
     if not mandatory:
-        raise FixtureBuildError("no RESOLVE symbols parsed from backend_loader.c")
+        raise FixtureBuildError("no X() symbols parsed from COLI_CUDA_ABI_LIST")
     overlap = set(mandatory) & set(optional)
     if overlap:
         raise FixtureBuildError("symbol in both RESOLVE and RESOLVE_OPT: %s"
@@ -586,7 +599,8 @@ int main(int argc, char **argv)
         return implib
 
     def _backend_source(self, with_dep=False):
-        real = {"coli_cuda_init", "coli_cuda_e8_set_grid"}
+        real = {"coli_cuda_init", "coli_cuda_e8_set_grid", "coli_cuda_abi_version"}
+        abi_version = _derive_abi_version()
         lines = [
             "/* generated fake backend: no HIP/ROCm/CUDA header, no GPU work,",
             " * no DllMain. Imports the marker from amdhip64_7.dll by basename",
@@ -605,6 +619,12 @@ int main(int argc, char **argv)
             "",
             "__declspec(dllexport) int coli_cuda_e8_set_grid(const void *grid)",
             "{ (void)grid; return 1; }",
+            "",
+            "/* The ABI stamp the loader gates on: must be the real value or",
+            " * every load test would fail at the version check. Derived from",
+            " * backend_cuda.h, never restated. */",
+            "__declspec(dllexport) int coli_cuda_abi_version(void)",
+            "{ return %d; }" % abi_version,
             "",
             "/* Remaining loader-required exports: never called on the startup",
             " * path under test, so trivial bodies are enough to let symbol",
@@ -873,20 +893,20 @@ class LoaderStubFixtureTest(unittest.TestCase):
             cls.fixture.cleanup()
             cls.fixture = None
 
-    def test_abi_is_derived_from_the_loader_source(self):
-        """47 mandatory + 3 optional, parsed from backend_loader.c.
+    def test_abi_is_derived_from_the_abi_list(self):
+        """47 mandatory + 4 optional, parsed from backend_cuda.h's X-macro.
 
-        The counts are a deliberate tripwire: adding a RESOLVE to the loader
-        widens the ABI every Windows DLL must satisfy, and that should be a
-        conscious act rather than something noticed by a user. Updating them is
-        the intended response, not a nuisance -- but name the symbol you added
-        below, so the next person reading a failure gets the reason and not
-        just a different integer.
+        The counts are a deliberate tripwire: adding an entry to
+        COLI_CUDA_ABI_LIST widens the ABI every Windows DLL must satisfy, and
+        that should be a conscious act rather than something noticed by a
+        user. Updating them is the intended response, not a nuisance -- but
+        name the symbol you added below, so the next person reading a failure
+        gets the reason and not just a different integer.
         """
         f = self.fixture
         self.assertEqual(len(f.mandatory), 47)
-        self.assertEqual(len(f.optional), 3)
-        self.assertEqual(len(f.exports), 50)
+        self.assertEqual(len(f.optional), 4)
+        self.assertEqual(len(f.exports), 51)
         self.assertEqual(len(f.exports), len(f.mandatory) + len(f.optional))
         self.assertIn("coli_cuda_init", f.mandatory)
         self.assertIn("coli_cuda_e8_set_grid", f.optional)
@@ -894,6 +914,9 @@ class LoaderStubFixtureTest(unittest.TestCase):
         self.assertIn("coli_cuda_attention_project_ragged", f.mandatory)
         # fp8_set_lut: fmt=8 e4m3 dense/expert kernels (#817).
         self.assertIn("coli_cuda_fp8_set_lut", f.optional)
+        # abi_version: the #11 signature-drift gate (optional: old DLLs load
+        # with a warning; a PRESENT-but-wrong stamp refuses the backend).
+        self.assertIn("coli_cuda_abi_version", f.optional)
 
     def test_both_runtimes_exist_with_the_production_basename(self):
         """Same basename, different directories — the conflict precondition."""
