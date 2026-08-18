@@ -50,6 +50,87 @@ class ResearchToolSelftests(unittest.TestCase):
         self.assertIn("selftest: ok", proc.stdout)
 
 
+class ExpertLayout(unittest.TestCase):
+    """#36: the layout tool only reports a win when there is one to report."""
+
+    def _mod(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "expert_layout", TOOLS / "expert_layout.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_selftest(self):
+        proc = _run("expert_layout.py")
+        self.assertEqual(proc.returncode, 0,
+                         f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        self.assertIn("selftest: ok", proc.stdout)
+
+    def test_reads_metric_endpoints(self):
+        el = self._mod()
+        slots = el.slots_of([0, 1, 2, 3, 4, 5])
+        self.assertEqual(el.runs_of(slots, {1, 2, 3}), 1)   # contiguous: one read
+        self.assertEqual(el.runs_of(slots, {0, 2, 4}), 3)   # scattered: |S| reads
+        self.assertEqual(el.runs_of(slots, set()), 0)
+
+    def test_clustered_routing_is_detected_out_of_sample(self):
+        import random
+        el = self._mod()
+        rng = random.Random(3)
+        forwards = el.synth_clustered(300, 3, 48, group=6, k=3, rng=rng)
+        scored, _, _ = el.evaluate(forwards)
+        gains = el.gains(scored)
+        # Beating BOTH baselines is the gate; beating only the random control
+        # would mean the metric moves under any permutation.
+        self.assertGreater(gains["vs_identity"], el.GAIN_THRESHOLD)
+        self.assertGreater(gains["vs_random"], el.GAIN_THRESHOLD)
+
+    def test_structureless_routing_reports_no_win(self):
+        # The regression that matters. Scored in-sample this tool claimed a ~9%
+        # read reduction on routing generated with no structure at all —
+        # a fitted-on-the-eval-set artifact that would have justified a
+        # container rewrite for nothing. Held out, it must report ~zero.
+        import random
+        el = self._mod()
+        rng = random.Random(5)
+        forwards = el.synth_uniform(300, 3, 48, k=3, rng=rng)
+        scored, _, _ = el.evaluate(forwards)
+        self.assertLessEqual(el.gains(scored)["vs_identity"], el.GAIN_THRESHOLD)
+
+    def test_report_is_flat_integers_and_verdict_follows_the_rule(self):
+        import random
+        el = self._mod()
+        rng = random.Random(7)
+        forwards = el.synth_clustered(200, 2, 32, group=4, k=2, rng=rng)
+        scored, _, _ = el.evaluate(forwards)
+        gains = el.gains(scored)
+        report = el.report_of(["synthetic"], forwards, scored, gains)
+        for key, value in report["claims"].items():
+            self.assertIsInstance(value, int, f"claim {key} is not an integer")
+        worth = (gains["vs_identity"] > el.GAIN_THRESHOLD
+                 and gains["vs_random"] > el.GAIN_THRESHOLD)
+        self.assertEqual(report["claims"]["worth_engine_slice"], 1 if worth else 0)
+        self.assertEqual(report["claims"]["forwards"], len(forwards))
+
+    def test_emitted_layout_is_a_permutation(self):
+        # A container rewrite consumes this directly, so a dropped or duplicated
+        # expert would corrupt the model rather than merely slow it down.
+        import random
+        el = self._mod()
+        rng = random.Random(9)
+        forwards = el.synth_clustered(120, 3, 24, group=4, k=3, rng=rng)
+        _, placements, by_layer = el.evaluate(forwards)
+        doc = el.permutation_doc(placements, by_layer)
+        self.assertEqual(doc["version"], 1)
+        for layer, order in doc["layers"].items():
+            expected = by_layer[int(layer)]
+            self.assertEqual(sorted(order), sorted(expected),
+                             f"layer {layer}: layout is not a permutation")
+            self.assertEqual(len(order), len(set(order)),
+                             f"layer {layer}: duplicate slot assignment")
+
+
 class LedgerShape(unittest.TestCase):
     """Claims are integers, flat, and scaled the same way everywhere."""
 

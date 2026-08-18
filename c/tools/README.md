@@ -12,9 +12,12 @@ not runtime dependencies of the C engine.
 - `make_glm_oracle.py`, `make_glm_bench_model.py`: deterministic fixtures
 - `benchmark_cuda_fixture.py`, `eval_glm.py`, `fetch_benchmarks.py`: benchmarks
 - `gen_unicode.py`: tokenizer table generation
-- `route_temporal.py`, `expert_redundancy.py`: the #32 / #31 offline
-  measurements — they answer a research question from artifacts the engine
-  already emits, before any engine code is written
+- `route_temporal.py`, `expert_redundancy.py`, `expert_layout.py`: the
+  #32 / #31 / #36 offline measurements — each answers a research question from
+  artifacts the engine already emits, before any engine code is written.
+  `expert_layout.py` scores its layout on a HELD-OUT split against both the
+  current order and a random control, because a seriation heuristic scored
+  in-sample reports a read reduction on routing that has no structure at all
 - `ledger.py`: one scaling convention and one record shape, so a measurement
   that costs a real checkpoint can be appended to a run ledger
   ([lex-notebooklab](https://github.com/alpibrusl/lex-notebooklab)) instead of
