@@ -3861,18 +3861,16 @@ static int mb_gs_compat(int est_fmt, int est_gs, int fmt, int gs){
     return !(est_fmt==4 && fmt==4 && gs!=est_gs);
 }
 
-static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int with_shared){
-    if(g_pilot_real){   /* barriera cross-layer: prendi possesso di QUESTO layer e aspetta
-                         * l'eventuale load-pilota in volo sullo stesso layer (dopodiche' il
-                         * worker droppa ogni nuovo load <= layer -> ecache[layer] e' stabile
-                         * per tutto il resolve/matmul/promozione qui sotto). */
-        pthread_mutex_lock(&g_pilot_mx);
-        atomic_store_explicit(&g_cur_moe_layer,layer,memory_order_release);
-        while(layer>=0 && layer<256 && g_pilot_inflight[layer]>0)
-            pthread_cond_wait(&g_pilot_cv,&g_pilot_mx);
-        pthread_mutex_unlock(&g_pilot_mx);
-    }
-    Cfg *c=&m->c; int D=c->hidden, E=c->n_experts, K=c->topk, I=c->moe_inter;
+/* ---- FASE A come funzione: routing di tutte le S posizioni (#10) ----
+ * Riempie idxs/ws/keff (K slot per posizione), azzera out, e fa TUTTA la
+ * contabilita' di routing: eusage/eheat/elast + entrambi gli orologi (il
+ * reale e quello privato DISK-CLASS), ROUTE_TRACE, couple/lookahead, e lo
+ * snapshot enr/eroute per il pilota. Nessuna decisione di placement qui:
+ * solo selezione + contatori. Entrambi i cammini (router CPU e pre-routed
+ * GPU) vivono qui, come prima. */
+static void moe_route(Model *m, Layer *l, int layer, float *x, int S,
+                      float *out, int *idxs, float *ws, int *keff){
+    Cfg *c=&m->c; int D=c->hidden, E=c->n_experts, K=c->topk;
     /* DISK-CLASS: does THIS call need the pre-bump recency snapshot? Must agree with
      * dc_needed() in expert_load_impl -- that's what reads what this writes. touched[]
      * makes the write once-per-call: an expert routed by more than one position in a big
@@ -3883,7 +3881,6 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     int need_classify = dc_needed();
     unsigned char touched[E]; if(need_classify) memset(touched,0,(size_t)E);
     float *choice=falloc(E);
-    int sI=c->moe_inter*c->n_shared;
     /* Rank buffer for CACHE_ROUTE max-rank selection (up to all E experts). */
     int *rank_buf=NULL; float *rank_w=NULL;
     int do_cache_route = g_cache_route && E>0 && K>0;
@@ -3896,8 +3893,6 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     }
     /* ---- FASE A: routing di tutte le S posizioni ---- */
     double route_t0=g_prof?now_s():0;
-    int *idxs=xalloc((size_t)S*K*sizeof(int),"moe idxs"); float *ws=xalloc((size_t)S*K*sizeof(float),"moe ws");
-    int *keff=xalloc((size_t)S*sizeof(int),"moe keff");
     /* router in UN matmul batch: stessa matematica, via le S chiamate S=1 */
     float *logits_all=falloc((int64_t)S*E);
     int pre_routed=0; (void)pre_routed;
@@ -4120,8 +4115,17 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         }
     }
     m->enr[layer]=keff[S-1]; for(int kk=0;kk<keff[S-1];kk++) m->eroute[layer][kk]=idxs[(int64_t)(S-1)*K+kk];
-    /* ---- FASE B: union degli expert del batch ---- */
-    int *uniq=xalloc((size_t)E*sizeof(int),"moe uniq"); int nu=0;
+    free(logits_all); free(choice);
+}
+
+/* ---- FASE B come funzione: union degli expert del batch (#10) ----
+ * Costruisce uniq[] (capienza E, allocato dal chiamante) e ritorna nu.
+ * Sotto EXPERT_BUDGET puo' RISCRIVERE idxs/ws/keff (drop dei miss oltre
+ * budget + renorm dei pesi) -- e' parte del contratto storico. */
+static int moe_batch_union(Model *m, int layer, int S, int *idxs, float *ws,
+                           int *keff, int *uniq){
+    Cfg *c=&m->c; int E=c->n_experts, K=c->topk;
+    int nu=0;
     unsigned char seen[E]; memset(seen,0,(size_t)E);
     for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++){
         int e=idxs[(int64_t)s*K+kk];
@@ -4227,6 +4231,128 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         nu=nu2;
         free(wsum); free(is_hit); free(keep);
     }
+    return nu;
+}
+
+/* ---- FASE C, primo passo, come funzione: resolve del blocco (#10) ----
+ * Classifica i <=64 unici del blocco: tier VRAM (VULKAN: nessuno slot RAM,
+ * nessun load), pin, LRU (hit: timbro used fresco), o MISS -> staging in
+ * ws[q]. Ritorna nmiss; use[]/missk[]/qof[] sono il vocabolario che il
+ * compute consuma. Stessi contatori hit/miss di prima, negli stessi punti. */
+static int moe_resolve_block(Model *m, int layer, const int *uniq, int base, int nb,
+                             ESlot **use, int *missk, int *qof
+#ifdef COLI_VULKAN
+                             , int vk_active, int *vk_hit
+#endif
+){
+    int nmiss=0;
+        for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL; qof[j]=-1;
+#ifdef COLI_VULKAN
+            /* VK VRAM tier first: registry-served experts need NO RAM slot and NO disk
+             * load (the whole point) — and skipping the LRU recency bump lets them age
+             * out of the RAM cache, freeing capacity for the CPU-served experts. */
+            if(vk_active && layer<m->c.n_layers){
+                ColiVkTensor **rg=vk_reg_at(layer,eid);
+                if(rg && rg[0]){ vk_hit[j]=1; m->hits++; m->hit_vk++; continue; }
+            }
+#endif
+            ESlot *P=m->tc.pin[layer];
+            for(int z=0;z<m->tc.npin[layer];z++) if(sl_eid(&P[z])==eid){ m->hits++; m->hit_pin++; use[j]=&P[z]; break; }
+            if(!use[j]){ ESlot *Sl=m->tc.ecache[layer]; int nn=__atomic_load_n(&m->tc.ecn[layer],__ATOMIC_RELAXED);
+                for(int z=0;z<nn;z++) if(sl_eid(&Sl[z])==eid){ m->hits++; m->hit_ecache++; sl_used_set(&Sl[z],(uint64_t)__atomic_add_fetch(&m->tc.eclock,1,__ATOMIC_RELAXED)); use[j]=&Sl[z]; break; } }
+            if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++;
+                if(g_disk_split){ if(m->ld_ctx==1) m->miss_draft++; else if(m->ld_ctx==2) m->miss_absorb++; } }
+        }
+    return nmiss;
+}
+
+/* ---- FASE E come funzione: shared expert (#10) ----
+ * shared_on_gpu (METAL): Phase E gia' fusa nel command buffer o gia'
+ * sommata via g_pre_sh -> qui si salta calcolo e accumulo. hh e' lo
+ * scratch S*D del chiamante (riusato, non allocato qui). */
+static void moe_shared(Layer *l, int D, int sI, float *x, int S, float *out,
+                       float *hh, int shared_on_gpu){
+    (void)shared_on_gpu;
+    float *sg=NULL,*su=NULL;int shared_cuda=0;
+#ifdef COLI_METAL
+    if(g_pre_sh){ for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=g_pre_sh[z]; shared_on_gpu=1; }
+    if(shared_on_gpu) shared_cuda=2;             /* gia' sommato in out: salta calcolo e add */
+#endif
+#ifdef COLI_CUDA
+    int shared_min=getenv("COLI_CUDA_SHARED_W4A16_MIN_ROWS")?
+        atoi(getenv("COLI_CUDA_SHARED_W4A16_MIN_ROWS")):32;
+    if(shared_min<16)shared_min=16;
+    if(shared_cuda==0&&S>=shared_min&&!l->shared_w4a16_failed&&!omp_in_parallel()&&g_cuda_enabled&&
+       l->sh_gate.fmt==2&&l->sh_up.fmt==2&&l->sh_down.fmt==2&&
+       getenv("COLI_CUDA_SHARED_W4A16")&&atoi(getenv("COLI_CUDA_SHARED_W4A16"))&&
+       qt_cuda_upload(&l->sh_gate)&&qt_cuda_upload(&l->sh_up)&&qt_cuda_upload(&l->sh_down)){
+        shared_cuda=coli_cuda_shared_mlp_w4a16(l->sh_gate.cuda,l->sh_up.cuda,
+                                               l->sh_down.cuda,hh,x,S);
+        if(!shared_cuda)l->shared_w4a16_failed=1;
+    }
+#endif
+    if(!shared_cuda){
+#ifdef COLI_VULKAN
+        /* Whole shared expert as ONE fused submit (gate+up+silu -> down, hidden on-device)
+         * via the expert-group primitive with count=1 — replaces 3 separate VK matmuls
+         * (x read once, 1 fence instead of 3). Falls through to the per-matmul chain. */
+        int fsh=l->sh_gate.fmt;
+        if(g_vk_dense && !omp_in_parallel() && (fsh==1||fsh==2||fsh==5) &&
+           l->sh_up.fmt==fsh && l->sh_down.fmt==fsh){
+            #define SW_(t) ((t).fmt==1?(const void*)(t).q8:(const void*)(t).q4)
+            if(coli_vk_tensor_ensure(&l->sh_gate.vk,SW_(l->sh_gate),l->sh_gate.s,fsh,D,sI,l->sh_gate.gs)&&
+               coli_vk_tensor_ensure(&l->sh_up.vk,  SW_(l->sh_up),  l->sh_up.s,  fsh,D,sI,l->sh_up.gs)&&
+               coli_vk_tensor_ensure(&l->sh_down.vk,SW_(l->sh_down),l->sh_down.s,fsh,sI,D,l->sh_down.gs)){
+                ColiVkTensor *vg=l->sh_gate.vk,*vu=l->sh_up.vk,*vd=l->sh_down.vk;
+                int rows1[1]={S};
+                if(coli_vk_expert_group(&vg,&vu,&vd,rows1,1,hh,x)) shared_cuda=1;
+            }
+            #undef SW_
+        }
+        if(!shared_cuda){
+#endif
+        sg=falloc((int64_t)S*sI);su=falloc((int64_t)S*sI);
+#ifdef COLI_VULKAN
+        if(!vk_matmul_qt(&l->sh_gate, sg, x, S))
+#endif
+        matmul_qt(sg, x, &l->sh_gate, S);
+#ifdef COLI_VULKAN
+        if(!vk_matmul_qt(&l->sh_up, su, x, S))
+#endif
+        matmul_qt(su, x, &l->sh_up,   S);
+        for(int64_t z=0;z<(int64_t)S*sI;z++) sg[z]=siluf(sg[z])*su[z];
+#ifdef COLI_VULKAN
+        if(!vk_matmul_qt(&l->sh_down, hh, sg, S))
+#endif
+        matmul_qt(hh, sg, &l->sh_down, S);
+#ifdef COLI_VULKAN
+        }
+#endif
+    }
+    if(shared_cuda!=2) for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
+    free(sg); free(su);
+}
+
+static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int with_shared){
+    if(g_pilot_real){   /* barriera cross-layer: prendi possesso di QUESTO layer e aspetta
+                         * l'eventuale load-pilota in volo sullo stesso layer (dopodiche' il
+                         * worker droppa ogni nuovo load <= layer -> ecache[layer] e' stabile
+                         * per tutto il resolve/matmul/promozione qui sotto). */
+        pthread_mutex_lock(&g_pilot_mx);
+        atomic_store_explicit(&g_cur_moe_layer,layer,memory_order_release);
+        while(layer>=0 && layer<256 && g_pilot_inflight[layer]>0)
+            pthread_cond_wait(&g_pilot_cv,&g_pilot_mx);
+        pthread_mutex_unlock(&g_pilot_mx);
+    }
+    Cfg *c=&m->c; int D=c->hidden, E=c->n_experts, K=c->topk, I=c->moe_inter;
+    int sI=c->moe_inter*c->n_shared;
+    int *idxs=xalloc((size_t)S*K*sizeof(int),"moe idxs"); float *ws=xalloc((size_t)S*K*sizeof(float),"moe ws");
+    int *keff=xalloc((size_t)S*sizeof(int),"moe keff");
+    /* ---- FASE A: routing di tutte le S posizioni ---- */
+    moe_route(m,l,layer,x,S,out,idxs,ws,keff);
+    /* ---- FASE B: union degli expert del batch ---- */
+    int *uniq=xalloc((size_t)E*sizeof(int),"moe uniq");
+    int nu=moe_batch_union(m,layer,S,idxs,ws,keff,uniq);
     /* ---- FASE C/D: risolvi (pin/cache/disco) e calcola, a blocchi di 64 unici ---- */
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
     float *xe=NULL;   /* fmt=6: x under the rotation Q^T, built once per call — all routed
@@ -4261,27 +4387,15 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     int shared_on_gpu=0; (void)shared_on_gpu;   /* set by the Metal path when Phase E was fused */
     for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
-        ESlot *use[64]; int missk[64]; int qof[64]; int nmiss=0;
+        ESlot *use[64]; int missk[64]; int qof[64]; int nmiss;
 #ifdef COLI_VULKAN
         int vk_hit[64]={0};
 #endif
-        for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL; qof[j]=-1;
+        nmiss=moe_resolve_block(m,layer,uniq,base,nb,use,missk,qof
 #ifdef COLI_VULKAN
-            /* VK VRAM tier first: registry-served experts need NO RAM slot and NO disk
-             * load (the whole point) — and skipping the LRU recency bump lets them age
-             * out of the RAM cache, freeing capacity for the CPU-served experts. */
-            if(vk_active && layer<c->n_layers){
-                ColiVkTensor **rg=vk_reg_at(layer,eid);
-                if(rg && rg[0]){ vk_hit[j]=1; m->hits++; m->hit_vk++; continue; }
-            }
+                                ,vk_active,vk_hit
 #endif
-            ESlot *P=m->tc.pin[layer];
-            for(int z=0;z<m->tc.npin[layer];z++) if(sl_eid(&P[z])==eid){ m->hits++; m->hit_pin++; use[j]=&P[z]; break; }
-            if(!use[j]){ ESlot *Sl=m->tc.ecache[layer]; int nn=__atomic_load_n(&m->tc.ecn[layer],__ATOMIC_RELAXED);
-                for(int z=0;z<nn;z++) if(sl_eid(&Sl[z])==eid){ m->hits++; m->hit_ecache++; sl_used_set(&Sl[z],(uint64_t)__atomic_add_fetch(&m->tc.eclock,1,__ATOMIC_RELAXED)); use[j]=&Sl[z]; break; } }
-            if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++;
-                if(g_disk_split){ if(m->ld_ctx==1) m->miss_draft++; else if(m->ld_ctx==2) m->miss_absorb++; } }
-        }
+                                );
         int metal_done=0;
 #ifdef COLI_METAL
         /* GPU/disk OVERLAP: submit the RESIDENT experts (pin/LRU hits, + shared expert on
@@ -4923,83 +5037,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * dispatched miss slot, before the nr==0 skip) already waited on all ws[] loads
          * for this block, so they are complete before the LRU swap — and the gen-tagged
          * cursor keeps any still-spinning worker off a wrong-generation slot. */
-        { ESlot *Sl=m->tc.ecache[layer];                            /* promozione LRU (swap buffer) */
-          int nn=__atomic_load_n(&m->tc.ecn[layer],__ATOMIC_RELAXED);
-          int promo = nmiss<m->tc.ecap ? nmiss : m->tc.ecap;
-          for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
-              if(nn<m->tc.ecap){ dst=&Sl[nn]; __atomic_store_n(&m->tc.ecn[layer],nn+1,__ATOMIC_RELAXED); nn++; }
-              else { int lru=eslot_lru_victim(Sl,nn);
-                     if(lru<0){ static int warned;
-                         if(!warned){ warned=1; fprintf(stderr,"[CUDA] all LRU expert slots are in flight; skipping cache promotion\n"); }
-                         continue; }
-                     dst=&Sl[lru]; }
-              ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; sl_used_set(dst,(uint64_t)__atomic_add_fetch(&m->tc.eclock,1,__ATOMIC_RELAXED)); }
-        }
+        tier_promote(&m->tc,layer,m->ws,nmiss);   /* promozione LRU (swap buffer) */
     }
     /* ---- FASE E: shared expert (PIPE2: gia' sul device; Metal CB: gia' sommata) ---- */
-    if(!with_shared) goto shared_done;
-    {
-    float *sg=NULL,*su=NULL;int shared_cuda=0;
-#ifdef COLI_METAL
-    if(g_pre_sh){ for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=g_pre_sh[z]; shared_on_gpu=1; }
-    if(shared_on_gpu) shared_cuda=2;             /* gia' sommato in out: salta calcolo e add */
-#endif
-#ifdef COLI_CUDA
-    int shared_min=getenv("COLI_CUDA_SHARED_W4A16_MIN_ROWS")?
-        atoi(getenv("COLI_CUDA_SHARED_W4A16_MIN_ROWS")):32;
-    if(shared_min<16)shared_min=16;
-    if(shared_cuda==0&&S>=shared_min&&!l->shared_w4a16_failed&&!omp_in_parallel()&&g_cuda_enabled&&
-       l->sh_gate.fmt==2&&l->sh_up.fmt==2&&l->sh_down.fmt==2&&
-       getenv("COLI_CUDA_SHARED_W4A16")&&atoi(getenv("COLI_CUDA_SHARED_W4A16"))&&
-       qt_cuda_upload(&l->sh_gate)&&qt_cuda_upload(&l->sh_up)&&qt_cuda_upload(&l->sh_down)){
-        shared_cuda=coli_cuda_shared_mlp_w4a16(l->sh_gate.cuda,l->sh_up.cuda,
-                                               l->sh_down.cuda,hh,x,S);
-        if(!shared_cuda)l->shared_w4a16_failed=1;
-    }
-#endif
-    if(!shared_cuda){
-#ifdef COLI_VULKAN
-        /* Whole shared expert as ONE fused submit (gate+up+silu -> down, hidden on-device)
-         * via the expert-group primitive with count=1 — replaces 3 separate VK matmuls
-         * (x read once, 1 fence instead of 3). Falls through to the per-matmul chain. */
-        int fsh=l->sh_gate.fmt;
-        if(g_vk_dense && !omp_in_parallel() && (fsh==1||fsh==2||fsh==5) &&
-           l->sh_up.fmt==fsh && l->sh_down.fmt==fsh){
-            #define SW_(t) ((t).fmt==1?(const void*)(t).q8:(const void*)(t).q4)
-            if(coli_vk_tensor_ensure(&l->sh_gate.vk,SW_(l->sh_gate),l->sh_gate.s,fsh,D,sI,l->sh_gate.gs)&&
-               coli_vk_tensor_ensure(&l->sh_up.vk,  SW_(l->sh_up),  l->sh_up.s,  fsh,D,sI,l->sh_up.gs)&&
-               coli_vk_tensor_ensure(&l->sh_down.vk,SW_(l->sh_down),l->sh_down.s,fsh,sI,D,l->sh_down.gs)){
-                ColiVkTensor *vg=l->sh_gate.vk,*vu=l->sh_up.vk,*vd=l->sh_down.vk;
-                int rows1[1]={S};
-                if(coli_vk_expert_group(&vg,&vu,&vd,rows1,1,hh,x)) shared_cuda=1;
-            }
-            #undef SW_
-        }
-        if(!shared_cuda){
-#endif
-        sg=falloc((int64_t)S*sI);su=falloc((int64_t)S*sI);
-#ifdef COLI_VULKAN
-        if(!vk_matmul_qt(&l->sh_gate, sg, x, S))
-#endif
-        matmul_qt(sg, x, &l->sh_gate, S);
-#ifdef COLI_VULKAN
-        if(!vk_matmul_qt(&l->sh_up, su, x, S))
-#endif
-        matmul_qt(su, x, &l->sh_up,   S);
-        for(int64_t z=0;z<(int64_t)S*sI;z++) sg[z]=siluf(sg[z])*su[z];
-#ifdef COLI_VULKAN
-        if(!vk_matmul_qt(&l->sh_down, hh, sg, S))
-#endif
-        matmul_qt(hh, sg, &l->sh_down, S);
-#ifdef COLI_VULKAN
-        }
-#endif
-    }
-    if(shared_cuda!=2) for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
-    free(sg); free(su);
-    }
-shared_done:
-    free(logits_all); free(choice); free(idxs); free(ws); free(keff); free(uniq);
+    if(with_shared) moe_shared(l,D,sI,x,S,out,hh,shared_on_gpu);
+    free(idxs); free(ws); free(keff); free(uniq);
     free(xg); free(gg); free(uu); free(hh); free(rows); free(rw); free(xe);
     #undef E8_XE
 #ifdef COLI_CUDA

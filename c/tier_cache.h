@@ -222,4 +222,29 @@ static int tier_evict_pick(TierCache *tc,int layer){
     return lru;
 }
 
+/* Promozione di fine blocco (il quarto verbo di moe(): route/resolve/compute/
+ * PROMOTE). Gli slot di staging ws[0..nmiss) appena caricati entrano nella LRU
+ * del layer via SWAP: lo slab della vittima migra nello slot ws[] e verra'
+ * riusato dal prossimo miss -- nessuna free qui, la proprieta' dei buffer non
+ * cambia mai di thread. L'ordine storico q=nmiss-1..0 e' preservato (l'ultimo
+ * miss del blocco e' il primo promosso). eslot_lru_victim salta gli slot in
+ * volo su una GPU; se TUTTI lo sono la promozione di quel q si salta con un
+ * warn-once, come sempre. Chiamare dal solo thread demand, con il layer
+ * protetto dall'invariante g_cur_moe_layer (nessun pilota in volo qui). */
+static void tier_promote(TierCache *tc,int layer,ESlot *ws,int nmiss){
+    ESlot *Sl=tc->ecache[layer];
+    int nn=__atomic_load_n(&tc->ecn[layer],__ATOMIC_RELAXED);
+    int promo = nmiss<tc->ecap ? nmiss : tc->ecap;
+    for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
+        if(nn<tc->ecap){ dst=&Sl[nn]; __atomic_store_n(&tc->ecn[layer],nn+1,__ATOMIC_RELAXED); nn++; }
+        else { int lru=eslot_lru_victim(Sl,nn);
+               if(lru<0){ static int warned;
+                   if(!warned){ warned=1; fprintf(stderr,"[CUDA] all LRU expert slots are in flight; skipping cache promotion\n"); }
+                   continue; }
+               dst=&Sl[lru]; }
+        ESlot tmp=*dst; *dst=ws[q]; ws[q]=tmp;
+        sl_used_set(dst,(uint64_t)__atomic_add_fetch(&tc->eclock,1,__ATOMIC_RELAXED));
+    }
+}
+
 #endif /* TIER_CACHE_H */

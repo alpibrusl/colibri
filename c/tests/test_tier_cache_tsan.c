@@ -141,8 +141,29 @@ int main(void) {
         for (int b = a + 1; b < nn; b++) CHECK(sl_eid(&cache_slots[b]) != ea);
     }
     CHECK(published > 0 && deduped > 0);
+
+    /* tier_promote (moe()'s end-of-block step): staged ws[] slots enter the
+     * LRU by SWAP -- the promoted eids become resident exactly once, and the
+     * evicted residents surface in the staging slots (ownership moves, no
+     * slot is dropped). Single-threaded here by design: promotion runs on
+     * the demand thread with the layer pilot-quiesced. */
+    ESlot staged[2]; memset(staged, 0, sizeof staged);
+    staged[0].eid = NEXPERT;        /* ids outside the run's range: countable */
+    staged[1].eid = NEXPERT + 1;
+    tier_promote(&tc, 0, staged, 2);
+    nn = tc.ecn[0];
+    int found0 = 0, found1 = 0;
+    for (int z = 0; z < nn; z++) {
+        int e = sl_eid(&cache_slots[z]);
+        if (e == NEXPERT) found0++;
+        if (e == NEXPERT + 1) found1++;
+    }
+    CHECK(found0 == 1 && found1 == 1);
+    CHECK(sl_eid(&staged[0]) != NEXPERT && sl_eid(&staged[1]) != NEXPERT + 1);
+
     printf("test_tier_cache: ok — %ld published, %ld deduped, %ld dropped "
-           "across %d pilots vs 1 demand thread; residents unique\n",
+           "across %d pilots vs 1 demand thread; residents unique; "
+           "tier_promote swap verified\n",
            (long)published, (long)deduped, (long)dropped, PILOTS);
     return 0;
 }
