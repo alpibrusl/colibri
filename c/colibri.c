@@ -84,6 +84,14 @@ static inline void omp_set_num_threads(int n){ (void)n; }
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
 #endif
+#include "gpu_ops.h"
+/* The active GPU backend, as the one boundary the engine calls through (#11).
+ * NULL = no GPU backend initialized (CPU-only). Slice 1 routes the Vulkan
+ * expert-group family through it; the remaining #ifdef sites migrate family
+ * by family. Declared unconditionally so portable code can test it; unused
+ * (and warned about) only on builds with no GPU backend compiled in, hence
+ * the attribute (same pattern as compat.h's compat_pread_lasterr). */
+static const ColiGpuOps *g_gops __attribute__((unused));
 /* Declared unconditionally (not just under COLI_METAL): on a non-Metal build it just sits
  * at 0 forever, which is the correct value there (no Metal backend => never enabled). Kept
  * outside the #ifdef so portable code — e.g. kvb_fmt_gate_notice below — can read "is Metal
@@ -3806,7 +3814,8 @@ typedef struct { ColiVkTensor **g,**u,**d; const int *rows; int n; const float *
 static void *vk2_issue_worker(void *p){
     Vk2Iss *j=(Vk2Iss*)p;
     double t0=now_s();
-    j->rc = coli_vk_expert_group_issue2(j->g,j->u,j->d,j->rows,j->n,j->x);
+    j->rc = g_gops->expert_group_issue((void *const*)j->g,(void *const*)j->u,
+                                       (void *const*)j->d,j->rows,j->n,j->x,1);
     j->dt = now_s()-t0;
     return NULL;
 }
@@ -4305,7 +4314,8 @@ static void moe_shared(Layer *l, int D, int sI, float *x, int S, float *out,
                coli_vk_tensor_ensure(&l->sh_down.vk,SW_(l->sh_down),l->sh_down.s,fsh,sI,D,l->sh_down.gs)){
                 ColiVkTensor *vg=l->sh_gate.vk,*vu=l->sh_up.vk,*vd=l->sh_down.vk;
                 int rows1[1]={S};
-                if(coli_vk_expert_group(&vg,&vu,&vd,rows1,1,hh,x)) shared_cuda=1;
+                if(g_gops && g_gops->expert_group((void *const*)&vg,(void *const*)&vu,
+                                                  (void *const*)&vd,rows1,1,hh,x,0)) shared_cuda=1;
             }
             #undef SW_
         }
@@ -4744,9 +4754,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             pthread_t iss2_th; int iss2_threaded=0;
             if(nvk2>0){
                 if(pthread_create(&iss2_th,NULL,vk2_issue_worker,&iss2)==0) iss2_threaded=1;
-                else iss2.rc = coli_vk_expert_group_issue2(vg2,vu2,vd2,vrows2,nvk2,vk_xh2);
+                else iss2.rc = g_gops->expert_group_issue((void *const*)vg2,(void *const*)vu2,
+                                                          (void *const*)vd2,vrows2,nvk2,vk_xh2,1);
             }
-            int vk_issued = nvk>0 && coli_vk_expert_group_issue(vg,vu,vd,vrows,nvk,vk_xh);
+            int vk_issued = nvk>0 && g_gops->expert_group_issue((void *const*)vg,(void *const*)vu,
+                                                               (void *const*)vd,vrows,nvk,vk_xh,0);
             if(g_prof) g_vkb_issue+=now_s()-t_iss0;
             /* CPU share stays SERIAL over experts with row-parallel kernels: a decode
              * block leaves only ~5-6 CPU experts (the tier absorbs the hot head), fewer
@@ -4783,7 +4795,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 }
             }
             double t_take0=now_s();
-            int vk_ok = vk_issued && coli_vk_expert_group_take(vk_yh);
+            int vk_ok = vk_issued && g_gops->expert_group_take(vk_yh,0);
             if(g_prof) m->t_egpu+=now_s()-t_take0;
             for(int c2=0;c2<nvk;c2++){ int nr=vrows[c2];
                 if(vk_ok){ int o=voff[c2];
@@ -4804,7 +4816,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
              * extra overlap; same per-expert CPU recompute fallback on failure. */
             if(iss2_threaded){ double t_j0=now_s(); pthread_join(iss2_th,NULL);
                 if(g_prof){ g_vkb_join+=now_s()-t_j0; g_vkb_wrk+=iss2.dt; } }
-            int vk2_ok = iss2.rc && coli_vk_expert_group_take2(vk_yh2);
+            int vk2_ok = iss2.rc && g_gops->expert_group_take(vk_yh2,1);
             for(int c2=0;c2<nvk2;c2++){ int nr=vrows2[c2];
                 if(vk2_ok){ int o=voff2[c2];
                     for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap2[c2*S+r]*D, wgt=vwmap2[c2*S+r], *src=vk_yh2+(int64_t)(o+r)*D;
@@ -9345,6 +9357,7 @@ int main(int argc, char **argv){
     if(getenv("COLI_VULKAN") && atoi(getenv("COLI_VULKAN"))){
         char spvbuf[512]; const char *spv = vk_resolve_spv(spvbuf, sizeof(spvbuf));
         g_vulkan = coli_vk_init(spv);
+        if(g_vulkan) g_gops = &coli_vk_gpu_ops;
         if(!g_vulkan){ fprintf(stderr,"[VK] Vulkan backend unavailable (tried %s; need libvulkan + "
                                "the compiled shaders — point COLI_VK_SHADERS at the shader directory "
                                "or the qmatmul.spv file, or run `make VK=1` to build them)\n", spv); return 2; }
