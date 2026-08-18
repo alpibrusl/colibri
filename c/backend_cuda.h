@@ -201,6 +201,50 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor
         int S,int H,int Q,int R,int V,int K,int T,float scale);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_sync(int device);
 
+/* ---- The ABI as data (#11 bullet 3) ----
+ * COLI_CUDA_ABI_LIST names every symbol the Windows runtime loader resolves
+ * from the backend DLL: X(name) for mandatory symbols (missing -> the whole
+ * backend is refused), X_OPT(name) for optional ones (a DLL predating the
+ * symbol only loses that feature). backend_loader.c derives its function-
+ * pointer typedefs, its resolved-pointer struct, and its GetProcAddress list
+ * from THIS list, taking each pointer type via __typeof__ of the prototype
+ * above -- so a signature edit in this header propagates to the loader at
+ * compile time, and the audit's drift class (edit the header, forget the
+ * loader's hand-written typedef, cast through FARPROC, corrupt the stack at
+ * runtime) is structurally gone. Adding an export = add its prototype above
+ * and its name here; there is no third place.
+ *
+ * COLI_CUDA_ABI_VERSION is the runtime half of the same guarantee: the DLL
+ * reports the version it was built against and the loader refuses a
+ * mismatch at load. Bump it whenever an EXISTING symbol's signature or
+ * semantics change; adding a new X_OPT symbol needs no bump. */
+#define COLI_CUDA_ABI_VERSION 1
+
+#define COLI_CUDA_ABI_LIST(X, X_OPT) \
+    X(init) X(shutdown) X(device_count) X(device_at) X(mem_info) \
+    X_OPT(device_integrated) \
+    X(stats) X(group_stats) X(group_stats_device) \
+    X(expert_mlp) X(expert_group) X(expert_group_issue) X(expert_group_take) \
+    X(attention_absorb) X(tensor_upload) X(tensor_upload_g) \
+    X_OPT(e8_set_grid) X_OPT(fp8_set_lut) \
+    X(matmul) X(tensor_free) X(tensor_bytes) X(tensor_device) \
+    X(attention_absorb_batch) X(attention_absorb_batch_dev) \
+    X(attention_absorb_kvdev) X(attention_project_batch) \
+    X(attention_project_ragged) X(attention_project_batch_dev) \
+    X(attention_project_batch_dev_out) \
+    X(pipe_add) X(pipe_alloc) X(pipe_copy2d) X(pipe_download) X(pipe_free) \
+    X(pipe_gemm) X(pipe_peer_copy) X(pipe_rmsnorm) X(pipe_rmsnorm_s) \
+    X(expert_group_resident_issue) X(expert_group_resident_take) \
+    X(pipe_router) X(pipe_rope) X(pipe_rope_base) X(pipe_rows_add) \
+    X(pipe_scratch) X(pipe_silu_mul) X(pipe_sync) X(pipe_upload) \
+    X(shared_mlp_w4a16) X(tensor_update) \
+    X_OPT(abi_version)
+
+/* The DLL's ABI stamp (see COLI_CUDA_ABI_VERSION above). Optional in the
+ * list so a pre-existing DLL still loads -- with a loader warning that the
+ * drift check is unavailable until it is rebuilt. */
+COLI_CUDA_DLLEXPORT int coli_cuda_abi_version(void);
+
 #ifdef __cplusplus
 }
 #endif
