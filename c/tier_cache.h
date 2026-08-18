@@ -152,4 +152,74 @@ static int pilot_pick_slot(TierCache *tc,int layer,int eid,ESlot *Sl,int nn,int 
     return slot;
 }
 
+/* ---- il protocollo di prenotazione, come operazioni (#10, slice 2) ----
+ * Tutte le operazioni assumono il lock del chiamante (g_pilot_mx nei
+ * percorsi pilota). Sequenza e sentinelle sono ESATTAMENTE quelle storiche
+ * dei due rami pilota; i rami differiscono solo per used_sentinel:
+ *
+ *   - ramo pread (pilot_realload): il loader pubblica l'eid FUORI da questo
+ *     lock, quindi la prenotazione marca anche used=-1 ("in carica") --
+ *     chiude la finestra eid-reale/used-vecchio in cui uno snapshot di
+ *     eclock preso prima del pread si farebbe superare da altri load;
+ *   - ramo URING (pilot_uring_batch): eid e used si pubblicano nello stesso
+ *     lock hold, la finestra non esiste, nessuna sentinella. */
+
+#define TIER_RESERVED   0   /* *out prenotato: eid=-(eid+2) [, used=-1] */
+#define TIER_RESIDENT   1   /* gia' pinnato/residente/prenotato: niente da fare */
+#define TIER_NO_SLOT   -1   /* tutti in volo, o vittima protetta dal guard */
+
+static int tier_reserve(TierCache *tc,int layer,int eid,int evict_guard,
+                        int used_sentinel,ESlot **out){
+    if(expert_resident_or_reserved(tc,layer,eid)) return TIER_RESIDENT;
+    ESlot *Sl=tc->ecache[layer]; int nn=__atomic_load_n(&tc->ecn[layer],__ATOMIC_RELAXED);
+    int slot;
+    if(nn<tc->ecap){ slot=nn; __atomic_store_n(&tc->ecn[layer],nn+1,__ATOMIC_RELAXED); } /* cresci: pubblica subito lo slot (prenotato qui sotto) */
+    else {
+        slot=pilot_pick_slot(tc,layer,eid,Sl,nn,evict_guard);
+        if(slot<0) return TIER_NO_SLOT;
+    }
+    ESlot *dst=&Sl[slot];
+    sl_eid_set(dst,-(eid+2));      /* prenotazione VISIBILE: dedup + scan-vittima degli altri worker la vedono */
+    if(used_sentinel) sl_used_set(dst,(uint64_t)-1);   /* mai vittima LRU finche' il loader non pubblica */
+    *out=dst;
+    return TIER_RESERVED;
+}
+
+/* Pubblica un load riuscito: eid>=0 lo scrive (ramo URING); eid<0 = l'eid
+ * e' gia' stato scritto dal loader (ramo pread). In entrambi i casi timbra
+ * used con un tick fresco di eclock. */
+static void tier_publish(TierCache *tc,ESlot *dst,int eid){
+    if(eid>=0) sl_eid_set(dst,eid);
+    sl_used_set(dst,(uint64_t)__atomic_add_fetch(&tc->eclock,1,__ATOMIC_RELAXED));
+}
+
+/* Load fallito: libera la prenotazione. reset_used=1 (ramo pread) riporta
+ * anche used a 0: la sentinella -1 renderebbe lo slot ULTIMO in ogni scan
+ * LRU -- mai evictable -- e ogni speculazione fallita (disco lento, errore
+ * I/O transitorio) sottrarrebbe ~19MB di cache in modo permanente e
+ * silenzioso; used=0 e' la convenzione "slot vergine" del RAM-guard, la
+ * PRIMA vittima. Il ramo URING non ha messo la sentinella e non la tocca. */
+static void tier_fail(TierCache *tc,ESlot *dst,int reset_used){
+    (void)tc;
+    sl_eid_set(dst,-1);
+    if(reset_used) sl_used_set(dst,0);
+}
+
+/* Vittima di emergenza per il RAM-guard: lo slot LRU PUBBLICATO e con slab
+ * (mai prenotazioni, mai slot in volo su una GPU). -1 se nessuno. Il
+ * teardown dello slab resta al chiamante -- QT e gli slab sono suoi -- e
+ * DEVE avvenire sotto lo stesso lock hold della scelta+occultamento: uno
+ * slot visibile come {eid=-1, slab valido} verrebbe riusato dal pilota
+ * mentre il chiamante lo libera (use-after-free). */
+static int tier_evict_pick(TierCache *tc,int layer){
+    ESlot *Sl=tc->ecache[layer];
+    int nn=__atomic_load_n(&tc->ecn[layer],__ATOMIC_RELAXED), lru=-1;
+    for(int z=0;z<nn;z++){
+        ESlot *cand=&Sl[z];
+        if(sl_eid(cand)<0 || !cand->slab || eslot_busy(cand)) continue;
+        if(lru<0 || sl_used(cand)<sl_used(&Sl[lru])) lru=z;
+    }
+    return lru;
+}
+
 #endif /* TIER_CACHE_H */
