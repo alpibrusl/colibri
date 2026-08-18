@@ -568,7 +568,7 @@ static void qt_vk_reset(QT *t){
 static int vk_matmul_qt(QT *t, float *y, const float *x, int S){
     if(!g_vk_dense || !VK_FMT_OK(t)) return 0;
     const void *w = t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
-    return g_gops->matmul((void**)&t->vk, y, x, w, t->s, t->fmt, S, t->I, t->O, t->gs);
+    return g_gops->matmul((void**)&t->vk, y, x, w, t->s, t->fmt, S, t->I, t->O, t->gs, 0);
 }
 /* Two same-input resident matmuls in one submit (q_a + kv_a read the same x). */
 static int vk_matmul_pair_qt(QT *a, float *ya, QT *b, float *yb, const float *x, int S){

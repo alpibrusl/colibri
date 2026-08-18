@@ -57,10 +57,13 @@ typedef struct ColiGpuOps {
     int    (*tensor_dev)(const void *t);  /* which device owns this handle */
 
     /* ---- dense matmul on a resident tensor ----
-     * y[S,O] = x[S,I] @ dequant(W)^T; uploads on first call via *t. */
+     * y[S,O] = x[S,I] @ dequant(W)^T; uploads on first call via *t. `dev`
+     * was missing from slice 1's signature (Vulkan's single dense device
+     * hid the gap) -- added in slice 5 once CUDA's per-tensor cuda_device
+     * showed every OTHER family already carries it. Vulkan ignores it. */
     int (*matmul)(void **t, float *y, const float *x,
                   const void *weights, const float *scales,
-                  int fmt, int S, int I, int O, int gs);
+                  int fmt, int S, int I, int O, int gs, int dev);
 
     /* ---- batched expert MLP (the moe() hot path) ----
      * For each expert c of n: y_c = down_c(silu(gate_c(x_c)) * up_c(x_c)),
@@ -130,7 +133,8 @@ static size_t vkops_tensor_bytes(const void *t){ return coli_vk_tensor_bytes((co
 static int    vkops_tensor_dev  (const void *t){ return coli_vk_tensor_dev((const ColiVkTensor*)t); }
 static int vkops_matmul(void **t, float *y, const float *x,
                         const void *w, const float *s,
-                        int fmt, int S, int I, int O, int gs){
+                        int fmt, int S, int I, int O, int gs, int dev){
+    (void)dev;   /* one dense device (G); dev2 is expert-tier only */
     return coli_vk_matmul((ColiVkTensor**)t,y,x,w,s,fmt,S,I,O,gs);
 }
 static int vkops_expert_group(void *const *g, void *const *u, void *const *d,
@@ -207,5 +211,100 @@ static const ColiGpuOps coli_vk_gpu_ops = {
 };
 
 #endif /* COLI_VULKAN */
+
+/* ======================= CUDA adapter (#11, slice 5) ======================= */
+/* Fills the families whose shape genuinely matches CUDA's own API one-to-one:
+ * lifecycle, resident tensor, dense matmul. `dev` throughout this adapter is
+ * a CUDA ORDINAL (backend_cuda.h: "Devices are CUDA ordinals, not positions
+ * in the input list") -- unlike Vulkan's dev in {0,1}, this is the same
+ * ordinal callers already pass to qt_cuda_upload/coli_cuda_matmul via
+ * QT.cuda_device, so no translation happens at this boundary.
+ *
+ * Deliberately UNFILLED here, and why (leaving these NULL is the honest
+ * choice, not a placeholder to paper over later):
+ *
+ *   - expert_group / expert_group_issue / matmul_pair: CUDA's own multi-
+ *     device group dispatch (colibri.c's dev_nc[]/dev_off[]/dev_total[]
+ *     arrays in moe()) already fans a SINGLE routed batch out across up to
+ *     COLI_CUDA_MAX_DEVICES devices with its own packing/sync -- that shape
+ *     has no single-call equivalent in this vtable (built for Vulkan's
+ *     one-or-two-device model) without reintroducing per-device loops
+ *     *inside* the adapter, which would just relocate colibri.c's own
+ *     dispatch logic rather than collapse it.
+ *   - expert_group_take: a harder mismatch than "just wire it" -- Vulkan's
+ *     take(y,dev) memcpy's into a caller buffer; coli_cuda_expert_group_take
+ *     RETURNS a pointer to pinned device-visible memory (zero-copy, valid
+ *     until the next issue on that device) with no byte count the adapter
+ *     could safely memcpy without also being told rows*D. Bridging that
+ *     needs a signature change (e.g. a length parameter) accepted
+ *     deliberately, not smuggled into this slice.
+ *   - kv_ensure/kv_row/kv_reset, attn_absorb(_project), attn_qprep: no CUDA
+ *     equivalent shape exists AT ALL. CUDA's decode attention is a
+ *     device-pointer, device-resident pipeline (coli_cuda_attention_absorb_*
+ *     variants operating on m->kv_dev_R/latent/rope device buffers PIPE
+ *     already manages) -- architecturally distinct from Vulkan's persistent
+ *     per-layer mirror-and-fuse design, not a narrower version of it.
+ *
+ * NOT WIRED into colibri.c in this slice, on purpose: `g_gops` is one
+ * global, bound to whichever backend's init() ran (today: Vulkan only, at
+ * coli_vk_init success). CUDA and Vulkan are independently
+ * #ifdef/runtime-flag gated throughout colibri.c and CAN be compiled and
+ * initialized together -- binding CUDA to the same g_gops would let
+ * whichever backend initializes LAST silently override the pointer table
+ * the OTHER backend's already-gated call sites still call through (e.g. a
+ * VULKAN-gated attn_qprep call left holding CUDA's NULL attn_qprep after
+ * CUDA initializes second). Wiring CUDA needs a real answer to "which
+ * global(s)" first -- a second g_gops_cuda, a per-tensor backend tag, or
+ * something else -- which is a deliberate design decision for the next
+ * slice, not a default to fall into here. */
+#ifdef COLI_CUDA
+
+static int cuops_dev_available(int dev){
+    int n = coli_cuda_device_count();
+    for(int i=0;i<n;i++) if(coli_cuda_device_at(i)==dev) return 1;
+    return 0;
+}
+static int cuops_mem_budget(int dev, double *used_gb, double *budget_gb){
+    size_t free_b=0, total_b=0;
+    if(!coli_cuda_mem_info(dev,&free_b,&total_b) || !total_b) return 0;
+    if(used_gb) *used_gb = (double)(total_b-free_b)/1e9;
+    if(budget_gb) *budget_gb = (double)total_b/1e9;
+    return 1;
+}
+/* Mirrors qt_cuda_upload's own dispatch exactly (colibri.c:583): fmt==4 needs
+ * the grouped-scale upload or its [O,ceil(I/gs)] scales get truncated to O
+ * floats and the group kernels read garbage; every other format uses the
+ * plain upload. Idempotent on repeat calls, like Vulkan's tensor_ensure (the
+ * CUDA backend's own *tensor slot is the cache; a non-NULL *t is reused). */
+static int cuops_tensor_ensure(void **t, const void *w, const float *s,
+                               int fmt, int I, int O, int gs, int dev){
+    ColiCudaTensor **ct = (ColiCudaTensor**)t;
+    if(fmt==4) return coli_cuda_tensor_upload_g(ct,w,s,fmt,I,O,dev,gs);
+    return coli_cuda_tensor_upload(ct,w,s,fmt,I,O,dev);
+}
+static void   cuops_tensor_free (void *t){ coli_cuda_tensor_free((ColiCudaTensor*)t); }
+static size_t cuops_tensor_bytes(const void *t){ return coli_cuda_tensor_bytes((const ColiCudaTensor*)t); }
+static int    cuops_tensor_dev  (const void *t){ return coli_cuda_tensor_device((const ColiCudaTensor*)t); }
+static int cuops_matmul(void **t, float *y, const float *x,
+                        const void *w, const float *s,
+                        int fmt, int S, int I, int O, int gs, int dev){
+    return coli_cuda_matmul((ColiCudaTensor**)t,y,x,w,s,fmt,S,I,O,dev,gs);
+}
+
+static const ColiGpuOps coli_cuda_gpu_ops = {
+    .name               = "cuda",
+    .dev_available      = cuops_dev_available,
+    .mem_budget         = cuops_mem_budget,
+    .tensor_ensure      = cuops_tensor_ensure,
+    .tensor_free        = cuops_tensor_free,
+    .tensor_bytes       = cuops_tensor_bytes,
+    .tensor_dev         = cuops_tensor_dev,
+    .matmul             = cuops_matmul,
+    /* expert_group*, matmul_pair, kv_*, attn_* -- see the comment above:
+     * left NULL deliberately, not resolved by a stub that would silently
+     * segfault the first time colibri.c called through it. */
+};
+
+#endif /* COLI_CUDA */
 
 #endif /* COLI_GPU_OPS_H */
