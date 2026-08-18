@@ -32,13 +32,30 @@ transitions. The gap between `conditional` (or `identity`) and `heat` is the
 achievable prefetch-hit improvement a temporal predictor could buy; if the
 gap is ~0 on real traces, #32 item 1 dies here, cheaply.
 
+The verdict is also written as a ledger-shaped JSON report with `--out`, so
+a measurement that costs a real checkpoint and a real trace corpus survives
+the terminal it ran in (tools/ledger.py explains the integer convention and
+what a ledger can and cannot check about it).
+
 Usage:
   python3 tools/route_temporal.py trace1.txt [trace2.txt ...]
+  python3 tools/route_temporal.py --out=report.json trace1.txt [...]
   python3 tools/route_temporal.py --selftest
 """
+import json
+import os
 import sys
 import random
 from collections import defaultdict
+
+try:                          # imported as tools.route_temporal
+    from . import ledger
+except ImportError:           # run as a script, or loaded by file path
+    # Both are real: the documented invocation is `python3 tools/<tool>.py`,
+    # and tests/test_research_tools.py loads these modules by path, where
+    # neither the package nor the tools directory is importable on its own.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import ledger
 
 
 def parse_traces(paths):
@@ -169,13 +186,51 @@ def selftest():
     return 0 if ok else 1
 
 
+# The decision rule this tool exists to settle, in one place so the printed
+# verdict and the recorded claim can never drift apart (#32).
+GAIN_THRESHOLD = 0.05
+
+
+def report_of(paths, sequences, recalls, total, budget_mult):
+    """The measurement as ledger claims: integers, flat, and comparable.
+
+    Recalls are rates in [0,1] and travel as millionths; the verdict travels
+    as the 0/1 bit it actually is, so "worth an engine slice" is a value
+    someone can query rather than a sentence someone has to re-read.
+    """
+    gap = max(recalls["identity"], recalls["conditional"]) - recalls["heat"]
+    claims = {
+        "sequences": len(sequences),
+        "scores": total,
+        "budget_mult": budget_mult,
+        "temporal_gain_micro": ledger.micro(gap),
+        "worth_engine_slice": ledger.bit(gap > GAIN_THRESHOLD),
+    }
+    for name in ("heat", "identity", "conditional"):
+        claims[f"recall.{name}_micro"] = ledger.micro(recalls[name])
+    verdict = ("worth an engine slice" if gap > GAIN_THRESHOLD
+               else "no temporal signal worth chasing")
+    return ledger.claims_report(
+        "route_temporal.py", paths, verdict,
+        {"recalls": recalls, "gain": gap, "threshold": GAIN_THRESHOLD},
+        claims)
+
+
 def main():
     args = sys.argv[1:]
     if args and args[0] == "--selftest":
         raise SystemExit(selftest())
     budget_mult = 1
-    if args and args[0].startswith("--budget-mult="):
-        budget_mult = int(args.pop(0).split("=")[1])
+    out = None
+    rest = []
+    for a in args:
+        if a.startswith("--budget-mult="):
+            budget_mult = int(a.split("=")[1])
+        elif a.startswith("--out="):
+            out = a.split("=")[1]
+        else:
+            rest.append(a)
+    args = rest
     if not args:
         raise SystemExit(__doc__)
     sequences = parse_traces(args)
@@ -186,7 +241,14 @@ def main():
         print(f"  recall@K {name:12s} {recalls[name]:.4f}")
     gap = max(recalls["identity"], recalls["conditional"]) - recalls["heat"]
     print(f"  temporal gain over marginal: {gap:+.4f}"
-          f"  ({'worth an engine slice' if gap > 0.05 else 'no temporal signal worth chasing'})")
+          f"  ({'worth an engine slice' if gap > GAIN_THRESHOLD else 'no temporal signal worth chasing'})")
+    if out:
+        with open(out, "w") as f:
+            json.dump(report_of(args, sequences, recalls, total, budget_mult),
+                      f, indent=1)
+        print(f"  report -> {out}  "
+              f"(record it: python3 tools/ledger.py --report={out} "
+              f"--series=route-temporal --attempt=1 --out=entry.json)")
 
 
 if __name__ == "__main__":
