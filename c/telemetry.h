@@ -175,7 +175,7 @@ static void tiers_emit(Model *m){
     for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
     int total=(nsp+(m->has_mtp?1:0))*c->n_experts;
     int pinned=0,lru=0;
-    for(int i=0;i<=c->n_layers;i++){ pinned+=m->npin?m->npin[i]:0; lru+=m->ecn?m->ecn[i]:0; }
+    for(int i=0;i<=c->n_layers;i++){ pinned+=m->tc.npin?m->tc.npin[i]:0; lru+=m->tc.ecn?m->tc.ecn[i]:0; }
     int vram=0; double vram_gb=0;
 #ifdef COLI_CUDA
     vram=m->gpu_expert_count; vram_gb=m->gpu_expert_bytes/1e9;
@@ -189,7 +189,7 @@ static void tiers_emit(Model *m){
     double ram_b=0;
     for(int i=0;i<=c->n_layers;i++){
         int64_t w=expert_bytes_row(m,i,m->ebits);
-        ram_b += (double)((m->npin?m->npin[i]:0)+(m->ecn?m->ecn[i]:0))*(double)w;
+        ram_b += (double)((m->tc.npin?m->tc.npin[i]:0)+(m->tc.ecn?m->tc.ecn[i]:0))*(double)w;
     }
     if(vram>0){                       /* the VRAM tier's host copies are not RAM-tier bytes */
         double avg = ram+vram>0 ? ram_b/(double)(ram+vram) : 0.0;
@@ -203,7 +203,7 @@ static void emap_emit(Model *m){
     Cfg *c=&m->c;
     int rows=0;
     for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) rows++;
-    int has_mtp = m->has_mtp && m->eusage[c->n_layers];
+    int has_mtp = m->has_mtp && m->tc.eusage[c->n_layers];
     if(has_mtp) rows++;
     int cols=c->n_experts;
     char *hex=malloc((size_t)rows*cols*2+1); int w=0;
@@ -212,17 +212,17 @@ static void emap_emit(Model *m){
         if(!is_row) continue;
         for(int e=0;e<cols;e++){
             int tier=0;
-            ESlot *P=m->pin[i];
-            for(int z=0;z<m->npin[i];z++) if(P[z].eid==e){
+            ESlot *P=m->tc.pin[i];
+            for(int z=0;z<m->tc.npin[i];z++) if(P[z].eid==e){
 #ifdef COLI_CUDA
                 tier = P[z].g.cuda?2:1;
 #else
                 tier = 1;
 #endif
                 break; }
-            if(!tier && m->ecache && m->ecache[i])
-                for(int z=0;z<m->ecn[i];z++) if(m->ecache[i][z].eid==e){ tier=1; break; }
-            uint32_t u = m->eusage[i]?m->eusage[i][e]:0;
+            if(!tier && m->tc.ecache && m->tc.ecache[i])
+                for(int z=0;z<m->tc.ecn[i];z++) if(m->tc.ecache[i][z].eid==e){ tier=1; break; }
+            uint32_t u = m->tc.eusage[i]?m->tc.eusage[i][e]:0;
             int heat=0; while(u){ heat++; u>>=1; } if(heat>63) heat=63;
             int b=(tier<<6)|heat;
             hex[w++]="0123456789abcdef"[b>>4]; hex[w++]="0123456789abcdef"[b&15];
@@ -236,7 +236,7 @@ static void hits_emit(Model *m){
     Cfg *c=&m->c; if(!g_ehit) return;
     int rows=0;
     for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) rows++;
-    int has_mtp = m->has_mtp && m->eusage[c->n_layers];
+    int has_mtp = m->has_mtp && m->tc.eusage[c->n_layers];
     if(has_mtp) rows++;
     int cols=c->n_experts, nb=(rows*cols+7)/8;
     uint8_t *bm=calloc(nb,1); int bit=0;
