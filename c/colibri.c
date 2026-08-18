@@ -355,51 +355,9 @@ typedef struct {
     QT sh_gate, sh_up, sh_down;                  /* shared expert */
 } Layer;
 
-/* slot di un expert: pesi quantizzati + scale. Nel container pre-quantizzato g/u/d sono
- * VISTE dentro `slab` (una sola pread coalescente); nel fallback hanno buffer propri.
- * slab_cap/fslab_cap: capienza allocata — gli slot ws[] sono riusati TRA layer e gli
- * expert non hanno tutti la stessa taglia (layer MTP int8 = 2x i layer int4). */
-typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
-                 int64_t slab_cap, fslab_cap; uint64_t used;
-                 unsigned in_flight; /* async GPU readers borrowing this slot */
-                 /* pin-arena backing (#419): when set, slab/fslab are interior
-                  * slices of a per-layer arena and must never be free()d —
-                  * expert_host_release detaches them, expert_host_ensure
-                  * re-attaches. NULL for every individually-allocated slot. */
-                 uint8_t *aslab; float *afslab; } ESlot;
-
-static void eslot_acquire(ESlot *s){ __atomic_add_fetch(&s->in_flight,1,__ATOMIC_ACQ_REL); }
-static void eslot_release(ESlot *s){
-    unsigned old=__atomic_fetch_sub(&s->in_flight,1,__ATOMIC_ACQ_REL);
-    if(!old){ fprintf(stderr,"[CUDA] ESlot reference underflow\n"); abort(); }
-}
-static int eslot_busy(const ESlot *s){ return __atomic_load_n(&s->in_flight,__ATOMIC_ACQUIRE)!=0; }
-static void eslots_acquire(ESlot **slots,int n){ for(int i=0;i<n;i++) eslot_acquire(slots[i]); }
-
-/* Disciplina dei campi cross-thread (#9). I pilot worker toccano gli slot del
- * layer L+1 sotto g_pilot_mx mentre moe() percorre quelli del layer L senza
- * lock -- layer disgiunti per l'invariante g_cur_moe_layer, ma la macchina
- * astratta C non lo sa: una load semplice che il compilatore puo' spezzare o
- * rileggere e' formalmente in gara con la store dell'altro lato non appena una
- * finestra (rss_guard, repin fra i turni) si sovrappone. Ogni accesso
- * cross-thread a eid/used/ecn e ai contatori heat/recency passa da questi
- * accessor RELAXED (disciplina READ_ONCE/WRITE_ONCE, la stessa dei cursori
- * del pool PIPE); l'ORDINAMENTO fra campi resta garantito da g_pilot_mx e dal
- * protocollo di prenotazione pubblicato, non da qui. I campi toccati solo dal
- * thread proprietario (gli slot ws[] di staging prima della pubblicazione)
- * restano accessi semplici. */
-static inline int      sl_eid(const ESlot *s){ return __atomic_load_n(&s->eid,__ATOMIC_RELAXED); }
-static inline void     sl_eid_set(ESlot *s,int v){ __atomic_store_n(&s->eid,v,__ATOMIC_RELAXED); }
-static inline uint64_t sl_used(const ESlot *s){ return __atomic_load_n(&s->used,__ATOMIC_RELAXED); }
-static inline void     sl_used_set(ESlot *s,uint64_t v){ __atomic_store_n(&s->used,v,__ATOMIC_RELAXED); }
-static inline uint32_t u32_ld(const uint32_t *p){ return __atomic_load_n(p,__ATOMIC_RELAXED); }
-static inline void     u32_st(uint32_t *p,uint32_t v){ __atomic_store_n(p,v,__ATOMIC_RELAXED); }
-static void eslots_release(ESlot **slots,int n){ for(int i=0;i<n;i++) eslot_release(slots[i]); }
-static int eslot_lru_victim(ESlot *slots,int n){
-    int lru=-1;
-    for(int i=0;i<n;i++) if(!eslot_busy(&slots[i])&&(lru<0||sl_used(&slots[i])<sl_used(&slots[lru]))) lru=i;
-    return lru;
-}
+/* ESlot + stato di placement + accessor cross-thread: estratti in
+ * tier_cache.h (#10). Va incluso qui, DOPO quant.h (QT) e tier.h. */
+#include "tier_cache.h"
 
 typedef struct {
     float **Lc, **Rc, **Ic;
@@ -427,39 +385,14 @@ typedef struct {
     float **Lc, **Rc; int max_t;                 /* alias della KVState attiva */
     int *kv_start;                               /* prima pos valida nella KV del layer (MTP: parziale) */
     KVState *kv;
-    ESlot **ecache; int *ecn; int ecap;          /* LRU expert per-layer */
+    TierCache tc;                                /* stato di placement condiviso main/pilot (#10):
+                                                  * LRU ecache, hot-store pin, heat/recency, eclock */
     float **kv_dev_L, **kv_dev_R; int *kv_dev_valid; /* ombra KV su device (decode) */
     float **ln_dev;                              /* in_ln/post_ln cached on device: [layer*2+{0,1}] (Inc.4) */
 #ifdef COLI_VULKAN
     int *vk_kv_valid;                            /* righe [0,v) specchiate nella cache KV Vulkan */
 #endif
     ESlot ws[64];                                /* working set del layer corrente (load paralleli) */
-    ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
-    uint32_t **eusage;                           /* contatori persistenti (per STATS/PIN) */
-    uint32_t **eheat;                            /* calore recente per promotion/demotion live */
-    uint32_t **elast, eaccess_clock;              /* recency per LFRU session-local */
-    /* DISK-CLASS: PRIVATE recency state, read only by expert_classify(). Private --
-     * not the real elast/eaccess_clock -- kept fully separate so DISK-CLASS's bookkeeping
-     * can never read from or write into stock eviction state: every DISK-CLASS write lives
-     * inside its own need_classify/dc_on gate, so "byte-identical with PROF=0" is provable
-     * by construction instead of by argument. (Historical note: when this was first written,
-     * the Metal pre-routed FASE A path (g_pre_idx) never bumped the real elast/eaccess_clock
-     * -- on Metal decode the real clock froze at end of prefill, so REPIN's LRU tie-breaker
-     * ran on stale recency for the rest of the run. That was an upstream defect; it has since
-     * been reported and fixed (#417, cfcc742) -- FASE A now bumps the real clock too. The
-     * private clock is retained anyway: separation from stock state is the stronger property,
-     * independent of whether the real clock is correct.) elast_dc/eaccess_clock_dc tick in
-     * BOTH FASE A paths, under the same need_classify gate, at the same rate the real clock
-     * ticks on the CPU path (one per selected (position,expert)) -- so the
-     * COLI_DISKCLASS_WINDOW window keeps its meaning in every mode. elast_pre snapshots
-     * elast_dc just BEFORE this call's own bump (see the touched[] guard in FASE A) --
-     * classifying against the live array would read the bump routing just made a few lines
-     * above the load that needed it, so a giant cold prefill burst would score every expert
-     * "just accessed" and get called warm. Recency alone (not eheat's access COUNT): a count
-     * never decays, so an expert hot early in a long session would keep reading "warm" long
-     * after it dropped out of the working set. Same shape/allocation as elast; NULL for dense
-     * layers. */
-    uint32_t **elast_dc, **elast_pre, eaccess_clock_dc;
     /* DSA lightning indexer (attivo solo se i pesi out-idx-* sono presenti) */
     int has_dsa;
     QT *ix_wq, *ix_wk, *ix_wp;                   /* per layer FULL: wq_b, wk, weights_proj */
@@ -472,7 +405,7 @@ typedef struct {
     float *hlast, *h_all;                        /* hidden pre-norm: ultima pos / tutte le pos batch */
     uint64_t mtp_prop, mtp_acc;                  /* statistica acceptance */
     int **eroute; int *enr;                      /* metodo C: routing dell'ULTIMO token per layer */
-    uint64_t eclock, hits, miss, ereq;
+    uint64_t hits, miss, ereq;
     uint64_t hit_pin, hit_ecache;                /* split di hits per tier (#336): pin vs LRU ecache */
     uint64_t hit_vk;                             /* VK VRAM tier hits (registry-served, no RAM load) */
     uint64_t gpu_expert_calls; int gpu_expert_count; int64_t gpu_expert_bytes;
@@ -758,7 +691,7 @@ static double edisk_s(void){ return atomic_load_explicit(&g_edisk_ns,memory_orde
  * recency state. Instrumentation only -- it never changes which fd serves a read (see
  * expert_classify() and its call site in expert_load_impl; the fd choice expression is
  * untouched by this feature). COLI_DISKCLASS_WINDOW is the recency window in ticks of the
- * PRIVATE clock (m->eaccess_clock_dc -- NOT the real eaccess_clock; see elast_dc in Model
+ * PRIVATE clock (m->tc.eaccess_clock_dc -- NOT the real eaccess_clock; see elast_dc in Model
  * for why DISK-CLASS keeps its own clock instead of reading the real one): one tick per
  * selected (position,expert) in FASE A while classification is active, the same per-token
  * rate the real clock has on the CPU path, so the window's meaning is unchanged. At or
@@ -1869,19 +1802,22 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->final_norm = ld(m,"model.norm.weight");
     m->L=calloc(c->n_layers,sizeof(Layer));
     int NR=c->n_layers+1;                        /* +1: riga del layer MTP */
-    m->ecap=cap; m->ecache=calloc(NR,sizeof(ESlot*)); m->ecn=calloc(NR,sizeof(int));
+    m->tc.ecap=cap; m->tc.ecache=calloc(NR,sizeof(ESlot*)); m->tc.ecn=calloc(NR,sizeof(int));
+#ifdef COLI_VULKAN
+    m->tc.ext_served=vk_reg_served;              /* sonda del tier VRAM per lo scan di residenza */
+#endif
     m->kv_dev_L=calloc(NR,sizeof(float*)); m->kv_dev_R=calloc(NR,sizeof(float*));
     m->kv_dev_valid=calloc(NR,sizeof(int));
 #ifdef COLI_VULKAN
     m->vk_kv_valid=calloc(NR,sizeof(int));
 #endif
     m->eroute=calloc(NR,sizeof(int*)); m->enr=calloc(NR,sizeof(int));
-    m->pin=calloc(NR,sizeof(ESlot*)); m->npin=calloc(NR,sizeof(int));
+    m->tc.pin=calloc(NR,sizeof(ESlot*)); m->tc.npin=calloc(NR,sizeof(int));
     rt_init("glm_moe_dsa",c->n_layers,c->n_experts);   /* owns the counters + the format */
-    m->eusage=rt_counts_all();                         /* alias: bump sites unchanged */
-    m->eheat=calloc(NR,sizeof(uint32_t*));
-    m->elast=calloc(NR,sizeof(uint32_t*));
-    m->elast_dc=calloc(NR,sizeof(uint32_t*)); m->elast_pre=calloc(NR,sizeof(uint32_t*));
+    m->tc.eusage=rt_counts_all();                         /* alias: bump sites unchanged */
+    m->tc.eheat=calloc(NR,sizeof(uint32_t*));
+    m->tc.elast=calloc(NR,sizeof(uint32_t*));
+    m->tc.elast_dc=calloc(NR,sizeof(uint32_t*)); m->tc.elast_pre=calloc(NR,sizeof(uint32_t*));
     m->kv=calloc(1,sizeof(KVState));
     m->kv_start=m->kv->kv_start=calloc(NR,sizeof(int));
     for(int i=0;i<c->n_layers;i++){
@@ -1921,12 +1857,12 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             qt_cuda_colocate(&l->sh_up,&l->sh_gate);
             qt_cuda_colocate(&l->sh_down,&l->sh_gate);
 #endif
-            m->ecache[i]=calloc(cap,sizeof(ESlot));
+            m->tc.ecache[i]=calloc(cap,sizeof(ESlot));
             m->eroute[i]=calloc(c->topk,sizeof(int));      /* metodo C: ultimo routing del layer */
-            m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
-            m->elast[i]=calloc(c->n_experts,sizeof(uint32_t));
-            m->elast_dc[i]=calloc(c->n_experts,sizeof(uint32_t));
-            m->elast_pre[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->tc.eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->tc.elast[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->tc.elast_dc[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->tc.elast_pre[i]=calloc(c->n_experts,sizeof(uint32_t));
         }
         #undef P
     }
@@ -1974,12 +1910,12 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             m->eh_proj = qt_load(m,PM("eh_proj.weight"), D, 2*D, dbits);
             m->enorm=ld(m,PM("enorm.weight")); m->hnorm=ld(m,PM("hnorm.weight"));
             m->mtp_norm=ld(m,PM("shared_head.norm.weight"));
-            m->ecache[i]=calloc(cap,sizeof(ESlot));
+            m->tc.ecache[i]=calloc(cap,sizeof(ESlot));
             m->eroute[i]=calloc(c->topk,sizeof(int));
-            m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
-            m->elast[i]=calloc(c->n_experts,sizeof(uint32_t));
-            m->elast_dc[i]=calloc(c->n_experts,sizeof(uint32_t));
-            m->elast_pre[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->tc.eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->tc.elast[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->tc.elast_dc[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->tc.elast_pre[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->kv_start[i]=-1;                    /* KV MTP: parte dalla prima posizione di decode */
             #undef PM
         }
@@ -2263,10 +2199,10 @@ static int dc_needed(void){ return g_prof; }
  * defensive only, elast_pre is allocated everywhere elast is); a demonstrable first-ever
  * access (last_pre==0) is not a judgment call, it stays cold regardless of that bias. */
 static int expert_classify(Model *m, int layer, int eid){
-    if(!m->elast_pre || !m->elast_pre[layer]) return DC_WARM;  /* no snapshot: label as the safe class */
-    uint32_t last_pre=m->elast_pre[layer][eid];
+    if(!m->tc.elast_pre || !m->tc.elast_pre[layer]) return DC_WARM;  /* no snapshot: label as the safe class */
+    uint32_t last_pre=m->tc.elast_pre[layer][eid];
     if(last_pre==0) return DC_COLD;                             /* never touched before this call: certain cold */
-    uint32_t age=m->eaccess_clock_dc-last_pre;                  /* ticks since last access, PRE this call's bump */
+    uint32_t age=m->tc.eaccess_clock_dc-last_pre;                  /* ticks since last access, PRE this call's bump */
     return age>g_direct_heat_ticks ? DC_COLD : DC_WARM;         /* '>' not '>=': ties lean warm */
 }
 static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, int demand){
@@ -3878,10 +3814,10 @@ static void *vk2_issue_worker(void *p){
 
 /* pin ∪ LRU residency probe (used by CACHE_ROUTE max-rank fill). */
 static int expert_is_resident(Model *m, int layer, int eid){
-    ESlot *P=m->pin[layer];
-    for(int z=0;z<m->npin[layer];z++) if(sl_eid(&P[z])==eid) return 1;
-    ESlot *Sl=m->ecache[layer];
-    for(int z=0;z<m->ecn[layer];z++) if(Sl[z].eid==eid) return 1;
+    ESlot *P=m->tc.pin[layer];
+    for(int z=0;z<m->tc.npin[layer];z++) if(sl_eid(&P[z])==eid) return 1;
+    ESlot *Sl=m->tc.ecache[layer];
+    for(int z=0;z<m->tc.ecn[layer];z++) if(Sl[z].eid==eid) return 1;
     return 0;
 }
 
@@ -3991,7 +3927,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         for(int s=0;s<S;s++){
             m->ereq+=keff[s];
             for(int kk=0;kk<keff[s];kk++){
-                m->eusage[layer][idxs[(int64_t)s*K+kk]]++;
+                m->tc.eusage[layer][idxs[(int64_t)s*K+kk]]++;
                 ehit_mark(m,layer,idxs[(int64_t)s*K+kk]);
                 if(need_classify){                /* DISK-CLASS private recency -- snapshot BEFORE this call's own bump,
                                                    * then tick. This path also bumps the REAL elast/eaccess_clock a few
@@ -3999,15 +3935,15 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                                                    * decode) -- DISK-CLASS's own clock stays independent regardless of
                                                    * that fix, see elast_dc in Model. */
                     int e=idxs[(int64_t)s*K+kk];
-                    if(!touched[e]){ m->elast_pre[layer][e]=m->elast_dc[layer][e]; touched[e]=1; }
-                    m->elast_dc[layer][e]=++m->eaccess_clock_dc;
+                    if(!touched[e]){ m->tc.elast_pre[layer][e]=m->tc.elast_dc[layer][e]; touched[e]=1; }
+                    m->tc.elast_dc[layer][e]=++m->tc.eaccess_clock_dc;
                 }
-                if(m->eheat[layer][idxs[(int64_t)s*K+kk]]<UINT32_MAX) m->eheat[layer][idxs[(int64_t)s*K+kk]]++;
+                if(m->tc.eheat[layer][idxs[(int64_t)s*K+kk]]<UINT32_MAX) m->tc.eheat[layer][idxs[(int64_t)s*K+kk]]++;
                 /* #417: la scorciatoia GPU-prerouted deve far avanzare l'orologio di recency
                  * come il percorso router completo (riga ~3055), altrimenti elast/eaccess_clock
                  * si congelano a fine prefill e il tie-breaker LFRU di REPIN gira su punteggi
                  * stantii durante il decode su Metal. */
-                m->elast[layer][idxs[(int64_t)s*K+kk]]=++m->eaccess_clock;
+                m->tc.elast[layer][idxs[(int64_t)s*K+kk]]=++m->tc.eaccess_clock;
             }
             for(int d=0;d<D;d++) out[(int64_t)s*D+d]=0;
         }
@@ -4147,18 +4083,18 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         }
         keff[s]=Ke; m->ereq+=Ke;
         for(int kk=0;kk<Ke;kk++){
-            m->eusage[layer][idx[kk]]++;
+            m->tc.eusage[layer][idx[kk]]++;
             ehit_mark(m,layer,idx[kk]);
             if(need_classify){                    /* DISK-CLASS private recency -- snapshot BEFORE this call's own bump,
                                                    * then tick (same rate as the real clock below: one per (s,kk)) */
-                if(!touched[idx[kk]]){ m->elast_pre[layer][idx[kk]]=m->elast_dc[layer][idx[kk]]; touched[idx[kk]]=1; }
-                m->elast_dc[layer][idx[kk]]=++m->eaccess_clock_dc;
+                if(!touched[idx[kk]]){ m->tc.elast_pre[layer][idx[kk]]=m->tc.elast_dc[layer][idx[kk]]; touched[idx[kk]]=1; }
+                m->tc.elast_dc[layer][idx[kk]]=++m->tc.eaccess_clock_dc;
             }
-            { uint32_t h=u32_ld(&m->eheat[layer][idx[kk]]);   /* relaxed: un update perso e'
+            { uint32_t h=u32_ld(&m->tc.eheat[layer][idx[kk]]);   /* relaxed: un update perso e'
                  tollerabile su un contatore euristico; una load/stor spezzata no (#9) */
-              if(h<UINT32_MAX) u32_st(&m->eheat[layer][idx[kk]],h+1); }
-            u32_st(&m->elast[layer][idx[kk]],
-                   __atomic_add_fetch(&m->eaccess_clock,1,__ATOMIC_RELAXED));
+              if(h<UINT32_MAX) u32_st(&m->tc.eheat[layer][idx[kk]],h+1); }
+            u32_st(&m->tc.elast[layer][idx[kk]],
+                   __atomic_add_fetch(&m->tc.eaccess_clock,1,__ATOMIC_RELAXED));
         }
         if(c->norm_topk){ float sm=0; for(int kk=0;kk<Ke;kk++) sm+=w[kk]; sm+=1e-20f; for(int kk=0;kk<Ke;kk++) w[kk]/=sm; }
         for(int kk=0;kk<Ke;kk++) w[kk]*=c->routed_scale;
@@ -4213,9 +4149,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         unsigned char *is_hit=xzalloc((size_t)nu,"moe is_hit"); int nhits=0;
         for(int j=0;j<nu;j++){ int eid=uniq[j];
             int found=0;
-            ESlot *P=m->pin[layer];
-            for(int z=0;z<m->npin[layer];z++) if(sl_eid(&P[z])==eid){ found=1; break; }
-            if(!found){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
+            ESlot *P=m->tc.pin[layer];
+            for(int z=0;z<m->tc.npin[layer];z++) if(sl_eid(&P[z])==eid){ found=1; break; }
+            if(!found){ ESlot *Sl=m->tc.ecache[layer]; int nn=m->tc.ecn[layer];
                 for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ found=1; break; } }
             if(found){ is_hit[j]=1; nhits++; }
         }
@@ -4339,10 +4275,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 if(rg && rg[0]){ vk_hit[j]=1; m->hits++; m->hit_vk++; continue; }
             }
 #endif
-            ESlot *P=m->pin[layer];
-            for(int z=0;z<m->npin[layer];z++) if(sl_eid(&P[z])==eid){ m->hits++; m->hit_pin++; use[j]=&P[z]; break; }
-            if(!use[j]){ ESlot *Sl=m->ecache[layer]; int nn=__atomic_load_n(&m->ecn[layer],__ATOMIC_RELAXED);
-                for(int z=0;z<nn;z++) if(sl_eid(&Sl[z])==eid){ m->hits++; m->hit_ecache++; sl_used_set(&Sl[z],(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED)); use[j]=&Sl[z]; break; } }
+            ESlot *P=m->tc.pin[layer];
+            for(int z=0;z<m->tc.npin[layer];z++) if(sl_eid(&P[z])==eid){ m->hits++; m->hit_pin++; use[j]=&P[z]; break; }
+            if(!use[j]){ ESlot *Sl=m->tc.ecache[layer]; int nn=__atomic_load_n(&m->tc.ecn[layer],__ATOMIC_RELAXED);
+                for(int z=0;z<nn;z++) if(sl_eid(&Sl[z])==eid){ m->hits++; m->hit_ecache++; sl_used_set(&Sl[z],(uint64_t)__atomic_add_fetch(&m->tc.eclock,1,__ATOMIC_RELAXED)); use[j]=&Sl[z]; break; } }
             if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++;
                 if(g_disk_split){ if(m->ld_ctx==1) m->miss_draft++; else if(m->ld_ctx==2) m->miss_absorb++; } }
         }
@@ -4451,13 +4387,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         if(base+64<nu){
             int nb2 = nu-(base+64)<64 ? nu-(base+64) : 64;
             for(int j=0;j<nb2;j++){ int eid=uniq[base+64+j]; int found=0;
-                ESlot *P=m->pin[layer];
+                ESlot *P=m->tc.pin[layer];
 #ifdef COLI_VULKAN
                 if(vk_active && vk_reg_served(layer,eid)) found=1;   /* VK-tier-served at decode */
 #endif
-                for(int z=0;z<m->npin[layer] && !found;z++) if(sl_eid(&P[z])==eid) found=1;
-                ESlot *Sl=m->ecache[layer];
-                for(int z=0;z<m->ecn[layer] && !found;z++) if(Sl[z].eid==eid) found=1;
+                for(int z=0;z<m->tc.npin[layer] && !found;z++) if(sl_eid(&P[z])==eid) found=1;
+                ESlot *Sl=m->tc.ecache[layer];
+                for(int z=0;z<m->tc.ecn[layer] && !found;z++) if(Sl[z].eid==eid) found=1;
                 if(!found) expert_prefetch(m,layer,eid);
             }
         }
@@ -4987,17 +4923,17 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * dispatched miss slot, before the nr==0 skip) already waited on all ws[] loads
          * for this block, so they are complete before the LRU swap — and the gen-tagged
          * cursor keeps any still-spinning worker off a wrong-generation slot. */
-        { ESlot *Sl=m->ecache[layer];                            /* promozione LRU (swap buffer) */
-          int nn=__atomic_load_n(&m->ecn[layer],__ATOMIC_RELAXED);
-          int promo = nmiss<m->ecap ? nmiss : m->ecap;
+        { ESlot *Sl=m->tc.ecache[layer];                            /* promozione LRU (swap buffer) */
+          int nn=__atomic_load_n(&m->tc.ecn[layer],__ATOMIC_RELAXED);
+          int promo = nmiss<m->tc.ecap ? nmiss : m->tc.ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
-              if(nn<m->ecap){ dst=&Sl[nn]; __atomic_store_n(&m->ecn[layer],nn+1,__ATOMIC_RELAXED); nn++; }
+              if(nn<m->tc.ecap){ dst=&Sl[nn]; __atomic_store_n(&m->tc.ecn[layer],nn+1,__ATOMIC_RELAXED); nn++; }
               else { int lru=eslot_lru_victim(Sl,nn);
                      if(lru<0){ static int warned;
                          if(!warned){ warned=1; fprintf(stderr,"[CUDA] all LRU expert slots are in flight; skipping cache promotion\n"); }
                          continue; }
                      dst=&Sl[lru]; }
-              ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; sl_used_set(dst,(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED)); }
+              ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; sl_used_set(dst,(uint64_t)__atomic_add_fetch(&m->tc.eclock,1,__ATOMIC_RELAXED)); }
         }
     }
     /* ---- FASE E: shared expert (PIPE2: gia' sul device; Metal CB: gia' sommata) ---- */
@@ -5163,69 +5099,23 @@ static Model *pilot_m=NULL;
 /* PILOT_REAL: load VERO dell'expert predetto dentro la LRU del layer FUTURO. Vedi
  * l'invariante di sicurezza accanto a g_pilot_real. Il pread (lento) gira FUORI dal lock;
  * il lock protegge solo la scelta/pubblicazione dello slot e l'handshake col main. */
-/* Sonda di residenza (#9): eid e' pinnato, residente, o prenotato in volo su
- * `layer`? UNA definizione per lo scan che era ricopiato a mano in ogni punto
- * d'ingresso del prefetch (pilot_realload, pilot_uring_batch, couple_prefetch,
- * pilot_prefetch, repin) -- lo "scan di residenza sicuro per convenzione su ~6
- * siti" segnalato dall'audit. Il locking e' del CHIAMANTE: ogni chiamante
- * attuale tiene g_pilot_mx. */
-static int expert_resident_or_reserved(Model *m,int layer,int eid){
-#ifdef COLI_VULKAN
-    if(vk_reg_served(layer,eid)) return 1;               /* VK-tier-served: no load */
-#endif
-    ESlot *P=m->pin[layer];
-    for(int z=0;z<m->npin[layer];z++) if(sl_eid(&P[z])==eid) return 1;
-    ESlot *Sl=m->ecache[layer]; int nn=__atomic_load_n(&m->ecn[layer],__ATOMIC_RELAXED);
-    for(int z=0;z<nn;z++){ int e=sl_eid(&Sl[z]); if(e==eid||e==-(eid+2)) return 1; }
-    return 0;
-}
-
-/* Scelta della vittima + LFRU eviction guard (#441, ristretto da #497): UNA
- * definizione per le due copie identiche di pilot_realload e pilot_uring_batch.
- * Ritorna l'indice dello slot, o -1 (tutti in volo, oppure il guard ha protetto
- * la vittima: il chiamante conta un drop in entrambi i casi). Il chiamante
- * tiene g_pilot_mx. */
-static int pilot_pick_slot(Model *m,int layer,int eid,ESlot *Sl,int nn){
-    int slot=-1;
-    for(int z=0;z<nn;z++){
-        if(eslot_busy(&Sl[z])) continue;                 /* borrowed by an async GPU read */
-        int e=sl_eid(&Sl[z]);
-        if(e==-1){ slot=z; break; }                      /* riusa uno slot libero/fallito */
-        if(e<-1) continue;                               /* prenotazione di un altro worker */
-        if(slot<0 || sl_used(&Sl[z])<sl_used(&Sl[slot])) slot=z;
-    }
-    if(slot<0) return -1;
-    /* proteggi la vittima solo se davvero CALDA (>=2 accessi demand) e chiaramente
-     * piu' calda della speculazione, con l'isteresi 25%+4-freq di tier_pick_lfru */
-    if(g_pilot_evict_guard && m->eheat && m->elast && sl_eid(&Sl[slot])>=0){
-        int vid=sl_eid(&Sl[slot]); uint32_t vh=u32_ld(&m->eheat[layer][vid]);
-        if(vh>=2){
-            uint32_t clk=__atomic_load_n(&m->eaccess_clock,__ATOMIC_RELAXED);
-            uint64_t vs=tier_lfru_score(vh,u32_ld(&m->elast[layer][vid]),clk);
-            uint64_t cs=tier_lfru_score(u32_ld(&m->eheat[layer][eid]),u32_ld(&m->elast[layer][eid]),clk);
-            if(vs+(vs>>2)+(4u<<8)>cs) return -1;
-        }
-    }
-    return slot;
-}
-
 static void pilot_realload(Model *m, int layer, int eid){
     pthread_mutex_lock(&g_pilot_mx);
     if(layer<0 || layer>=256 || layer <= atomic_load_explicit(&g_cur_moe_layer,memory_order_acquire)){
         atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);   /* fuori range (come il ramo URING) o main gia' su questo layer */
         pthread_mutex_unlock(&g_pilot_mx); return;
     }
-    if(expert_resident_or_reserved(m,layer,eid)){ pthread_mutex_unlock(&g_pilot_mx); return; }
-    ESlot *Sl=m->ecache[layer]; int nn=__atomic_load_n(&m->ecn[layer],__ATOMIC_RELAXED);
+    if(expert_resident_or_reserved(&m->tc,layer,eid)){ pthread_mutex_unlock(&g_pilot_mx); return; }
+    ESlot *Sl=m->tc.ecache[layer]; int nn=__atomic_load_n(&m->tc.ecn[layer],__ATOMIC_RELAXED);
     /* SPMC (PILOT_WORKERS>1): scegli lo slot sotto lock e MARCALO prenotato prima di
      * rilasciarlo, cosi' gli altri worker non lo scelgono come vittima ne' ricaricano
      * lo stesso eid. Stesso schema del ramo URING (prenotazione visibile -(eid+2),
      * ecn bumpato subito, scan-vittima che salta le prenotazioni). Vittima +
      * eviction guard: pilot_pick_slot (#9, una definizione per i due rami). */
     int slot,isnew=0;
-    if(nn<m->ecap){ slot=nn; isnew=1; __atomic_store_n(&m->ecn[layer],nn+1,__ATOMIC_RELAXED); }   /* cresci: pubblica subito lo slot (marcato prenotato) */
+    if(nn<m->tc.ecap){ slot=nn; isnew=1; __atomic_store_n(&m->tc.ecn[layer],nn+1,__ATOMIC_RELAXED); }   /* cresci: pubblica subito lo slot (marcato prenotato) */
     else {
-        slot=pilot_pick_slot(m,layer,eid,Sl,nn);
+        slot=pilot_pick_slot(&m->tc,layer,eid,Sl,nn,g_pilot_evict_guard);
         if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
                     pthread_mutex_unlock(&g_pilot_mx); return; }   /* tutti in volo, o vittima protetta dal guard */
     }
@@ -5242,7 +5132,7 @@ static void pilot_realload(Model *m, int layer, int eid){
 
     pthread_mutex_lock(&g_pilot_mx);
     if(rc==0){
-        sl_used_set(dst,(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED));  /* eid gia' reale (expert_load); timbra used fresco */
+        sl_used_set(dst,(uint64_t)__atomic_add_fetch(&m->tc.eclock,1,__ATOMIC_RELAXED));  /* eid gia' reale (expert_load); timbra used fresco */
         atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
     } else {
         /* load fallito: libera la prenotazione. LO SLOT VA ANCHE RIPORTATO A used=0:
@@ -5276,11 +5166,11 @@ static void pilot_uring_batch(Model *m){
             atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
             pthread_mutex_unlock(&g_pilot_mx); continue;
         }
-        if(expert_resident_or_reserved(m,layer,eid)){ pthread_mutex_unlock(&g_pilot_mx); continue; }
-        ESlot *Sl=m->ecache[layer]; int nn=__atomic_load_n(&m->ecn[layer],__ATOMIC_RELAXED);
+        if(expert_resident_or_reserved(&m->tc,layer,eid)){ pthread_mutex_unlock(&g_pilot_mx); continue; }
+        ESlot *Sl=m->tc.ecache[layer]; int nn=__atomic_load_n(&m->tc.ecn[layer],__ATOMIC_RELAXED);
         int slot;
-        if(nn<m->ecap){ slot=nn; __atomic_store_n(&m->ecn[layer],nn+1,__ATOMIC_RELAXED); }
-        else slot=pilot_pick_slot(m,layer,eid,Sl,nn);    /* vittima + eviction guard (#9) */
+        if(nn<m->tc.ecap){ slot=nn; __atomic_store_n(&m->tc.ecn[layer],nn+1,__ATOMIC_RELAXED); }
+        else slot=pilot_pick_slot(&m->tc,layer,eid,Sl,nn,g_pilot_evict_guard);    /* vittima + eviction guard (#9) */
         if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); pthread_mutex_unlock(&g_pilot_mx); continue; }
         ESlot *dst=&Sl[slot];
         sl_eid_set(dst,-(eid+2));                  /* visible reservation; never considered resident/evictable */
@@ -5309,7 +5199,7 @@ static void pilot_uring_batch(Model *m){
         pthread_mutex_lock(&g_pilot_mx);
         if(rc==0){
             sl_eid_set(d->dst,d->eid);
-            sl_used_set(d->dst,(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED));
+            sl_used_set(d->dst,(uint64_t)__atomic_add_fetch(&m->tc.eclock,1,__ATOMIC_RELAXED));
             atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
         }else{
             sl_eid_set(d->dst,-1);
@@ -5435,7 +5325,7 @@ static void couple_prefetch(Model *m, int layer, const int *idx, int Ke){
             if(best<0) break;
             sc[best]=0;
             pthread_mutex_lock(&g_pilot_mx);        /* residency scan, same locking as pilot */
-            int found=expert_resident_or_reserved(m,lt,best);
+            int found=expert_resident_or_reserved(&m->tc,lt,best);
             pthread_mutex_unlock(&g_pilot_mx);
             if(!found){
                 unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
@@ -5492,7 +5382,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
              * re-entrant double-lock, and the worker re-checks residency under the
              * lock anyway, making a racing redundant enqueue harmless. */
             pthread_mutex_lock(&g_pilot_mx);
-            int found=expert_resident_or_reserved(m,lnext,best);
+            int found=expert_resident_or_reserved(&m->tc,lnext,best);
             pthread_mutex_unlock(&g_pilot_mx);
             if(!found){
                 unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
@@ -6721,8 +6611,8 @@ static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens,
     int pinned=0,lru=0; double pin_b=0,lru_b=0;
     for(int i=0;i<=c->n_layers;i++){
         double w=(double)expert_bytes_row(m,i,m->ebits);
-        if(m->npin){ pinned+=m->npin[i]; pin_b+=(double)m->npin[i]*w; }
-        if(m->ecn){ lru+=m->ecn[i];      lru_b+=(double)m->ecn[i]*w; }
+        if(m->tc.npin){ pinned+=m->tc.npin[i]; pin_b+=(double)m->tc.npin[i]*w; }
+        if(m->tc.ecn){ lru+=m->tc.ecn[i];      lru_b+=(double)m->tc.ecn[i]*w; }
     }
     double io_w=m->t_ewait-b->ewait;    /* stall the compute thread felt */
     double io_svc=edisk_s()-b->edisk;   /* read service on the loading threads (overlaps compute) */
@@ -6770,7 +6660,7 @@ static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens,
         }
     }
     fprintf(f,"[PROF] resident experts: %d pinned (%.1f GB) + %d in LRU (%.1f GB, cap %d/layer)\n",
-        pinned,pin_b/1e9,lru,lru_b/1e9,m->ecap);
+        pinned,pin_b/1e9,lru,lru_b/1e9,m->tc.ecap);
     double emm=m->t_emm-b->emm, ecpu=m->t_ecpu-b->ecpu, egpu=m->t_egpu-b->egpu;
     double route=m->t_route-b->route,p2p=m->t_p2p-b->p2p;
     uint64_t np2p=m->n_p2p-b->n_p2p;
@@ -6981,19 +6871,19 @@ typedef struct { long gain; int l, slot, eid, gpu_swap; } RepinCand;
 static int repin_pick(Model *m, RepinCand *out, int maxc){
     Cfg *c=&m->c; int nb=0;
     for(int l=0;l<c->n_layers;l++){
-        if(!m->npin || m->npin[l]<1 || !m->eheat[l]) continue;
+        if(!m->tc.npin || m->tc.npin[l]<1 || !m->tc.eheat[l]) continue;
 #ifdef COLI_CUDA
         int cold=-1,hot=-1;
-        for(int z=0;z<m->npin[l];z++){
-            ESlot *s=&m->pin[l][z]; uint32_t heat=m->eheat[l][s->eid];
+        for(int z=0;z<m->tc.npin[l];z++){
+            ESlot *s=&m->tc.pin[l][z]; uint32_t heat=m->tc.eheat[l][s->eid];
             if(s->g.cuda_eligible){
-                if(cold<0||heat<m->eheat[l][m->pin[l][cold].eid]) cold=z;
-            }else if(hot<0||heat>m->eheat[l][m->pin[l][hot].eid]) hot=z;
+                if(cold<0||heat<m->tc.eheat[l][m->tc.pin[l][cold].eid]) cold=z;
+            }else if(hot<0||heat>m->tc.eheat[l][m->tc.pin[l][hot].eid]) hot=z;
         }
         if(cold>=0&&hot>=0){
-            uint32_t ch=m->eheat[l][m->pin[l][cold].eid],hh=m->eheat[l][m->pin[l][hot].eid];
+            uint32_t ch=m->tc.eheat[l][m->tc.pin[l][cold].eid],hh=m->tc.eheat[l][m->tc.pin[l][hot].eid];
             if(hh>ch+1){
-                RepinCand v={(long)hh-(long)ch,l,cold,m->pin[l][hot].eid,1};
+                RepinCand v={(long)hh-(long)ch,l,cold,m->tc.pin[l][hot].eid,1};
                 if(nb<maxc) out[nb++]=v;
                 else { int w=0; for(int b=1;b<maxc;b++) if(out[b].gain<out[w].gain)w=b;
                        if(v.gain>out[w].gain)out[w]=v; }
@@ -7001,10 +6891,10 @@ static int repin_pick(Model *m, RepinCand *out, int maxc){
             }
         }
 #endif
-        ESlot *P=m->pin[l]; int ids[4096], zp, eu; long g;
-        int np=m->npin[l]; if(np>4096) np=4096;
+        ESlot *P=m->tc.pin[l]; int ids[4096], zp, eu; long g;
+        int np=m->tc.npin[l]; if(np>4096) np=4096;
         for(int z=0;z<np;z++) ids[z]=sl_eid(&P[z]);
-        if(!tier_pick_lfru(m->eheat[l],m->elast[l],m->eaccess_clock,
+        if(!tier_pick_lfru(m->tc.eheat[l],m->tc.elast[l],m->tc.eaccess_clock,
                            c->n_experts,ids,np,&zp,&eu,&g)) continue;
         if(nb<maxc){ out[nb]=(RepinCand){g,l,zp,eu,0}; nb++; }
         else { int w=0; for(int b=1;b<maxc;b++) if(out[b].gain<out[w].gain) w=b;
@@ -7043,16 +6933,16 @@ static void rss_guard(Model *m){
     int64_t need=(int64_t)((rss-lim)*1e9), freed=0; int dropped=0;
     for(int pass=0; pass<8 && freed<need; pass++){
         for(int l=0; l<=c->n_layers && freed<need; l++){
-            if(!m->ecache || !m->ecache[l]) continue;
+            if(!m->tc.ecache || !m->tc.ecache[l]) continue;
             pthread_mutex_lock(&g_pilot_mx);
-            int nn=__atomic_load_n(&m->ecn[l],__ATOMIC_RELAXED), lru=-1;
+            int nn=__atomic_load_n(&m->tc.ecn[l],__ATOMIC_RELAXED), lru=-1;
             for(int z=0;z<nn;z++){                        /* solo slot pubblicati e con slab */
-                ESlot *cand=&m->ecache[l][z];
+                ESlot *cand=&m->tc.ecache[l][z];
                 if(sl_eid(cand)<0 || !cand->slab || eslot_busy(cand)) continue;
-                if(lru<0 || sl_used(cand)<sl_used(&m->ecache[l][lru])) lru=z;
+                if(lru<0 || sl_used(cand)<sl_used(&m->tc.ecache[l][lru])) lru=z;
             }
             if(lru<0){ pthread_mutex_unlock(&g_pilot_mx); continue; }
-            ESlot *s=&m->ecache[l][lru];
+            ESlot *s=&m->tc.ecache[l][lru];
             sl_eid_set(s,-1);                             /* nascosto: nessun hit/evict altrui */
             int64_t sb=s->slab_cap + s->fslab_cap*4;
 #ifdef COLI_METAL
@@ -7071,11 +6961,11 @@ static void rss_guard(Model *m){
             pthread_mutex_unlock(&g_pilot_mx);
             freed += sb; dropped++;
         }
-        if(m->ecap>2) m->ecap--;                           /* il tetto scende: niente ricrescita */
+        if(m->tc.ecap>2) m->tc.ecap--;                           /* il tetto scende: niente ricrescita */
     }
     if(dropped)
         fprintf(stderr,"[RAM-GUARD] RSS %.1f GB over the %.1f GB budget (#403): "
-                       "dropped %d cached experts, cap -> %d\n", rss, lim, dropped, m->ecap);
+                       "dropped %d cached experts, cap -> %d\n", rss, lim, dropped, m->tc.ecap);
 }
 static void repin_pass_limit(Model *m,int limit){
     rss_guard(m);                     /* #403: il budget si fa rispettare sull'RSS MISURATO */
@@ -7092,23 +6982,23 @@ static void repin_pass_limit(Model *m,int limit){
      * ~0.7 s on the six-GPU host. */
     #pragma omp parallel for schedule(dynamic,1)
     for(int b=0;b<nb;b++) if(cd[b].gpu_swap){
-        ESlot *s=&m->pin[cd[b].l][cd[b].slot];
+        ESlot *s=&m->tc.pin[cd[b].l][cd[b].slot];
         expert_host_ensure(m,cd[b].l,s);
     }
     for(int b=0;b<nb;b++) if(cd[b].gpu_swap){
-        ESlot *s=&m->pin[cd[b].l][cd[b].slot];
+        ESlot *s=&m->tc.pin[cd[b].l][cd[b].slot];
         m->resident_bytes+=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
     }
 #endif
     for(int b=0;b<nb;b++){
-        ESlot *s=&m->pin[cd[b].l][cd[b].slot];
+        ESlot *s=&m->tc.pin[cd[b].l][cd[b].slot];
         int old=sl_eid(s);
-        uint32_t old_heat=u32_ld(&m->eheat[cd[b].l][old]), new_heat=u32_ld(&m->eheat[cd[b].l][cd[b].eid]);
+        uint32_t old_heat=u32_ld(&m->tc.eheat[cd[b].l][old]), new_heat=u32_ld(&m->tc.eheat[cd[b].l][cd[b].eid]);
 #ifdef COLI_CUDA
         if(cd[b].gpu_swap){
             ESlot *hot=NULL;
-            for(int z=0;z<m->npin[cd[b].l];z++)
-                if(sl_eid(&m->pin[cd[b].l][z])==cd[b].eid){hot=&m->pin[cd[b].l][z];break;}
+            for(int z=0;z<m->tc.npin[cd[b].l];z++)
+                if(sl_eid(&m->tc.pin[cd[b].l][z])==cd[b].eid){hot=&m->tc.pin[cd[b].l][z];break;}
             if(!hot||hot->g.cuda_eligible) continue;
             double t0=now_s();
             QT *cq[3]={&s->g,&s->u,&s->d},*hq[3]={&hot->g,&hot->u,&hot->d};
@@ -7159,7 +7049,7 @@ static void repin_pass_limit(Model *m,int limit){
     }
     if(gpu_swaps) fprintf(stderr,"[REPIN] VRAM: %d expert scambiati/swapped in %.0f ms\n",
         gpu_swaps,(now_s()-pass_t0)*1e3);
-    for(int l=0;l<m->c.n_layers;l++) if(m->eheat[l]) tier_decay(m->eheat[l],m->c.n_experts);
+    for(int l=0;l<m->c.n_layers;l++) if(m->tc.eheat[l]) tier_decay(m->tc.eheat[l],m->c.n_experts);
 }
 /* ---- KV SU DISCO: la conversazione si riapre CALDA (KVSAVE=0 disattiva) ----
  * Il re-prefill di una chat riaperta costa ore su questo disco; la KV compressa MLA
@@ -7887,13 +7777,13 @@ static void vk_registry_fill(Model *m){
     Cfg *c=&m->c; int E=c->n_experts, NL=c->n_layers;
     if(!g_vulkan || g_vk_budget<=0) return;
     int64_t nz=0;
-    for(int i=0;i<NL;i++) if(m->eusage[i]) for(int e=0;e<E;e++) if(m->eusage[i][e]) nz++;
+    for(int i=0;i<NL;i++) if(m->tc.eusage[i]) for(int e=0;e<E;e++) if(m->tc.eusage[i][e]) nz++;
     if(!nz){ fprintf(stderr,"[VK] expert tier: no usage history yet — tier empty this run "
                      "(it seeds from %s as you use the model)\n", g_usage_path); return; }
     VkCand *cand=malloc((size_t)nz*sizeof(VkCand)); if(!cand) return;
     int64_t n=0;
-    for(int i=0;i<NL;i++) if(m->eusage[i]) for(int e=0;e<E;e++)
-        if(m->eusage[i][e]) cand[n++]=(VkCand){m->eusage[i][e],i,e};
+    for(int i=0;i<NL;i++) if(m->tc.eusage[i]) for(int e=0;e<E;e++)
+        if(m->tc.eusage[i][e]) cand[n++]=(VkCand){m->tc.eusage[i][e],i,e};
     qsort(cand,(size_t)n,sizeof(VkCand),vk_cand_cmp);
     g_vk_reg=calloc((size_t)NL*E*3,sizeof(*g_vk_reg)); g_vk_reg_E=E; g_vk_reg_NL=NL;
     if(!g_vk_reg){ free(cand); return; }
@@ -7913,8 +7803,8 @@ static void vk_registry_fill(Model *m){
         if(vkr_reserve>0 && (g_vk_reg_n&7)==0 && coli_vk_mem_budget(&vkr_used,&vkr_budget)
            && vkr_budget-vkr_used < vkr_reserve){ vkr_stopped=1; break; }
         int layer=cand[i2].layer, eid=cand[i2].eid; tried++;
-        ESlot *src=NULL, *P=m->pin[layer];
-        for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid && P[z].slab){ src=&P[z]; break; }
+        ESlot *src=NULL, *P=m->tc.pin[layer];
+        for(int z=0;z<m->tc.npin[layer];z++) if(P[z].eid==eid && P[z].slab){ src=&P[z]; break; }
         if(!src){ if(expert_load(m,layer,eid,&tmp,0,0)!=0){   /* 0 = success (impl convention); demand=0: startup tier fill */
                 if(++loadfail<4) fprintf(stderr,"[VK] tier fill: expert_load(%d,%d) failed\n",layer,eid);
                 if(loadfail>=64) break;                     /* disk trouble: stop burning time */
@@ -7955,8 +7845,8 @@ static void vk_registry_fill(Model *m){
             if(vkr2_reserve>0 && (g_vk_reg_n2&7)==0 && coli_vk_mem_budget2(&u2,&b2)
                && b2-u2 < vkr2_reserve){ vkr2_stopped=1; break; }
             int layer=cand[i2].layer, eid=cand[i2].eid; tried2++;
-            ESlot *src=NULL, *P=m->pin[layer];
-            for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid && P[z].slab){ src=&P[z]; break; }
+            ESlot *src=NULL, *P=m->tc.pin[layer];
+            for(int z=0;z<m->tc.npin[layer];z++) if(P[z].eid==eid && P[z].slab){ src=&P[z]; break; }
             if(!src){ if(expert_load(m,layer,eid,&tmp,0,0)!=0){
                     if(++loadfail>=64) break;
                     continue; } src=&tmp; }
@@ -8060,8 +7950,8 @@ static void pin_wire(Model *m){
          * has already run -- qt_wire_mmap() skips cuda_eligible (VRAM-tier)
          * slots, so only the genuinely RAM-tier experts get locked. */
         Cfg *c=&m->c; double t0=now_s();
-        for(int i=0;i<c->n_layers;i++) for(int z=0;z<m->npin[i];z++){
-            ESlot *s=&m->pin[i][z];
+        for(int i=0;i<c->n_layers;i++) for(int z=0;z<m->tc.npin[i];z++){
+            ESlot *s=&m->tc.pin[i][z];
             qt_wire_mmap(&s->g,&g_mmap_wired,&g_mmap_wire_failed);
             qt_wire_mmap(&s->u,&g_mmap_wired,&g_mmap_wire_failed);
             qt_wire_mmap(&s->d,&g_mmap_wired,&g_mmap_wire_failed);
@@ -8071,8 +7961,8 @@ static void pin_wire(Model *m){
         return;
     }
     Cfg *c=&m->c; double t0=now_s(); int64_t wired=0; long failed=0;
-    for(int i=0;i<c->n_layers;i++) for(int z=0;z<m->npin[i];z++){
-        ESlot *s=&m->pin[i][z];
+    for(int i=0;i<c->n_layers;i++) for(int z=0;z<m->tc.npin[i];z++){
+        ESlot *s=&m->tc.pin[i][z];
         if(s->slab){  if(mem_wire(s->slab, s->slab_cap)==0) wired+=s->slab_cap; else failed++; }
         if(s->fslab){ size_t fl=(size_t)s->fslab_cap*sizeof(float);
                       if(mem_wire(s->fslab, fl)==0) wired+=fl; else failed++; }
@@ -8266,7 +8156,7 @@ static void pin_arena_bind(Model *m, PinRec *r, int *slot_of, int from, int to){
         int i=0;
         for(int a=from;a<to;a++){
             if(r[a].l!=l) continue;
-            ESlot *s=&m->pin[l][slot_of[a]];
+            ESlot *s=&m->tc.pin[l][slot_of[a]];
             s->slab=aw+(size_t)i*ws;   s->slab_cap=(int64_t)ws;   s->aslab=s->slab;
             s->fslab=(float*)((uint8_t*)af+(size_t)i*fs);
             s->fslab_cap=(int64_t)(fs/sizeof(float));             s->afslab=s->fslab;
@@ -8371,10 +8261,10 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
     if(npin<1){ free(r); return; }
     int *cnt_l=calloc(c->n_layers+1,sizeof(int));   /* +1: riga MTP */
     for(int a=0;a<npin;a++) cnt_l[r[a].l]++;
-    for(int i=0;i<=c->n_layers;i++) if(cnt_l[i]) m->pin[i]=calloc(cnt_l[i],sizeof(ESlot));
+    for(int i=0;i<=c->n_layers;i++) if(cnt_l[i]) m->tc.pin[i]=calloc(cnt_l[i],sizeof(ESlot));
     int *slot_of=malloc((size_t)npin*sizeof(int)), *next=calloc(c->n_layers+1,sizeof(int));
     for(int a=0;a<npin;a++) slot_of[a]=next[r[a].l]++;
-    for(int i=0;i<=c->n_layers;i++) m->npin[i]=cnt_l[i];
+    for(int i=0;i<=c->n_layers;i++) m->tc.npin[i]=cnt_l[i];
     double t0=now_s(), pin_host_released=0.0;
 #ifdef COLI_CUDA
     if(prefix_est>0){ gpu_prefix=prefix_est; if(gpu_prefix>npin) gpu_prefix=npin; }
@@ -8423,13 +8313,13 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
     int hi = base+stage; if(hi>pre_n) hi=pre_n;
     #pragma omp parallel for schedule(dynamic,1)
     for(int a=base;a<hi;a++)
-        expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
+        expert_load(m,r[a].l,r[a].e,&m->tc.pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
     m->resident_bytes+=(int64_t)pin_range_bytes(m,r,base,hi);
 #ifdef COLI_CUDA
     if(g_cuda_enabled && budget>0){
         for(int a=base;a<hi && m->gpu_expert_bytes<budget;a++){
             int li=r[a].l;
-            { ESlot *s=&m->pin[li][slot_of[a]];
+            { ESlot *s=&m->tc.pin[li][slot_of[a]];
                 int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
                 int compress=0;
 #ifdef COLI_ANS
@@ -8517,7 +8407,7 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
     if(gpu_prefix>0&&gpu_prefix<npin){
         #pragma omp parallel for schedule(dynamic,1)
         for(int a=gpu_prefix;a<npin;a++)
-            expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
+            expert_load(m,r[a].l,r[a].e,&m->tc.pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
         m->resident_bytes+=(int64_t)pin_range_bytes(m,r,gpu_prefix,npin);
     }
     double warm_b=pin_range_bytes(m,r,0,npin)-pin_host_released;
@@ -8686,14 +8576,14 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
             exit(2);
         }
     }
-    if(capmax < m->ecap){
+    if(capmax < m->tc.ecap){
         fprintf(stderr,"[RAM_GB=%.1f%s] resident %.1f GB + reserve %.1f GB (ws %.1f, KV %dx%d %.1f, kvb %.1f), "
             "experts %.1f MB avg x %d layers -> cap lowered %d->%d (projected peak %.1f GB)\n",
             ram_gb,auto_b?" auto":"",m->resident_bytes/1e9,slack/1e9,ws_b/1e9,
             kv_slot_count(),max_ctx,kv_b/1e9,kvb_b/1e9,
-            row_b/(nsp>0?nsp:1)/1e6, nsp, m->ecap, capmax,
+            row_b/(nsp>0?nsp:1)/1e6, nsp, m->tc.ecap, capmax,
             (m->resident_bytes + (double)capmax*row_b + slack)/1e9);
-        m->ecap=capmax;
+        m->tc.ecap=capmax;
     } else {
         /* AUTO-RAISE (issue #12): il budget consente PIU' cache di quella chiesta.
          * Senza questo, una macchina da 128 GB girava con la LRU di una da 16
@@ -8708,19 +8598,19 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
          * measurement stamp as the cap-1 default in coli_resolve_cap(). */
         int raise_on = getenv("CAP_RAISE")?atoi(getenv("CAP_RAISE")):(g_ssd_fast?0:1);
         int newcap = capmax>c->n_experts ? c->n_experts : capmax;
-        if(raise_on && newcap>m->ecap){
-            for(int i=0;i<=c->n_layers;i++) if(m->ecache[i]){
-                m->ecache[i]=realloc(m->ecache[i],(size_t)newcap*sizeof(ESlot));
-                memset(m->ecache[i]+m->ecap,0,(size_t)(newcap-m->ecap)*sizeof(ESlot));
+        if(raise_on && newcap>m->tc.ecap){
+            for(int i=0;i<=c->n_layers;i++) if(m->tc.ecache[i]){
+                m->tc.ecache[i]=realloc(m->tc.ecache[i],(size_t)newcap*sizeof(ESlot));
+                memset(m->tc.ecache[i]+m->tc.ecap,0,(size_t)(newcap-m->tc.ecap)*sizeof(ESlot));
             }
             fprintf(stderr,"[RAM_GB=%.1f%s] cap raised %d->%d: budget allows it "
                 "(projected peak %.1f GB; set CAP_RAISE=0 to disable)\n",
-                ram_gb, auto_b?" auto":"", m->ecap, newcap,
+                ram_gb, auto_b?" auto":"", m->tc.ecap, newcap,
                 (m->resident_bytes + (double)newcap*row_b + slack)/1e9);
-            m->ecap=newcap;
+            m->tc.ecap=newcap;
         } else
-            fprintf(stderr,"[RAM_GB=%.1f%s] cap=%d ok (projected peak %.1f GB)\n", ram_gb, auto_b?" auto":"", m->ecap,
-                (m->resident_bytes + (double)m->ecap*row_b + slack)/1e9);
+            fprintf(stderr,"[RAM_GB=%.1f%s] cap=%d ok (projected peak %.1f GB)\n", ram_gb, auto_b?" auto":"", m->tc.ecap,
+                (m->resident_bytes + (double)m->tc.ecap*row_b + slack)/1e9);
     }
 }
 
@@ -8761,9 +8651,9 @@ static void prof_config(Model *m, double ram_env, int est_ctx){
      * from. Printing a projection derived differently from the cap is how the
      * halving stayed invisible through a whole release. */
     int pinned=0; double pin_b=0;
-    for(int i=0;i<=c->n_layers;i++) if(m->npin){
-        pinned+=m->npin[i];
-        pin_b+=(double)m->npin[i]*(double)expert_bytes_row(m,i,m->ebits);
+    for(int i=0;i<=c->n_layers;i++) if(m->tc.npin){
+        pinned+=m->tc.npin[i];
+        pin_b+=(double)m->tc.npin[i]*(double)expert_bytes_row(m,i,m->ebits);
     }
     (void)nsp;
     fprintf(stderr,"[PROF] machine: %s | %d cores (%d omp threads) | RAM %.1f GB total, %.1f GB available | backend %s\n",
@@ -8771,7 +8661,7 @@ static void prof_config(Model *m, double ram_env, int est_ctx){
     fprintf(stderr,"[PROF] config: RAM_GB=%s%.1f CTX=%d | expert cache cap %d/layer (up to %.1f GB) | pinned %d (%.1f GB) | "
         "DRAFT=%d PIPE=%d DIRECT=%d MMAP=%d IDOT=%d DSA=%s PILOT=%d CACHE_ROUTE=%d\n",
         ram_env<=0?"auto ":"",ram_env<=0?g_mem_avail_boot*0.88:ram_env,est_ctx,
-        m->ecap,(double)m->ecap*expert_cache_row_bytes(m,m->ebits)/1e9,pinned,pin_b/1e9,
+        m->tc.ecap,(double)m->tc.ecap*expert_cache_row_bytes(m,m->ebits)/1e9,pinned,pin_b/1e9,
         g_draft,g_pipe,g_direct,g_mmap,g_idot,
         (m->has_dsa&&c->index_topk)?"on":"off",g_pilot,g_cache_route);
 }
@@ -9687,7 +9577,7 @@ int main(int argc, char **argv){
           int preserved_cap=0;
           double lru_reserve=autopin_lru_reserve(
               expert_available,expert_cache_bytes_per_slot(&m,ebits),
-              m.ecap,&preserved_cap);
+              m.tc.ecap,&preserved_cap);
           double pin_bytes=autopin_preserve_lru(
               planned_pin,expert_available,lru_reserve);
           /* Print every term, every time, capped or not.

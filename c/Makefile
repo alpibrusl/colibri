@@ -813,6 +813,9 @@ tests/test_st_mirror$(EXE): tests/test_st_mirror.c st.h json.h compat.h
 tests/test_tier$(EXE): tests/test_tier.c tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_tier_cache_tsan$(EXE): tests/test_tier_cache_tsan.c tier_cache.h tier.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_grammar$(EXE): tests/test_grammar.c grammar.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -1139,7 +1142,7 @@ test-asan:
 # -O1 + frame pointers: TSan, like ASan, needs readable stacks.
 TSAN_CFLAGS  = -O1 -g -fno-omit-frame-pointer -fsanitize=thread -Wno-unknown-pragmas
 TSAN_ENV     = TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1
-TSAN_TESTS   = tests/test_pilot_ring.c
+TSAN_TESTS   = tests/test_pilot_ring.c tests/test_tier_cache_tsan.c
 
 test-tsan:
 	@for t in $(TSAN_TESTS); do \

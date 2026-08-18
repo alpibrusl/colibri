@@ -46,23 +46,23 @@ static int test_expert_layout(int fd){
     compat_aligned_free(slot.slab); free(slot.fslab);
     if(bad){ for(int i=0;i<m.S.n;i++) free(m.S.t[i].name); free(m.S.t); return fail("expert tensor views"); }
 
-    m.c.n_experts=8; m.c.n_layers=2; m.ecap=2;
-    m.pin=calloc(3,sizeof(ESlot*)); m.npin=calloc(3,sizeof(int));
-    m.ecache=calloc(3,sizeof(ESlot*)); m.ecn=calloc(3,sizeof(int));
-    m.ecache[1]=calloc(2,sizeof(ESlot));
-    if(!m.pin||!m.npin||!m.ecache||!m.ecn||!m.ecache[1])
+    m.c.n_experts=8; m.c.n_layers=2; m.tc.ecap=2;
+    m.tc.pin=calloc(3,sizeof(ESlot*)); m.tc.npin=calloc(3,sizeof(int));
+    m.tc.ecache=calloc(3,sizeof(ESlot*)); m.tc.ecn=calloc(3,sizeof(int));
+    m.tc.ecache[1]=calloc(2,sizeof(ESlot));
+    if(!m.tc.pin||!m.tc.npin||!m.tc.ecache||!m.tc.ecn||!m.tc.ecache[1])
         return fail("pilot fixture allocation");
     if(uring_batch_init(&g_ub_pilot)) return fail("pilot ring init");
     memset(g_pilot_inflight,0,sizeof(g_pilot_inflight));
     atomic_store(&g_cur_moe_layer,-1); atomic_store(&g_pilot_loads,0); atomic_store(&g_pilot_drops,0);
     pilot_r=0; pilot_w=1; pilot_q[0].l=1; pilot_q[0].e=7;
     pilot_uring_batch(&m);
-    bad=m.ecn[1]!=1 || m.ecache[1][0].eid!=7 || g_pilot_inflight[1]!=0
+    bad=m.tc.ecn[1]!=1 || m.tc.ecache[1][0].eid!=7 || g_pilot_inflight[1]!=0
         || atomic_load(&g_pilot_loads)!=1 || atomic_load(&g_pilot_drops)!=0;
     coli_uring_close(&g_ub_pilot.ring);
-    compat_aligned_free(m.ecache[1][0].slab); free(m.ecache[1][0].fslab);
-    free(m.ecache[1]);
-    free(m.pin); free(m.npin); free(m.ecache); free(m.ecn);
+    compat_aligned_free(m.tc.ecache[1][0].slab); free(m.tc.ecache[1][0].fslab);
+    free(m.tc.ecache[1]);
+    free(m.tc.pin); free(m.tc.npin); free(m.tc.ecache); free(m.tc.ecn);
     for(int i=0;i<m.S.n;i++) free(m.S.t[i].name);
     free(m.S.t);
     return bad?fail("pilot uring publication"):0;
