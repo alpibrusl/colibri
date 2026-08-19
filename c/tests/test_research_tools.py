@@ -50,6 +50,167 @@ class ResearchToolSelftests(unittest.TestCase):
         self.assertIn("selftest: ok", proc.stdout)
 
 
+class TraceHealth(unittest.TestCase):
+    """A trace that cannot support a conclusion must not receive a verdict."""
+
+    def _mod(self, name):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(name, TOOLS / f"{name}.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _trace(self, gates, rows=40, layers=3):
+        path = HERE / "_tmp_health_trace.txt"
+        with open(path, "w") as f:
+            call = 0
+            for _ in range(rows):
+                for layer in range(layers):
+                    f.write(f"{call} 0 {layer} " +
+                            " ".join(f"{i}:{g:.4f}" for i, g in enumerate(gates)) + "\n")
+                    call += 1
+        return path
+
+    def test_selftest(self):
+        proc = _run("trace_health.py")
+        self.assertEqual(proc.returncode, 0,
+                         f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        self.assertIn("selftest: ok", proc.stdout)
+
+    def test_uniform_gates_are_degenerate(self):
+        th = self._mod("trace_health")
+        # The measurement from a random-weight OLMoE checkpoint run through the
+        # real engine: gates within 4% of each other, entropy 0.9999.
+        path = self._trace([0.1284, 0.1268, 0.1251, 0.1242,
+                            0.1241, 0.1238, 0.1238, 0.1238])
+        try:
+            stats = th.gate_stats([str(path)])
+            self.assertTrue(th.is_degenerate(stats))
+            self.assertIsNotNone(th.warning(stats))
+            self.assertEqual(th.claims(stats)["gate.degenerate"], 1)
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_peaked_gates_are_not_degenerate(self):
+        th = self._mod("trace_health")
+        path = self._trace([0.60, 0.20, 0.10, 0.04, 0.03, 0.01, 0.01, 0.01])
+        try:
+            stats = th.gate_stats([str(path)])
+            self.assertFalse(th.is_degenerate(stats))
+            self.assertIsNone(th.warning(stats))
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_degenerate_trace_suppresses_both_verdicts(self):
+        # The regression this exists for. On a random-weight trace the two
+        # tools reported +0.135 temporal gain and a 21.6% read reduction —
+        # both over their thresholds, both meaningless. The gain may still be
+        # reported; the VERDICT must not be.
+        th = self._mod("trace_health")
+        rt = self._mod("route_temporal")
+        el = self._mod("expert_layout")
+        path = self._trace([0.125] * 8)
+        try:
+            gate = th.gate_stats([str(path)])
+            self.assertTrue(th.is_degenerate(gate))
+
+            seqs = rt.parse_traces([str(path)])
+            recalls, total = rt.evaluate(seqs)
+            report = rt.report_of([str(path)], seqs, recalls, total, 1, gate)
+            self.assertEqual(report["claims"]["worth_engine_slice"], 0)
+            self.assertIn("degenerate", report["verdict"])
+            self.assertEqual(report["claims"]["gate.degenerate"], 1)
+
+            forwards = el.parse_forwards([str(path)])
+            scored, _, _ = el.evaluate(forwards)
+            report = el.report_of([str(path)], forwards, scored, el.gains(scored), gate)
+            self.assertEqual(report["claims"]["worth_engine_slice"], 0)
+            self.assertIn("degenerate", report["verdict"])
+        finally:
+            path.unlink(missing_ok=True)
+
+
+class ExpertLayout(unittest.TestCase):
+    """#36: the layout tool only reports a win when there is one to report."""
+
+    def _mod(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "expert_layout", TOOLS / "expert_layout.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_selftest(self):
+        proc = _run("expert_layout.py")
+        self.assertEqual(proc.returncode, 0,
+                         f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        self.assertIn("selftest: ok", proc.stdout)
+
+    def test_reads_metric_endpoints(self):
+        el = self._mod()
+        slots = el.slots_of([0, 1, 2, 3, 4, 5])
+        self.assertEqual(el.runs_of(slots, {1, 2, 3}), 1)   # contiguous: one read
+        self.assertEqual(el.runs_of(slots, {0, 2, 4}), 3)   # scattered: |S| reads
+        self.assertEqual(el.runs_of(slots, set()), 0)
+
+    def test_clustered_routing_is_detected_out_of_sample(self):
+        import random
+        el = self._mod()
+        rng = random.Random(3)
+        forwards = el.synth_clustered(300, 3, 48, group=6, k=3, rng=rng)
+        scored, _, _ = el.evaluate(forwards)
+        gains = el.gains(scored)
+        # Beating BOTH baselines is the gate; beating only the random control
+        # would mean the metric moves under any permutation.
+        self.assertGreater(gains["vs_identity"], el.GAIN_THRESHOLD)
+        self.assertGreater(gains["vs_random"], el.GAIN_THRESHOLD)
+
+    def test_structureless_routing_reports_no_win(self):
+        # The regression that matters. Scored in-sample this tool claimed a ~9%
+        # read reduction on routing generated with no structure at all —
+        # a fitted-on-the-eval-set artifact that would have justified a
+        # container rewrite for nothing. Held out, it must report ~zero.
+        import random
+        el = self._mod()
+        rng = random.Random(5)
+        forwards = el.synth_uniform(300, 3, 48, k=3, rng=rng)
+        scored, _, _ = el.evaluate(forwards)
+        self.assertLessEqual(el.gains(scored)["vs_identity"], el.GAIN_THRESHOLD)
+
+    def test_report_is_flat_integers_and_verdict_follows_the_rule(self):
+        import random
+        el = self._mod()
+        rng = random.Random(7)
+        forwards = el.synth_clustered(200, 2, 32, group=4, k=2, rng=rng)
+        scored, _, _ = el.evaluate(forwards)
+        gains = el.gains(scored)
+        report = el.report_of(["synthetic"], forwards, scored, gains)
+        for key, value in report["claims"].items():
+            self.assertIsInstance(value, int, f"claim {key} is not an integer")
+        worth = (gains["vs_identity"] > el.GAIN_THRESHOLD
+                 and gains["vs_random"] > el.GAIN_THRESHOLD)
+        self.assertEqual(report["claims"]["worth_engine_slice"], 1 if worth else 0)
+        self.assertEqual(report["claims"]["forwards"], len(forwards))
+
+    def test_emitted_layout_is_a_permutation(self):
+        # A container rewrite consumes this directly, so a dropped or duplicated
+        # expert would corrupt the model rather than merely slow it down.
+        import random
+        el = self._mod()
+        rng = random.Random(9)
+        forwards = el.synth_clustered(120, 3, 24, group=4, k=3, rng=rng)
+        _, placements, by_layer = el.evaluate(forwards)
+        doc = el.permutation_doc(placements, by_layer)
+        self.assertEqual(doc["version"], 1)
+        for layer, order in doc["layers"].items():
+            expected = by_layer[int(layer)]
+            self.assertEqual(sorted(order), sorted(expected),
+                             f"layer {layer}: layout is not a permutation")
+            self.assertEqual(len(order), len(set(order)),
+                             f"layer {layer}: duplicate slot assignment")
+
+
 class LedgerShape(unittest.TestCase):
     """Claims are integers, flat, and scaled the same way everywhere."""
 

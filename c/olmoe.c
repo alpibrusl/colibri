@@ -685,6 +685,17 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             idx[kk] = best; val[kk] = pr[best];
         }
         if (c->norm_topk) { float sm=0; for(int kk=0;kk<K;kk++) sm+=val[kk]; for(int kk=0;kk<K;kk++) val[kk]/=sm; }
+        /* ROUTE_TRACE: the selection this row will actually apply, with its
+         * post-normalization gates — the same bytes colibri.c emits, so
+         * route_pairs.py / route_temporal.py / expert_layout.py read an olmoe
+         * capture unchanged.
+         *
+         * Deliberately rt_trace() and not rt_route(): the heat counters below
+         * stop at hot_pinned, and a trace that stopped with them would
+         * silently truncate every capture that ran long enough to pin — which
+         * is every capture worth taking. route_trace.h keeps the counting and
+         * tracing entry points apart for exactly this case. */
+        rt_trace(layer, s, idx, val, K);
         /* IMPROVEMENT 2: update activation heatmap (before pinning activates) */
         if (!m->hot_pinned && m->freq) {
             uint32_t *freq_l = m->freq[layer];
@@ -702,6 +713,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             for (int d = 0; d < D; d++) os[d] += w * hh[d];
         }
     }
+    rt_trace_end();                 /* one moe() invocation traced; advance the call id */
     free(logits); free(g); free(u); free(hh);
 }
 
