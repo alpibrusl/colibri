@@ -23,8 +23,9 @@ static _Atomic int  producer_done = 0;
 static void *consumer(void *arg){
     (void)arg;
     for(;;){
-        int v, e;
-        if(pilot_ring_claim(&v, &e)){
+        int v, e, o;
+        if(pilot_ring_claim(&v, &e, &o)){
+            (void)o;                                      /* origin (#32): not this test's concern, pilot_ring_claim just has to pass it through untorn */
             if(v < 0 || v >= NITEMS || e != v){          /* out-of-range or mismatched => torn read leaked through */
                 atomic_store_explicit(&torn, 1, memory_order_relaxed);
                 continue;
@@ -51,6 +52,7 @@ int main(void){
             if(w - r < 4096){                            /* ring has space */
                 atomic_store_explicit(&pilot_q[w & 4095].l, i, memory_order_relaxed);
                 atomic_store_explicit(&pilot_q[w & 4095].e, i, memory_order_relaxed);
+                atomic_store_explicit(&pilot_q[w & 4095].o, TIER_ORIGIN_PILOT, memory_order_relaxed);
                 __atomic_store_n(&pilot_w, w+1, __ATOMIC_RELEASE);
                 break;
             }

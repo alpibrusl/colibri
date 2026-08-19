@@ -55,10 +55,11 @@ static int test_expert_layout(int fd){
     if(uring_batch_init(&g_ub_pilot)) return fail("pilot ring init");
     memset(g_pilot_inflight,0,sizeof(g_pilot_inflight));
     atomic_store(&g_cur_moe_layer,-1); atomic_store(&g_pilot_loads,0); atomic_store(&g_pilot_drops,0);
-    pilot_r=0; pilot_w=1; pilot_q[0].l=1; pilot_q[0].e=7;
+    pilot_r=0; pilot_w=1; pilot_q[0].l=1; pilot_q[0].e=7; pilot_q[0].o=TIER_ORIGIN_PILOT;
     pilot_uring_batch(&m);
     bad=m.tc.ecn[1]!=1 || m.tc.ecache[1][0].eid!=7 || g_pilot_inflight[1]!=0
-        || atomic_load(&g_pilot_loads)!=1 || atomic_load(&g_pilot_drops)!=0;
+        || atomic_load(&g_pilot_loads)!=1 || atomic_load(&g_pilot_drops)!=0
+        || sl_origin(&m.tc.ecache[1][0])!=TIER_ORIGIN_PILOT;   /* origin threaded through tier_publish (#32) */
     coli_uring_close(&g_ub_pilot.ring);
     compat_aligned_free(m.tc.ecache[1][0].slab); free(m.tc.ecache[1][0].fslab);
     free(m.tc.ecache[1]);

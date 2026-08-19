@@ -1155,6 +1155,14 @@ static int g_pilot_evict_guard=1;/* PILOT_EVICT_GUARD=0 -> old plain-LRU evictio
                           * demand-loaded expert. Cache placement only -> output byte-identical. (#441/#474) */
 static _Atomic long g_pilot_loads=0;     /* load cross-layer VERI completati (banda spesa) */
 static _Atomic long g_pilot_drops=0;     /* predizioni scartate perche' il main possiede gia' il layer */
+/* Demand hits attributed to a speculative predictor via ESlot.origin (#32): a
+ * demand miss-scan that finds the expert already resident, on a slot PILOT or
+ * COUPLE published and no other demand hit has claimed yet (origin is cleared
+ * to TIER_ORIGIN_DEMAND on the first attribution -- see moe_resolve_block).
+ * Without this, g_pilot_loads/g_cp_enq say what was FETCHED speculatively but
+ * not whether the fetch was ever USED before eviction. */
+static _Atomic long g_pilot_hits=0;
+static _Atomic long g_couple_hits=0;
 /* format from `bits`: >=16 f32, 5..8 int8, 4 int4-packed, 3 int3-g64 (group scales), <=2 int2 */
 static void qt_alloc(QT *t, int O, int I, int bits){
     t->O=O; t->I=I; t->gs=0; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
@@ -4279,7 +4287,15 @@ static int moe_resolve_block(Model *m, int layer, const int *uniq, int base, int
             ESlot *P=m->tc.pin[layer];
             for(int z=0;z<m->tc.npin[layer];z++) if(sl_eid(&P[z])==eid){ m->hits++; m->hit_pin++; use[j]=&P[z]; break; }
             if(!use[j]){ ESlot *Sl=m->tc.ecache[layer]; int nn=__atomic_load_n(&m->tc.ecn[layer],__ATOMIC_RELAXED);
-                for(int z=0;z<nn;z++) if(sl_eid(&Sl[z])==eid){ m->hits++; m->hit_ecache++; sl_used_set(&Sl[z],(uint64_t)__atomic_add_fetch(&m->tc.eclock,1,__ATOMIC_RELAXED)); use[j]=&Sl[z]; break; } }
+                for(int z=0;z<nn;z++) if(sl_eid(&Sl[z])==eid){ m->hits++; m->hit_ecache++; sl_used_set(&Sl[z],(uint64_t)__atomic_add_fetch(&m->tc.eclock,1,__ATOMIC_RELAXED));
+                    /* origin attribution (#32): a demand hit against a slot PILOT or
+                     * COUPLE published is the fetch actually paying off. Cleared to
+                     * DEMAND on this first claim so a slot resident across many demand
+                     * hits is credited once, not on every access. */
+                    int org=sl_origin(&Sl[z]);
+                    if(org==TIER_ORIGIN_PILOT){ atomic_fetch_add_explicit(&g_pilot_hits,1,memory_order_relaxed); sl_origin_set(&Sl[z],TIER_ORIGIN_DEMAND); }
+                    else if(org==TIER_ORIGIN_COUPLE){ atomic_fetch_add_explicit(&g_couple_hits,1,memory_order_relaxed); sl_origin_set(&Sl[z],TIER_ORIGIN_DEMAND); }
+                    use[j]=&Sl[z]; break; } }
             if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++;
                 if(g_disk_split){ if(m->ld_ctx==1) m->miss_draft++; else if(m->ld_ctx==2) m->miss_absorb++; } }
         }
@@ -5158,13 +5174,13 @@ static void la_predict(Model *m, int target, const float *h, int kind){
  * del fadvise BLOCCA (~0.5ms x 169k chiamate = +92s/48 token, misurato) — inline
  * il pilota costava piu' di quanto rendesse. Ring lock-free 1P/1C; pieno = scarta
  * (un hint perso non e' un errore). */
-static struct { _Atomic int l,e; } pilot_q[4096];  /* payload atomico (relaxed): la claim SPMC legge speculativamente prima della CAS e scarta se perde -> senza _Atomic sarebbe una data race C11 col produttore. int e' sempre lock-free: stessa size/align. */
+static struct { _Atomic int l,e,o; } pilot_q[4096];  /* payload atomico (relaxed): la claim SPMC legge speculativamente prima della CAS e scarta se perde -> senza _Atomic sarebbe una data race C11 col produttore. int e' sempre lock-free: stessa size/align. o = TIER_ORIGIN_PILOT/_COUPLE (#32): quale predittore ha messo in coda questo hint, cosi' il load che ne segue puo' pubblicare l'origine corretta sullo slot. */
 static volatile unsigned pilot_w=0, pilot_r=0;
 static Model *pilot_m=NULL;
 /* PILOT_REAL: load VERO dell'expert predetto dentro la LRU del layer FUTURO. Vedi
  * l'invariante di sicurezza accanto a g_pilot_real. Il pread (lento) gira FUORI dal lock;
  * il lock protegge solo la scelta/pubblicazione dello slot e l'handshake col main. */
-static void pilot_realload(Model *m, int layer, int eid){
+static void pilot_realload(Model *m, int layer, int eid, int origin){
     pthread_mutex_lock(&g_pilot_mx);
     if(layer<0 || layer>=256 || layer <= atomic_load_explicit(&g_cur_moe_layer,memory_order_acquire)){
         atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);   /* fuori range (come il ramo URING) o main gia' su questo layer */
@@ -5188,7 +5204,7 @@ static void pilot_realload(Model *m, int layer, int eid){
 
     pthread_mutex_lock(&g_pilot_mx);
     if(rc==0){
-        tier_publish(&m->tc,dst,-1);            /* eid gia' reale (expert_load); timbra used fresco */
+        tier_publish(&m->tc,dst,-1,origin);      /* eid gia' reale (expert_load); timbra used fresco + origin (#32) */
         atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
     } else {
         tier_fail(&m->tc,dst,/*reset_used=*/1); /* prenotazione liberata E used=0: la storia del
@@ -5203,14 +5219,15 @@ static void pilot_realload(Model *m, int layer, int eid){
         fprintf(stderr,"[PILOT] load speculativo abbandonato: layer %d expert %d (I/O error/short read) — nessun impatto sull'output\n",layer,eid);
 }
 #ifdef __linux__
-typedef struct { int layer,eid,li; ESlot *dst; } PilotUringDone;
+typedef struct { int layer,eid,li,origin; ESlot *dst; } PilotUringDone;
 static void pilot_uring_batch(Model *m){
     PilotUringDone done[URING_LOAD_MAX]; int nd=0;
     uring_batch_reset(&g_ub_pilot);
     unsigned r=__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE);
     unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_ACQUIRE);
     while(r!=w && nd<URING_LOAD_MAX){
-        int layer=atomic_load_explicit(&pilot_q[r&4095].l,memory_order_relaxed),eid=atomic_load_explicit(&pilot_q[r&4095].e,memory_order_relaxed); r++;
+        int layer=atomic_load_explicit(&pilot_q[r&4095].l,memory_order_relaxed),eid=atomic_load_explicit(&pilot_q[r&4095].e,memory_order_relaxed);
+        int origin=atomic_load_explicit(&pilot_q[r&4095].o,memory_order_relaxed); r++;
         if(layer<0 || layer>=256){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); continue; }
         pthread_mutex_lock(&g_pilot_mx);
         if(layer<=atomic_load_explicit(&g_cur_moe_layer,memory_order_acquire)){
@@ -5232,7 +5249,7 @@ static void pilot_uring_batch(Model *m){
             pthread_cond_broadcast(&g_pilot_cv); pthread_mutex_unlock(&g_pilot_mx);
             atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); continue;
         }
-        done[nd++]=(PilotUringDone){layer,eid,li,dst};
+        done[nd++]=(PilotUringDone){layer,eid,li,origin,dst};
     }
     __atomic_store_n(&pilot_r,r,__ATOMIC_RELEASE);
     if(!nd) return;
@@ -5247,7 +5264,7 @@ static void pilot_uring_batch(Model *m){
         int rc=uring_finalize_load(&g_ub_pilot,d->li,0);
         pthread_mutex_lock(&g_pilot_mx);
         if(rc==0){
-            tier_publish(&m->tc,d->dst,d->eid);
+            tier_publish(&m->tc,d->dst,d->eid,d->origin);
             atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
         }else{
             tier_fail(&m->tc,d->dst,0);
@@ -5264,7 +5281,7 @@ static void pilot_uring_batch(Model *m){
 /* SPMC ring claim: each of N pilot workers grabs a UNIQUE ring index via CAS, never
  * advancing past pilot_w. Returns 1 and *out=index, or 0 if the ring is empty. The
  * producer stays single (main thread, only pilot_w) — this only splits the consumer. */
-static int pilot_ring_claim(int *out_l, int *out_e){
+static int pilot_ring_claim(int *out_l, int *out_e, int *out_o){
     for(;;){
         unsigned r=__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE);
         unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_ACQUIRE);
@@ -5275,9 +5292,10 @@ static int pilot_ring_claim(int *out_l, int *out_e){
          * is valid. If it fails, another worker advanced pilot_r; we discard and retry
          * (a torn read there is thrown away, never used). */
         int l=atomic_load_explicit(&pilot_q[r&4095].l,memory_order_relaxed), e=atomic_load_explicit(&pilot_q[r&4095].e,memory_order_relaxed);
+        int o=atomic_load_explicit(&pilot_q[r&4095].o,memory_order_relaxed);
         if(__atomic_compare_exchange_n(&pilot_r,&r,r+1,/*weak=*/1,
                                        __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){
-            *out_l=l; *out_e=e; return 1;                /* claimed exactly one item, payload valid */
+            *out_l=l; *out_e=e; *out_o=o; return 1;      /* claimed exactly one item, payload valid */
         }
         /* lost the CAS race to another worker -> retry */
     }
@@ -5294,10 +5312,10 @@ static void *pilot_worker(void *arg){
             continue;
         }
 #endif
-        int l,e;                                        /* blocking / hint path: SPMC, one item per worker */
-        if(!pilot_ring_claim(&l,&e)){ usleep(200); continue; }
-        if(g_pilot_real) pilot_realload(pilot_m, l, e); /* QD=N: N concurrent preads instead of 1 */
-        else             expert_prefetch(pilot_m, l, e);
+        int l,e,o;                                      /* blocking / hint path: SPMC, one item per worker */
+        if(!pilot_ring_claim(&l,&e,&o)){ usleep(200); continue; }
+        if(g_pilot_real) pilot_realload(pilot_m, l, e, o); /* QD=N: N concurrent preads instead of 1 */
+        else             expert_prefetch(pilot_m, l, e);   /* fadvise-only hint: never touches an ESlot, no origin to carry */
     }
     return NULL;
 }
@@ -5379,6 +5397,7 @@ static void couple_prefetch(Model *m, int layer, const int *idx, int Ke){
                 unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
                 if(w-__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE)<4096){
                     atomic_store_explicit(&pilot_q[w&4095].l,lt,memory_order_relaxed); atomic_store_explicit(&pilot_q[w&4095].e,best,memory_order_relaxed);
+                    atomic_store_explicit(&pilot_q[w&4095].o,TIER_ORIGIN_COUPLE,memory_order_relaxed);
                     __atomic_store_n(&pilot_w,w+1,__ATOMIC_RELEASE);
                     g_cp_enq++;
                 }
@@ -5436,6 +5455,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
                 unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
                 if(w-__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE)<4096){
                     atomic_store_explicit(&pilot_q[w&4095].l,lnext,memory_order_relaxed); atomic_store_explicit(&pilot_q[w&4095].e,best,memory_order_relaxed);
+                    atomic_store_explicit(&pilot_q[w&4095].o,TIER_ORIGIN_PILOT,memory_order_relaxed);
                     __atomic_store_n(&pilot_w,w+1,__ATOMIC_RELEASE);
                 }
             }
@@ -6876,6 +6896,14 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     if(g_pilot_real) printf("PILOT_REAL: %ld load cross-layer completati, %ld scartati (main gia' sul layer) | PILOT_K=%d\n",
         (long)atomic_load_explicit(&g_pilot_loads,memory_order_relaxed),
         (long)atomic_load_explicit(&g_pilot_drops,memory_order_relaxed), g_pilot_k);
+    /* origin-attributed hits (#32): of the loads above, how many were still resident
+     * when demand needed that expert -- the fetch actually paying off, not just
+     * completing. Both predictors publish through the same PILOT_REAL machinery
+     * (COUPLE only enqueues; pilot_realload/pilot_uring_batch does the real load),
+     * so this line is gated the same way. */
+    if(g_pilot_real) printf("origin-attributed hits: PILOT %ld, COUPLE %ld (demand hit against a still-resident speculative slot)\n",
+        (long)atomic_load_explicit(&g_pilot_hits,memory_order_relaxed),
+        (long)atomic_load_explicit(&g_couple_hits,memory_order_relaxed));
     if(g_pilot_two) printf("PILOT_TWO: two-step shared-expert-corrected prefetch active (3 extra matmuls/prediction)\n");
     if(g_looka){
         const char *nm[4]={"previous token (=SPEC prefetch)","layer input, skip attention","next layer (PILOT, stale)","next layer (two-step, shared-expert)"};

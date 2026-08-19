@@ -34,7 +34,21 @@ typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
                   * slices of a per-layer arena and must never be free()d —
                   * expert_host_release detaches them, expert_host_ensure
                   * re-attaches. NULL for every individually-allocated slot. */
-                 uint8_t *aslab; float *afslab; } ESlot;
+                 uint8_t *aslab; float *afslab;
+                 /* which predictor published this slot (#32): stamped by tier_publish
+                  * (PILOT/COUPLE) or tier_promote (DEMAND — moe()'s own miss path),
+                  * read and cleared to DEMAND on the first demand hit. Without this,
+                  * a demand hit against an already-resident slot cannot tell "COUPLE
+                  * fetched this ahead of need" from "the LRU just kept it warm" —
+                  * the gap that left COUPLE/PILOT hit rates unattributable. Cleared
+                  * (not left stamped) on first hit so a slot that stays resident
+                  * across many demand hits is credited once, not every access. */
+                 int origin; } ESlot;
+
+#define TIER_ORIGIN_DEMAND 0   /* moe()'s own miss path (tier_promote), or an
+                                 * attributed hit already claimed and cleared */
+#define TIER_ORIGIN_PILOT  1   /* published by a PILOT_REAL speculative load */
+#define TIER_ORIGIN_COUPLE 2   /* published by a COUPLE-conditioned speculative load */
 
 static void eslot_acquire(ESlot *s){ __atomic_add_fetch(&s->in_flight,1,__ATOMIC_ACQ_REL); }
 static void eslot_release(ESlot *s){
@@ -61,6 +75,8 @@ static inline int      sl_eid(const ESlot *s){ return __atomic_load_n(&s->eid,__
 static inline void     sl_eid_set(ESlot *s,int v){ __atomic_store_n(&s->eid,v,__ATOMIC_RELAXED); }
 static inline uint64_t sl_used(const ESlot *s){ return __atomic_load_n(&s->used,__ATOMIC_RELAXED); }
 static inline void     sl_used_set(ESlot *s,uint64_t v){ __atomic_store_n(&s->used,v,__ATOMIC_RELAXED); }
+static inline int      sl_origin(const ESlot *s){ return __atomic_load_n(&s->origin,__ATOMIC_RELAXED); }
+static inline void     sl_origin_set(ESlot *s,int v){ __atomic_store_n(&s->origin,v,__ATOMIC_RELAXED); }
 static inline uint32_t u32_ld(const uint32_t *p){ return __atomic_load_n(p,__ATOMIC_RELAXED); }
 static inline void     u32_st(uint32_t *p,uint32_t v){ __atomic_store_n(p,v,__ATOMIC_RELAXED); }
 
@@ -187,10 +203,13 @@ static int tier_reserve(TierCache *tc,int layer,int eid,int evict_guard,
 
 /* Pubblica un load riuscito: eid>=0 lo scrive (ramo URING); eid<0 = l'eid
  * e' gia' stato scritto dal loader (ramo pread). In entrambi i casi timbra
- * used con un tick fresco di eclock. */
-static void tier_publish(TierCache *tc,ESlot *dst,int eid){
+ * used con un tick fresco di eclock, e origin (#32) con chi l'ha predetto --
+ * TIER_ORIGIN_PILOT o _COUPLE, mai _DEMAND: questa funzione pubblica solo
+ * load speculativi (il ramo demand pubblica via tier_promote). */
+static void tier_publish(TierCache *tc,ESlot *dst,int eid,int origin){
     if(eid>=0) sl_eid_set(dst,eid);
     sl_used_set(dst,(uint64_t)__atomic_add_fetch(&tc->eclock,1,__ATOMIC_RELAXED));
+    sl_origin_set(dst,origin);
 }
 
 /* Load fallito: libera la prenotazione. reset_used=1 (ramo pread) riporta
@@ -244,6 +263,10 @@ static void tier_promote(TierCache *tc,int layer,ESlot *ws,int nmiss){
                dst=&Sl[lru]; }
         ESlot tmp=*dst; *dst=ws[q]; ws[q]=tmp;
         sl_used_set(dst,(uint64_t)__atomic_add_fetch(&tc->eclock,1,__ATOMIC_RELAXED));
+        /* ws[] is always demand-loaded (moe()'s own miss path, #32): the swap just
+         * carried over whatever origin the staging slot happened to hold from its
+         * PREVIOUS occupant, so stamp DEMAND explicitly rather than publish it. */
+        sl_origin_set(dst,TIER_ORIGIN_DEMAND);
     }
 }
 
