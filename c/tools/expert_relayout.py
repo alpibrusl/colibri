@@ -323,6 +323,31 @@ def byte_ranges(src):
     return out
 
 
+def byte_ranges_castore(src):
+    """The read pattern a content-addressed store would give (#14).
+
+    In a CA store every tensor is its own blob file, so two tensors can never be
+    adjacent and no read ever merges with another. Modelling that needs no CA
+    store on disk: take the same tensors and give each one its OWN shard id, and
+    count_reads' merge condition (same shard, touching ranges) can never fire.
+
+    That is not a simplification -- it is exactly what the layout does. It is
+    also why this number matters: #36 made the container faster by putting
+    co-activating experts ADJACENT, and content addressing makes adjacency
+    impossible by construction. The two pull in opposite directions, and this
+    prices the tension instead of arguing about it.
+    """
+    out = {}
+    sid = 0
+    for (layer, expert), segs in sorted(byte_ranges(src).items()):
+        placed = []
+        for _old_sid, a, b in segs:
+            placed.append((sid, a, b))     # one synthetic shard per tensor
+            sid += 1
+        out[(layer, expert)] = placed
+    return out
+
+
 def routed_sets(trace):
     """{(call, layer): set(expert)} from a ROUTE_TRACE dump.
 
@@ -386,6 +411,12 @@ def measure(trace, before_dir, after_dir):
         print(f"  {label:9s} reads {r:8d}   bytes {moved/1e9:7.2f} GB   mean read {moved/r/1e6:6.2f} MB")
     after, _ = count_reads(per, byte_ranges(after_dir))
     print(f"  read reduction {1 - after/base:+.3f} at identical bytes moved")
+    # What the same tensors would cost with no adjacency at all (#14).
+    ca, ca_bytes = count_reads(per, byte_ranges_castore(before_dir))
+    print(f"  {'castore':9s} reads {ca:8d}   bytes {ca_bytes/1e9:7.2f} GB   "
+          f"mean read {ca_bytes/ca/1e6:6.2f} MB")
+    print(f"  content addressing costs {ca/after:.2f}x the reads of the relaid layout, "
+          f"{ca/base:.2f}x the original")
 
 
 # ---------------------------------------------------------------- selftest
