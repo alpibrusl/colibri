@@ -2395,6 +2395,15 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
                 atomic_fetch_add_explicit(&g_mir_bytes[rep],tw[k]->nbytes+tq[k]->nbytes,memory_order_relaxed);
             }
             atomic_fetch_add_explicit(&g_mir_nread[rep],1,memory_order_relaxed);
+            /* #13: the pre-touch above already faulted every page of this expert
+             * in, so verifying here costs CPU and no extra I/O -- and it is the
+             * only chance: under mmap the engine computes straight out of the
+             * mapping, so nothing downstream ever copies these bytes past a seam
+             * where they could be checked. No-op without a checksum map. */
+            for(int k=0;k<3;k++){
+                st_verify_once(&m->S, tw[k], (const char*)bw[k]+tw[k]->off, tw[k]->nbytes);
+                st_verify_once(&m->S, tq[k], (const char*)bq[k]+tq[k]->off, tq[k]->nbytes);
+            }
             sl_eid_set(s,eid); return 0;
         }
     }
@@ -2794,6 +2803,13 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
         qt_verify_fmt_stamp(l->tw[k]->name,stamped,fmt);
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+l->pos[k]); qt[k]->q4=s->slab+l->pos[k]; qt[k]->s=fp[k];
+    }
+    /* #13: the io_uring completions have landed and the slabs hold this expert's
+     * bytes, unread. Same first-touch contract as the pread path in
+     * expert_load_impl; this is the other way an expert reaches a slot. */
+    for(int k=0;k<3;k++){
+        st_verify_once(&l->m->S, l->tw[k], s->slab+l->pos[k], l->tw[k]->nbytes);
+        st_verify_once(&l->m->S, l->tq[k], (const char*)fp[k], l->tq[k]->nbytes);
     }
     if(publish_eid) sl_eid_set(s,l->eid);
     l->finalized=1; return 0;
