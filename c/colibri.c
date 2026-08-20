@@ -2355,7 +2355,17 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
             for(int k=0;k<3;k++){
                 int64_t nb=tw[k]->nbytes;
                 int gs=0;
-                int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs,NULL);   /* routed expert: never stamped */
+                /* #13: routed experts consult the stamp too. They used to pass NULL because
+                 * no tool stamped them -- which left the bulk of a MoE's weights on
+                 * byte-arithmetic inference alone, including through the collision paths
+                 * qt_resolve_fmt itself calls a design landmine. st_fmt_stamp is O(1) since
+                 * st.h's stamp index, so this costs a hash per expert load rather than the
+                 * scan that measured tens of seconds per token at GLM's tensor count.
+                 * Unstamped containers are unaffected: the lookup returns NULL and every
+                 * decision below is the same byte arithmetic as before. */
+                const char *stamped=st_fmt_stamp(&m->S,tw[k]->name);
+                int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs,stamped);
+                qt_verify_fmt_stamp(tw[k]->name,stamped,fmt);
                 qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
                 qt[k]->q8=(int8_t*)((char*)bw[k]+tw[k]->off); qt[k]->q4=(uint8_t*)((char*)bw[k]+tw[k]->off);
                 qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
@@ -2553,7 +2563,17 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     for(int k=0;k<3;k++){
         int64_t nb=tw[k]->nbytes;
         int gs=0;
-        int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs,NULL);   /* routed expert: never stamped */
+        /* #13: routed experts consult the stamp too. They used to pass NULL because
+         * no tool stamped them -- which left the bulk of a MoE's weights on
+         * byte-arithmetic inference alone, including through the collision paths
+         * qt_resolve_fmt itself calls a design landmine. st_fmt_stamp is O(1) since
+         * st.h's stamp index, so this costs a hash per expert load rather than the
+         * scan that measured tens of seconds per token at GLM's tensor count.
+         * Unstamped containers are unaffected: the lookup returns NULL and every
+         * decision below is the same byte arithmetic as before. */
+        const char *stamped=st_fmt_stamp(&m->S,tw[k]->name);
+        int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs,stamped);
+        qt_verify_fmt_stamp(tw[k]->name,stamped,fmt);
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
     }
@@ -2752,7 +2772,17 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
         /* qt_resolve_fmt like the other two expert paths: the raw ?1:?2:3 inference here
          * missed grouped int4 (fmt=4, gs never set) and would mis-tag int3-g64 as int2. */
         int gs=0;
-        int fmt=qt_resolve_fmt(l->tw[k]->name,OO[k],II[k],nb,l->tq[k]->nbytes,&gs,NULL);   /* routed expert: never stamped */
+        /* #13: routed experts consult the stamp too. They used to pass NULL because
+         * no tool stamped them -- which left the bulk of a MoE's weights on
+         * byte-arithmetic inference alone, including through the collision paths
+         * qt_resolve_fmt itself calls a design landmine. st_fmt_stamp is O(1) since
+         * st.h's stamp index, so this costs a hash per expert load rather than the
+         * scan that measured tens of seconds per token at GLM's tensor count.
+         * Unstamped containers are unaffected: the lookup returns NULL and every
+         * decision below is the same byte arithmetic as before. */
+        const char *stamped=st_fmt_stamp(&m->S,l->tw[k]->name);
+        int fmt=qt_resolve_fmt(l->tw[k]->name,OO[k],II[k],nb,l->tq[k]->nbytes,&gs,stamped);
+        qt_verify_fmt_stamp(l->tw[k]->name,stamped,fmt);
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+l->pos[k]); qt[k]->q4=s->slab+l->pos[k]; qt[k]->s=fp[k];
     }

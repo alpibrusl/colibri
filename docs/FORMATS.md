@@ -325,33 +325,53 @@ this revision):
   completeness of a stamping tool's coverage is a writer-side guarantee
   (a load-time coverage diagnostic is deferred, not implied).
 
-### Stamp-map scan bound
+### Stamp-map bound
 
-`st_fmt_stamp_ingest` (`c/st.h`) caps the total number of stamped-tensor
-entries it will ingest across a container's shards at `ST_FMT_STAMP_MAX`
-(4096) and refuses loudly (`exit(1)`) if a container's combined
-`__metadata__["colibri.fmt"]` entries exceed it. This is a **cap, not a
-switch to a hash table**: stamps are a resident-tensor convention — a
-handful to a few hundred tensors per model (`q_a`/`q_b`/`kv_a`/`kv_b_proj`,
+`st_fmt_stamp_ingest` (`c/st.h`) enforces two bounds on the stamped-tensor
+entries it ingests across a container's shards:
+
+- **the tight one** — a stamp map may not name more tensors than the container
+  holds. Checked in `st_init_multi` once `S->n` is final, and refuses loudly
+  (`exit(1)`). A map padded with entries for tensors that do not exist is
+  malformed or hostile, and this catches it exactly.
+- **an absolute ceiling**, `ST_FMT_STAMP_MAX` (2²⁰), which only bounds memory
+  while shards are still streaming in and the container's tensor count is not
+  yet known. No honest container approaches it.
+
+This replaces an earlier 4096-entry cap, described as a **cap, not a switch to
+a hash table**, on the reasoning that stamps are a resident-tensor convention —
+a handful to a few hundred tensors per model (`q_a`/`q_b`/`kv_a`/`kv_b_proj`,
 `o_proj`, shared-expert and dense-MLP gate/up/down; see the resident-role
-census in `c/tools/fp8_collision_census.py`), **never** the tens of
-thousands of routed-expert tensors a large MoE checkpoint carries. A
-container whose combined stamp map exceeds 4096 entries is not using this
-convention as it's designed to be used. To be precise about what the cap
-bounds: the `colibri.fmt` blob is JSON-parsed in full **before** the
-per-entry cap is checked, so the parse allocation itself is bounded by the
-shard-header size cap (`ST_MAX_HEADER`), not by this constant — what the
-cap bounds is the **persistent** per-tensor arrays (`fmt_name`/`fmt_val`
-strdups on `shards`) that would otherwise grow with an adversarial map,
-plus every later `st_fmt_stamp` linear scan over them. Refusing loudly at
-that bound is the same "untrusted container, refuse rather than guess"
-discipline `qt_resolve_fmt` applies everywhere else in this feature.
+census in `c/tools/fp8_collision_census.py`), **never** the tens of thousands
+of routed-expert tensors a large MoE checkpoint carries.
+
+[#13](https://github.com/alpibrusl/colibri/issues/13) overturns that premise: a
+*mandatory* format tag means routed experts carry one too, and GLM-5.2 alone has
+roughly 120k routed-expert tensors. Three things assumed stamps stay small, and
+the cap was only the most visible:
+
+| assumption | was | now |
+|---|---|---|
+| ingest de-duplication | linear rescan per entry, O(n²) | hash lookup, O(1) |
+| `st_fmt_stamp` lookup | linear scan, on the routed-expert load path | hash lookup, O(1) |
+| entry count | capped at 4096 | bounded by the container's own tensor count |
+
+Raising the cap alone would have moved a measured cost rather than removed it:
+the linear scan over ~120k names is the same shape that cost *tens of seconds
+per token* on the first real GLM run and put a hash index on the tensor table in
+the first place. Both scans are now open-addressed indexes sharing `st_hash`.
+
+To be precise about what the ceiling bounds: the `colibri.fmt` blob is
+JSON-parsed in full **before** the per-entry check fires, so the parse
+allocation is bounded by the shard-header size cap (`ST_MAX_HEADER`), not by
+this constant — what it bounds is the **persistent** per-tensor arrays
+(`fmt_name`/`fmt_val` strdups on `shards`).
 
 ### Discovery-time abort surface
 
 `st_fmt_stamp_ingest`'s `exit(1)` calls (a `colibri.fmt` value that isn't a
 JSON string, one that doesn't parse to a JSON object, an entry whose value
-isn't a string, or the 4096-entry cap above) all fire from inside
+isn't a string, or either entry-count bound above) all fire from inside
 `st_init_multi`'s shard-header-parse loop — i.e. at **container discovery
 time**, while the engine is still building its tensor index, before it has
 resolved a single tensor against the model's architecture or read one byte
