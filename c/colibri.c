@@ -6832,6 +6832,30 @@ static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens,
 /* Fixed-token decode benchmark: prefill all but the prompt's last token, then
  * replay the oracle sequence one token at a time. CPU and CUDA therefore see
  * identical hidden-state inputs even if their argmax predictions differ. */
+/* The speculative-prefetch verdict (#32/#39), shared by every path that reports
+ * COUPLE stats. `couple:` (hints enqueued) was already printed by both run_replay
+ * and run_text; these two lines were added to run_text only, so the oracle/replay
+ * path -- the DEFAULT invocation, and the one the canonical gate uses -- showed
+ * what was fetched speculatively and never whether any of it paid off. One
+ * function, called from both, because "the fix lands in one engine and not its
+ * siblings" is this tree's documented recurring defect shape (route_trace.h:373).
+ *
+ *   attributed hits: of the speculative loads, how many were still resident when
+ *   demand arrived -- the fetch paying off, not merely completing. Gated on
+ *   PILOT_REAL, the only path that stamps a slot origin at all.
+ *
+ *   drift: those hits as a rate against the hints enqueued, EWMA'd, plus whether
+ *   the COUPLE table still matches this workload. Silent until a window closes,
+ *   so a run too short to measure reports nothing rather than a number built
+ *   from one partial window. */
+static void couple_attribution_report(void){
+    if(g_pilot_real) printf("origin-attributed hits: PILOT %ld, COUPLE %ld (demand hit against a still-resident speculative slot)\n",
+        (long)atomic_load_explicit(&g_pilot_hits,memory_order_relaxed),
+        (long)atomic_load_explicit(&g_couple_hits,memory_order_relaxed));
+    if(g_cp_windows) printf("couple drift: hit rate %.1f%% (EWMA over %ld windows of %d hints)%s\n",
+        100.0*g_cp_ewma,g_cp_windows,CP_DRIFT_WIN,
+        g_cp_stale?" — STALE, rebuild the table from recent ROUTE_TRACE":"");
+}
 static void run_replay(Model *m, const int *full, int nfull, int np){
     if(np<2||nfull<=np){ fprintf(stderr,"REPLAY requires a non-empty prompt and continuation\n"); return; }
     kv_alloc(m,nfull+2);
@@ -6850,6 +6874,7 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
     printf("REPLAY decode: %d tokens in %.3fs | %.2f tok/s | expert hit %.1f%%\n",
         steps,dt,steps/dt,tot?100.0*m->hits/tot:0.0);
     if(g_cp_enq) printf("couple: %ld cross-layer prefetch hints enqueued\n",g_cp_enq);
+    couple_attribution_report();
     profile_print(m,dt);
     if(g_prof) prof_report(m,&pb,dt,steps,stdout);
 #ifdef COLI_CUDA
@@ -6961,21 +6986,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     if(g_pilot_real) printf("PILOT_REAL: %ld load cross-layer completati, %ld scartati (main gia' sul layer) | PILOT_K=%d\n",
         (long)atomic_load_explicit(&g_pilot_loads,memory_order_relaxed),
         (long)atomic_load_explicit(&g_pilot_drops,memory_order_relaxed), g_pilot_k);
-    /* origin-attributed hits (#32): of the loads above, how many were still resident
-     * when demand needed that expert -- the fetch actually paying off, not just
-     * completing. Both predictors publish through the same PILOT_REAL machinery
-     * (COUPLE only enqueues; pilot_realload/pilot_uring_batch does the real load),
-     * so this line is gated the same way. */
-    if(g_pilot_real) printf("origin-attributed hits: PILOT %ld, COUPLE %ld (demand hit against a still-resident speculative slot)\n",
-        (long)atomic_load_explicit(&g_pilot_hits,memory_order_relaxed),
-        (long)atomic_load_explicit(&g_couple_hits,memory_order_relaxed));
-    /* the same two counters as a live rate, plus whether the COUPLE table still
-     * matches this workload (#32). Reported whenever a window closed, so a run too
-     * short to measure says nothing rather than reporting a number built from one
-     * partial window. */
-    if(g_cp_windows) printf("couple drift: hit rate %.1f%% (EWMA over %ld windows of %d hints)%s\n",
-        100.0*g_cp_ewma,g_cp_windows,CP_DRIFT_WIN,
-        g_cp_stale?" — STALE, rebuild the table from recent ROUTE_TRACE":"");
+    couple_attribution_report();
     if(g_pilot_two) printf("PILOT_TWO: two-step shared-expert-corrected prefetch active (3 extra matmuls/prediction)\n");
     if(g_looka){
         const char *nm[4]={"previous token (=SPEC prefetch)","layer input, skip attention","next layer (PILOT, stale)","next layer (two-step, shared-expert)"};
