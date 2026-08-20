@@ -456,3 +456,48 @@ assignment at all.
   the DeepSeek-V4 datapoint above: it's a declared property. f32 is this PR
   pair's implemented value; UE8M0 is recognized and refused by name, an
   invited follow-up rather than a blocking requirement.
+
+## Entropy containers: CFS1 retired, rANS is the one
+
+`fse_coli.h` (the CFS1 container) and its packer `cfse_pack.c` were removed on
+2026-08-20, closing the retire-or-wire question
+[#13](https://github.com/alpibrusl/colibri/issues/13) left open. The engine
+never had a reader for CFS1 — `cfse_pack.c` was its only consumer, and that
+tool had no build target of its own; only `tests/test_cfse_bounds` compiled it,
+white-box, to bound a codec nothing shipped. `tests/test_fse.c` was already on
+the Makefile's list of tests that deliberately have no rule.
+
+Its own header said so: *"entropy coder di casa per il container colibrì
+(LOCALE, non pushato)"*.
+
+It was also the same idea as what replaced it — order-0 rANS over nibbles,
+normalized frequencies, interleaved states. `rans.h` is that idea finished:
+fuzzed (`tests/fuzz_rans.c`), tested across four decode paths, exposed to the
+Python tooling through `tools/rans_ctypes.c`, with a real repack tool and a
+documented on-disk record. Carrying a second, unmaintained entropy container
+that touches the weights bought nothing and cost an audit surface — CFS1's own
+header notes that a bug there "corrompe l'output del modello in silenzio".
+
+Retired rather than wired, because there was nothing to wire it into that
+`rans.h` does not already serve better. It remains in git history.
+
+## rANS decompression-amplification bound
+
+`rans_record_parse` bounds `n_symbols` at `payload_len * 8 * M_max` — the
+tightest a format-level reader can state knowing nothing about what it reads,
+since a symbol costs at least `log2(M/(M-1))` bits under any admissible table.
+That still admits **payload × 2¹⁸**: enough headroom for a hostile record to
+make a consumer size a buffer a quarter of a million times larger than the
+bytes that justified it.
+
+A consumer decoding a *tensor* does not need that headroom. It knows the
+geometry from the container — an int4 `[O,I]` weight is exactly `O*I` nibbles,
+and `.qs` already pins the scale count. `rans_record_parse_expect` takes that
+count and refuses `RANS_E_SYMBOL_COUNT` on a mismatch, turning an amplification
+ceiling into an equality: the difference between "this cannot be absurd" and
+"this is what it must be".
+
+`expected_symbols == 0` means the caller genuinely has no expectation (a
+fuzzer, a format inspector) and gets the generic bound alone.
+`rans_record_parse`'s signature is deliberately unchanged — it is exposed
+through `tools/rans_ctypes.c`.

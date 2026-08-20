@@ -803,6 +803,48 @@ static void test_nstreams_and_alignment(void) {
  * fixture (the runtime selftest asserts the same on its fixture): the
  * multi-byte renorm band the sabotage exercise proved load-bearing must
  * actually be visited, or the identity sweep is running blind. */
+static void test_expected_symbol_count(void) {
+    /* #13: rans_record_parse's amplification bound is the tightest a
+     * format-level reader can state without knowing what it reads -- and it
+     * still admits payload x 2^18. A caller decoding a TENSOR knows the exact
+     * symbol count from the container geometry, so it gets an equality. */
+    enum { N = 4 };
+    uint64_t n = 4096;
+    uint8_t *nib = (uint8_t *)malloc(n);
+    for (uint64_t i = 0; i < n; i++) nib[i] = (uint8_t)(i & 15u);
+    test_table tt; tt_from_hist(&tt, 12, nib, (size_t)n);
+    uint64_t rec_len = 0;
+    uint8_t *buf = make_record(nib, n, &tt, N, &rec_len);
+    rans_record rec;
+
+    CHECK(rans_record_parse_expect(buf, rec_len, N, n, &rec) == RANS_OK,
+          "expect: the true count must parse");
+    CHECK(rec.n_symbols == n, "expect: n_symbols preserved");
+
+    /* a disagreeing count is refused BY NAME, and leaves nothing usable --
+     * TRUST-VERIFY-REFUSE, same as every other malformation class here */
+    memset(&rec, 0xAB, sizeof rec);
+    CHECK(rans_record_parse_expect(buf, rec_len, N, n + 1, &rec) == RANS_E_SYMBOL_COUNT,
+          "expect: n+1 must be refused");
+    CHECK(rec.n_symbols == 0 && rec.payload == NULL,
+          "expect: a refused record must not be partially accepted");
+    CHECK(rans_record_parse_expect(buf, rec_len, N, n - 1, &rec) == RANS_E_SYMBOL_COUNT,
+          "expect: n-1 must be refused");
+
+    /* 0 means the caller has no expectation (a fuzzer, a format inspector):
+     * identical to the plain parse, so the generic bound is what applies */
+    CHECK(rans_record_parse_expect(buf, rec_len, N, 0, &rec) == RANS_OK,
+          "expect: 0 means no expectation");
+    CHECK(rec.n_symbols == n, "expect: 0 still yields the record");
+
+    /* a malformation still wins over the count check: the caller must learn the
+     * record is broken, not that its count disagrees */
+    CHECK(rans_record_parse_expect(buf, 4, N, n, &rec) == RANS_E_TRUNCATED,
+          "expect: parse errors take precedence");
+
+    free(buf); free(nib); tt_free(&tt);
+}
+
 static void test_band_coverage(void) {
     const uint64_t n = 32768;
     uint8_t *d = (uint8_t *)malloc(n);
@@ -854,6 +896,7 @@ int main(void) {
     test_uncodable_input();
     test_nstreams_and_alignment();
     test_band_coverage();
+    test_expected_symbol_count();
     if (failures) {
         printf("test_rans: FAIL (%d)\n", failures);
         return 1;
