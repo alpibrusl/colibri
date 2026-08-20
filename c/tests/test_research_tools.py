@@ -211,6 +211,123 @@ class ExpertLayout(unittest.TestCase):
                              f"layer {layer}: duplicate slot assignment")
 
 
+class ExpertRelayout(unittest.TestCase):
+    """#36's container half: reorder the bytes, change nothing else."""
+
+    def _mod(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "expert_relayout", TOOLS / "expert_relayout.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_selftest(self):
+        proc = _run("expert_relayout.py")
+        self.assertEqual(proc.returncode, 0,
+                         f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        self.assertIn("selftest: ok", proc.stdout)
+
+    def _container(self, root, layers=2, experts=6, kinds=(("qs", 16), ("w", 96))):
+        """A container with the real pathology: all scales, then all weights."""
+        import json as _json
+        import struct as _struct
+        root.mkdir(parents=True, exist_ok=True)
+        names = []
+        for kind, size in kinds:
+            for layer in range(layers):
+                for eid in sorted(range(experts), key=str):   # lexicographic, as the real one is
+                    names.append((f"model.layers.{layer}.mlp.experts.{eid}.{kind}", size))
+        blobs = {n: bytes((i * 31 + j) % 251 for j in range(sz))
+                 for i, (n, sz) in enumerate(names)}
+        header, cursor = {}, 0
+        for n, sz in names:
+            header[n] = {"dtype": "U8", "shape": [sz], "data_offsets": [cursor, cursor + sz]}
+            cursor += sz
+        blob = _json.dumps(header, separators=(",", ":")).encode()
+        with open(root / "model-00000.safetensors", "wb") as fh:
+            fh.write(_struct.pack("<Q", len(blob)))
+            fh.write(blob)
+            for n, _ in names:
+                fh.write(blobs[n])
+        return len(names)
+
+    def test_rewrite_preserves_every_byte(self):
+        # The entire safety argument. A rewrite that changed one byte would
+        # change the model, and the failure would look like a quality
+        # regression rather than a corrupt file.
+        import tempfile
+        from pathlib import Path
+        er = self._mod()
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dst = Path(tmp) / "src", Path(tmp) / "dst"
+            n = self._container(src)
+            tensors, order, meta = er.index_container(str(src))
+            self.assertEqual(len(tensors), n)
+            perm = {"version": 1, "layers": {"0": [5, 4, 3, 2, 1, 0],
+                                             "1": [0, 2, 4, 1, 3, 5]}}
+            new, dropped = er.emission_order(tensors, order, perm)
+            self.assertEqual(dropped, 0)
+            er.write_container(new, str(dst), shard_bytes=1 << 20, metadata=meta)
+            self.assertEqual(er.verify(tensors, str(dst)), [])
+
+    def test_expert_tensors_become_adjacent(self):
+        # The within-expert win: the real merged container puts every .qs in
+        # one region and every weight in another, so the two reads olmoe.c
+        # issues per expert land far apart.
+        import tempfile
+        from pathlib import Path
+        er = self._mod()
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src"
+            self._container(src)
+            tensors, order, _ = er.index_container(str(src))
+            perm = {"version": 1, "layers": {"0": list(range(6)), "1": list(range(6))}}
+            new, _ = er.emission_order(tensors, order, perm)
+            self.assertGreater(er.locality([tensors[n] for n in order]), 0)
+            self.assertEqual(er.locality(new), 0)
+
+    def test_expert_absent_from_permutation_survives(self):
+        # A permutation is fitted on a trace, which only names experts that
+        # trace routed to. The container must still carry all of them.
+        import tempfile
+        from pathlib import Path
+        er = self._mod()
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src"
+            n = self._container(src)
+            tensors, order, _ = er.index_container(str(src))
+            new, dropped = er.emission_order(
+                tensors, order, {"version": 1, "layers": {"0": [4, 2]}})
+            self.assertEqual(len(new), n, "rewrite lost tensors")
+            self.assertEqual(sorted(e["name"] for e in new), sorted(tensors))
+            self.assertGreater(dropped, 0)
+
+    def test_measured_reads_drop_for_a_clustered_layout(self):
+        # End to end against real header offsets: fewer, longer reads at
+        # identical bytes moved, which is #36's actual claim.
+        import tempfile
+        from pathlib import Path
+        er = self._mod()
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dst = Path(tmp) / "src", Path(tmp) / "dst"
+            self._container(src, layers=1, experts=6)
+            tensors, order, meta = er.index_container(str(src))
+            # a trace whose every forward routes to {0,1,2} -- adjacency should
+            # collapse three scattered reads into one
+            trace = Path(tmp) / "t.txt"
+            trace.write_text("".join(f"{c} 0 0 0:0.4 1:0.3 2:0.3\n" for c in range(8)))
+            perm = {"version": 1, "layers": {"0": [0, 1, 2, 3, 4, 5]}}
+            new, _ = er.emission_order(tensors, order, perm)
+            er.write_container(new, str(dst), shard_bytes=1 << 20, metadata=meta)
+
+            per = er.routed_sets(str(trace))
+            before, b_bytes = er.count_reads(per, er.byte_ranges(str(src)))
+            after, a_bytes = er.count_reads(per, er.byte_ranges(str(dst)))
+            self.assertLess(after, before, "clustering did not reduce reads")
+            self.assertEqual(a_bytes, b_bytes, "bytes moved must not change")
+
+
 class LedgerShape(unittest.TestCase):
     """Claims are integers, flat, and scaled the same way everywhere."""
 
