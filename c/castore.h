@@ -315,18 +315,26 @@ static void ca_close(ca_store *S);   /* defined below; st_init_ca unwinds throug
  * the address; st_pread_tensor dispatches on that, and the posix_fadvise and
  * mirror-routing sites skip a negative fd on their own.
  *
- * What this does NOT give you is the coalesced expert read. colibri.c's
- * expert_load_impl loads three weight tensors in ONE pread because they are
- * adjacent inside a shard; in a CA store every tensor is its own file, so that
- * adjacency does not exist. #36 spent an entire issue proving how much those
- * scattered reads cost (67% more of them, measured), so the expert path
- * deliberately refuses a CA container rather than silently taking the
- * regression -- see coli_expert_path_supports_ca in colibri.c. Resolving that
- * (pack blobs, or accept the reads and measure) is the next decision, and it
- * should be made on numbers.
+ * What this does NOT give you is the coalesced expert read, and that is
+ * PERMANENT rather than a gap waiting to be filled.
  *
- * Returns 0 on success. The store's own verification applies: a manifest whose
- * bytes do not match its name is refused before a tensor is indexed.
+ * colibri.c's expert_load_impl loads three weight tensors in ONE pread because
+ * they are adjacent inside a shard. In a CA store every tensor is its own file,
+ * so that adjacency cannot exist -- a blob's location is its hash. #36 spent an
+ * entire issue proving what those scattered reads cost, and the same tooling
+ * priced this one: 3.6x the reads of the clustered layout and 1.19x even the
+ * unoptimised original, at identical bytes
+ * (docs/experiments/castore-io-cost-2026-08-20.md).
+ *
+ * The obvious fix -- content-address PACKS of co-activating experts rather than
+ * individual tensors -- was proposed as lex-moe#50 with a falsifiable gate, and
+ * the gate FAILED (docs/experiments/pack-size-gate-2026-08-20.md): read locality
+ * needs packs of >= 4 experts, a fine-tune's delta needs <= 2, and the windows
+ * do not meet. That issue is closed not-planned.
+ *
+ * So content addressing is for DISTRIBUTION and safetensors for STREAMING.
+ * Everything else here is unaffected: st_init_ca below populates a shards, and
+ * dense and resident tensors load from a CA store normally.
  */
 static int st_init_ca(shards *S, const char *root, const char *manifest_hex) {
     ca_store cs;

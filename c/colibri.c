@@ -2316,23 +2316,41 @@ static int expert_classify(Model *m, int layer, int eid){
     uint32_t age=m->tc.eaccess_clock_dc-last_pre;                  /* ticks since last access, PRE this call's bump */
     return age>g_direct_heat_ticks ? DC_COLD : DC_WARM;         /* '>' not '>=': ties lean warm */
 }
-/* #14: the coalesced expert read has no counterpart in a content-addressed
- * store. This path loads three weight tensors in ONE pread because they sit
- * adjacent inside a shard; in a CA store every tensor is its own blob, so that
- * adjacency does not exist and the same load becomes three scattered reads --
- * exactly the cost #36 spent an issue measuring (67% more reads) and removing.
+/* #14: routed-expert streaming from a content-addressed store is refused, and
+ * on the evidence this is PERMANENT rather than a gap waiting to be filled.
  *
- * So a CA container is refused here rather than silently taking that
- * regression. st.h's readers work against one already (st_init_ca); it is this
- * path, and only this path, that needs the decision: pack blobs so co-activating
- * experts stay adjacent, or accept the reads and measure what they cost. That
- * belongs on numbers from tools/expert_io_replay.py, not on a guess made here. */
+ * This path loads three weight tensors in ONE pread because they sit adjacent
+ * inside a shard. In a CA store every tensor is its own blob, so that adjacency
+ * cannot exist -- a blob's location is its hash. Measured on a real trained
+ * OLMoE (docs/experiments/castore-io-cost-2026-08-20.md): 3.6x the reads of the
+ * co-activation-clustered layout #43 produces, and 1.19x even the unoptimised
+ * original, at identical bytes.
+ *
+ * The obvious fix -- content-address PACKS of co-activating experts instead of
+ * individual tensors -- was proposed as lex-moe#50 with a falsifiable gate, and
+ * the gate FAILED (docs/experiments/pack-size-gate-2026-08-20.md). Read locality
+ * needs packs of >= 4 experts; a fine-tune's delta needs <= 2. The windows do
+ * not meet, because delta scales linearly in pack size while reads improve only
+ * sub-linearly. Packing also forces a choice between verifying a pack (reading
+ * all of it: 2.4x the bytes at P=4) and reading only what is needed. That issue
+ * is closed not-planned.
+ *
+ * So the conclusion is that content addressing is for DISTRIBUTION and
+ * safetensors for STREAMING, and they are for different jobs. Nothing else about
+ * CA is excluded: st.h's readers work against a CA store (st_init_ca), dense and
+ * resident tensors load from one, and dedupe, per-tensor deltas, integrity by
+ * address (#53) and a network cache are all untouched -- none of them are on
+ * this path. */
 static int coli_expert_path_supports_ca(Model *m){
     if(!m->S.ca_root) return 1;
     fprintf(stderr,
-        "expert load: this build cannot stream routed experts from a "
-        "content-addressed store -- the coalesced read has no equivalent there "
-        "(#14). Use a safetensors container for expert streaming.\n");
+        "expert load: routed experts are not streamed from a content-addressed "
+        "store, by design (#14). A CA store cannot place co-activating experts "
+        "adjacently -- a blob's location is its hash -- which measured 3.6x the "
+        "reads of a clustered container; packing them was tried and its gate "
+        "failed (lex-moe#50). Content addressing is for distribution; use a "
+        "safetensors container for expert streaming. Dense and resident tensors "
+        "load from a CA store normally.\n");
     return 0;
 }
 
