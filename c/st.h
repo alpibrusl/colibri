@@ -61,12 +61,20 @@ typedef struct {
      * __metadata__["colibri.fmt"] JSON blob (safetensors __metadata__ values are
      * always strings, so colibri.fmt's value is itself JSON text, parsed a
      * second time -- see st_init_multi below). Small in practice (only the
-     * tensors a stamping tool selected, a subset of S->t), so a flat array +
-     * linear st_fmt_stamp() lookup is fine; this is a reference implementation,
-     * not a framework -- no hash map for a handful-to-low-thousands of entries.
+     * tensors a stamping tool selected, a subset of S->t).
+     *
+     * INDEXED, not scanned (#13). That "small in practice" held only while
+     * routed experts went unstamped -- and stamping them is the entire point of
+     * a mandatory format tag, which takes this table from a handful to the same
+     * ~120k entries the tensor index above exists for. A linear scan over that
+     * many names is the exact cost that measured "decine di secondi/token" on
+     * the first real GLM run, and st_fmt_stamp sits on the routed-expert load
+     * path, so it gets the same open-addressed index for the same reason.
      * Both arrays own strdup'd strings, intentionally leaked like the rest of
      * st_init_multi's one-time startup parsing (see the json_parse callers
      * below). */
+    int       *fmt_hidx;   /* name -> fmt_name/fmt_val index, open addressing (see above) */
+    int        fmt_hcap;
     char     **fmt_name;   /* stamped tensor name */
     char     **fmt_val;    /* stamped format NAME string */
     int        fmt_n, fmt_cap;
@@ -280,21 +288,74 @@ static void st_pread_full(int fd, void *buf, int64_t n, int64_t off, const char 
     }
 }
 
-/* Stamps are a resident-tensor convention (see docs/FORMATS.md's "Stamp-map
- * scan bound"): a handful to a few hundred entries per model
- * (q_a/q_b/kv_a/kv_b_proj, o_proj, shared-expert and dense-MLP gate/up/down),
- * NEVER the tens of thousands of routed-expert tensors a large MoE model
- * carries (tools/repack_fp8_passthrough.py never stamps routed experts). A
- * container whose combined __metadata__["colibri.fmt"] entries exceed this
- * cap is not using the convention as designed -- CAP, not a switch to a hash
- * table. Precisely what this bounds: the colibri.fmt blob is json_parse'd in
- * FULL before the per-entry check below fires, so the parse allocation
- * itself is bounded by ST_MAX_HEADER (the shard-header size cap), not by
- * this constant -- what the cap bounds is the PERSISTENT fmt_name/fmt_val
- * strdup arrays on `shards` (and every later st_fmt_stamp linear scan over
- * them), which would otherwise grow with an adversarial map. Refuse loudly
- * rather than carry an absurd stamp map forward. */
-#define ST_FMT_STAMP_MAX 4096
+/* An absolute ceiling on persistent stamp entries.
+ *
+ * This was 4096, on the reasoning that stamps are "a resident-tensor
+ * convention: a handful to a few hundred entries per model, NEVER the tens of
+ * thousands of routed-expert tensors a large MoE carries" -- true while
+ * tools/repack_fp8_passthrough.py stamped only resident tensors, and a
+ * deliberate CAP rather than a switch to a hash table.
+ *
+ * #13 overturns the premise: a MANDATORY format tag means routed experts carry
+ * one too, and GLM alone has ~120k routed-expert tensors. The cap was the third
+ * of three things assuming stamps stay small -- the other two were the O(n^2)
+ * ingest dedup and the linear st_fmt_stamp lookup, both now hash-indexed above,
+ * without which raising this constant would move a measured disaster from
+ * per-token to startup rather than fixing it.
+ *
+ * What the cap still bounds is the PERSISTENT fmt_name/fmt_val strdup arrays
+ * (the colibri.fmt blob's own parse is bounded separately by ST_MAX_HEADER).
+ * The tight bound is not this constant but "no more stamps than the container
+ * has tensors", enforced in st_init_multi once S->n is final; this ceiling only
+ * bounds memory while shards are still streaming in and S->n is unknown. */
+#define ST_FMT_STAMP_MAX (1 << 20)
+
+/* The stamp map is a hash table, built as entries arrive, not a flat array
+ * rescanned per entry (#13).
+ *
+ * Two separate quadratic behaviours lived here while stamps were assumed to be
+ * "a handful to a few hundred": the duplicate check below rescanned every
+ * earlier entry (O(n^2) ingest), and st_fmt_stamp rescanned on every lookup --
+ * the latter on the routed-expert load path. Both were fine at ST_FMT_STAMP_MAX
+ * 4096 and neither is at the tens of thousands of tensors a large MoE carries,
+ * which is what a MANDATORY format tag implies. The linear scan over ~120k
+ * names is the same cost that measured "decine di secondi/token" and put a hash
+ * index on the tensor table above.
+ *
+ * Open addressing with linear probing, kept at <=50% load, mirroring that index
+ * exactly. Indices into fmt_name/fmt_val stay valid across their reallocs. */
+static void st_fmt_rehash(shards *S, int want) {
+    int cap = 1; while (cap < want * 2) cap <<= 1;
+    if (cap <= S->fmt_hcap) return;
+    int *idx = malloc((size_t)cap * sizeof(int));
+    if (!idx) { fprintf(stderr, "OOM indexing %d format stamps\n", want); exit(1); }
+    for (int i = 0; i < cap; i++) idx[i] = -1;
+    for (int i = 0; i < S->fmt_n; i++) {
+        uint64_t h = st_hash(S->fmt_name[i]) & (uint64_t)(cap - 1);
+        while (idx[h] >= 0) h = (h + 1) & (uint64_t)(cap - 1);
+        idx[h] = i;
+    }
+    free(S->fmt_hidx);
+    S->fmt_hidx = idx; S->fmt_hcap = cap;
+}
+
+/* Index of `name` in fmt_name/fmt_val, or -1. */
+static int st_fmt_idx(shards *S, const char *name) {
+    if (!S->fmt_hidx) return -1;
+    uint64_t h = st_hash(name) & (uint64_t)(S->fmt_hcap - 1);
+    while (S->fmt_hidx[h] >= 0) {
+        int i = S->fmt_hidx[h];
+        if (!strcmp(S->fmt_name[i], name)) return i;
+        h = (h + 1) & (uint64_t)(S->fmt_hcap - 1);
+    }
+    return -1;
+}
+
+static void st_fmt_insert(shards *S, int i) {
+    uint64_t h = st_hash(S->fmt_name[i]) & (uint64_t)(S->fmt_hcap - 1);
+    while (S->fmt_hidx[h] >= 0) h = (h + 1) & (uint64_t)(S->fmt_hcap - 1);
+    S->fmt_hidx[h] = i;
+}
 
 /* Parses one shard's __metadata__["colibri.fmt"] value (a safetensors metadata
  * value is always a plain string, so colibri.fmt's VALUE is itself JSON text --
@@ -358,11 +419,10 @@ static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
          * both format names; the EARLIER claim's shard file is not named
          * (per-entry shard provenance isn't stored, and adding it just for
          * this message would be new plumbing -- only the current shard's
-         * path is in scope here). Linear rescan per entry is O(n^2) worst
-         * case, bounded by ST_FMT_STAMP_MAX at one-time startup. */
-        int dup = -1;
-        for (int k = 0; k < S->fmt_n; k++)
-            if (!strcmp(S->fmt_name[k], inner->keys[i])) { dup = k; break; }
+         * path is in scope here). The lookup is O(1) via the stamp index
+         * (st_fmt_idx); it was a linear rescan per entry, which is O(n^2)
+         * ingest and untenable once routed experts are stamped (#13). */
+        int dup = st_fmt_idx(S, inner->keys[i]);
         if (dup >= 0) {
             if (!strcmp(S->fmt_val[dup], v->str)) continue;   /* agreeing duplicate: keep one */
             fprintf(stderr, "%s: __metadata__[\"colibri.fmt\"] stamps tensor '%s' as '%s', but an "
@@ -371,8 +431,7 @@ static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
                     shard_path, inner->keys[i], v->str, S->fmt_val[dup]); exit(1); }
         if (S->fmt_n >= ST_FMT_STAMP_MAX) {
             fprintf(stderr, "%s: __metadata__[\"colibri.fmt\"] stamps more than %d tensor names across "
-                    "this container's shards -- stamps are a resident-tensor convention (docs/FORMATS.md), "
-                    "not a bulk migration path; a container stamping this many names is malformed, "
+                    "this container's shards -- far beyond any real model's tensor count, "
                     "refusing (untrusted container)\n",
                     shard_path, ST_FMT_STAMP_MAX); exit(1); }
         if (S->fmt_n == S->fmt_cap) {
@@ -382,6 +441,8 @@ static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
         }
         S->fmt_name[S->fmt_n] = strdup(inner->keys[i]);
         S->fmt_val[S->fmt_n]  = strdup(v->str);
+        st_fmt_rehash(S, S->fmt_n + 1);     /* no-op unless the table is >=50% full */
+        st_fmt_insert(S, S->fmt_n);
         S->fmt_n++;
     }
     free(arena2);  /* always NULL (json_parse never populates it -- see j_dup); the jval
@@ -406,9 +467,9 @@ static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
  * formats, and only a .qs-backed tensor can have one. See docs/FORMATS.md's
  * "Scope: .qs-backed tensors only". */
 static const char *st_fmt_stamp(shards *S, const char *name) {
-    for (int i = 0; i < S->fmt_n; i++)
-        if (!strcmp(S->fmt_name[i], name)) return S->fmt_val[i];
-    return NULL;
+    if (S->fmt_n <= 0) return NULL;             /* unstamped container: the common case */
+    int i = st_fmt_idx(S, name);
+    return i >= 0 ? S->fmt_val[i] : NULL;
 }
 
 /* Scan one directory for *.safetensors shards, appending to files[] (dedup by
@@ -585,6 +646,17 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
         uint64_t h = st_hash(S->t[i].name) & (S->hcap - 1);
         while (S->hidx[h] >= 0) h = (h + 1) & (S->hcap - 1);
         S->hidx[h] = i;
+    }
+    /* A stamp map may not name more tensors than the container holds (#13). The
+     * absolute ST_FMT_STAMP_MAX ceiling bounds memory while shards stream in,
+     * when S->n is not yet final; this is the tight bound, checked once it is.
+     * An adversarial map padded with names for tensors that do not exist fails
+     * here rather than being carried forward. */
+    if (S->fmt_n > S->n) {
+        fprintf(stderr, "container stamps %d tensor names but holds only %d tensors -- "
+                "refusing (untrusted container, stamp map larger than the container)\n",
+                S->fmt_n, S->n);
+        exit(1);
     }
 }
 

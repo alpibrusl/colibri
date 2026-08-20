@@ -1145,18 +1145,20 @@ static void write_stamp_cap_fixture(const char *dir, int n_entries){
     free(hdr);
 }
 
-static void test_stamp_map_cap_boundary_ok(void){
-    const char *dir="tests/tmp_fp8_stamp_cap_ok";
-    write_stamp_cap_fixture(dir, ST_FMT_STAMP_MAX);   /* exactly at the cap: must NOT refuse */
-    static Model gm; memset(&gm,0,sizeof gm);
-    st_init(&gm.S, dir);
-    CHECK(gm.S.fmt_n == ST_FMT_STAMP_MAX);
-    char p[300]; snprintf(p,sizeof p,"%s/model.safetensors",dir); unlink(p); rmdir(dir);
-}
-
-static void test_stamp_map_cap_exceeded(void){
-    const char *dir="tests/tmp_fp8_stamp_cap_over";
-    write_stamp_cap_fixture(dir, ST_FMT_STAMP_MAX+1);  /* one past the cap: must refuse */
+static void test_stamp_map_larger_than_container(void){
+    /* #13 made the tight bound "no more stamps than the container has tensors",
+     * checked in st_init_multi once S->n is final. It replaces the old
+     * ST_FMT_STAMP_MAX boundary pair as the tested contract: that cap was 4096
+     * and is now a memory backstop at a scale no honest container reaches, so
+     * exercising ITS boundary would mean generating a million-entry JSON blob
+     * per run for a check the container-size rule already subsumes.
+     *
+     * The fixture writes 2 real tensors and stamps far more names than that, the
+     * shape an adversarial map padded with entries for tensors that do not exist
+     * takes. Before #13 those fictitious names were ingested and carried
+     * forward; now the container is refused. */
+    const char *dir="tests/tmp_fp8_stamp_over_container";
+    write_stamp_cap_fixture(dir, 64);      /* 64 stamps, 2 tensors */
 #ifndef _WIN32
     int pipefd[2];
     if(pipe(pipefd)==0){
@@ -1164,26 +1166,38 @@ static void test_stamp_map_cap_exceeded(void){
         if(pid == 0){
             dup2(pipefd[1],2); close(pipefd[0]); close(pipefd[1]);
             static Model gm; memset(&gm,0,sizeof gm);
-            st_init(&gm.S, dir);   /* must exit(1) inside st_fmt_stamp_ingest's cap check */
-            _exit(42);              /* reaching here is the bug */
+            st_init(&gm.S, dir);           /* must exit(1): stamps outnumber tensors */
+            _exit(42);                     /* reaching here is the bug */
         } else if(pid > 0){
             close(pipefd[1]);
-            char err[1024]={0}; size_t eoff=0; ssize_t n; /* drain to EOF (Linux pipe short-reads; see expect_refuse) */ while(eoff<sizeof(err)-1 && (n=read(pipefd[0],err+eoff,sizeof(err)-1-eoff))>0) eoff+=(size_t)n;
-            close(pipefd[0]);
-            int status=0; waitpid(pid,&status,0);
-            int ok = WIFEXITED(status) && WEXITSTATUS(status)==1;
-            if(!ok) printf("FAIL stamp-map cap exceeded: expected exit(1), got status=%d, stderr=%.200s\n", status, err);
-            CHECK(ok);
-            if(ok && !strstr(err,"refus")){
-                printf("FAIL stamp-map cap exceeded: exited(1) but message lacked a refusal explanation: %.200s\n", err);
-                fails++;
-            }
-        } else fails++;
-    } else fails++;
-#else
-    printf("skipped on Windows (no fork): stamp-map cap exceeded\n");
+            char buf[1024]; ssize_t n=read(pipefd[0],buf,sizeof buf-1); close(pipefd[0]);
+            if(n<0) n=0; buf[n]=0;
+            int st=0; waitpid(pid,&st,0);
+            int refused = WIFEXITED(st) && WEXITSTATUS(st)==1;
+            if(!refused){ printf("FAIL: stamp map larger than the container was accepted\n"); fails++; }
+            else if(!strstr(buf,"refus")){ printf("FAIL: refusal did not say why: %s\n", buf); fails++; }
+            else if(!strstr(buf,"stamp map larger")){ printf("FAIL: wrong refusal reason: %s\n", buf); fails++; }
+        }
+    }
 #endif
-    char p[300]; snprintf(p,sizeof p,"%s/model.safetensors",dir); unlink(p); rmdir(dir);
+    char p2[300]; snprintf(p2,sizeof p2,"%s/model.safetensors",dir); unlink(p2); rmdir(dir);
+}
+
+static void test_stamp_map_within_container_loads(void){
+    /* The other side: a map whose entries do not outnumber the container's
+     * tensors is ingested normally, so the new check cannot be a blanket
+     * refusal of stamped containers. */
+    const char *dir="tests/tmp_fp8_stamp_within";
+    write_stamp_cap_fixture(dir, 2);       /* 2 stamps, 2 tensors */
+    static Model gm; memset(&gm,0,sizeof gm);
+    st_init(&gm.S, dir);
+    CHECK(gm.S.fmt_n == 2);
+    /* and every stamped name resolves through the index, including one that
+     * probes past a probe-chain collision */
+    CHECK(st_fmt_stamp(&gm.S,"stamp_0") != NULL);
+    CHECK(st_fmt_stamp(&gm.S,"stamp_1") != NULL);
+    CHECK(st_fmt_stamp(&gm.S,"stamp_999") == NULL);   /* absent -> NULL, no false hit */
+    char p2[300]; snprintf(p2,sizeof p2,"%s/model.safetensors",dir); unlink(p2); rmdir(dir);
 }
 
 int main(void){
@@ -1212,8 +1226,8 @@ int main(void){
     test_stamp_absent();
     test_stamp_conflicting_duplicate();
     test_stamp_agreeing_duplicate();
-    test_stamp_map_cap_boundary_ok();
-    test_stamp_map_cap_exceeded();
+    test_stamp_map_larger_than_container();
+    test_stamp_map_within_container_loads();
     if(fails){ printf("fp8 loader-seam tests: %d FAILED\n", fails); return 1; }
     printf("fp8 loader-seam tests: ok\n");
     return 0;
