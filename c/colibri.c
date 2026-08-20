@@ -1711,8 +1711,30 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
  * no stamp for those paths to verify yet -- adding the plumbing there now
  * would be framework-building ahead of any container that needs it, which
  * this reference implementation deliberately avoids. */
+/* COLI_REQUIRE_FMT=1: refuse any tensor that arrives without a format stamp
+ * (#13). This is what turns the stamp from available into MANDATORY, and it is
+ * opt-in because the containers that exist today are not fully stamped -- the
+ * converters that produce routed experts do not write a map yet, so turning
+ * this on by default would refuse every real checkpoint.
+ *
+ * The point of the mode is that byte-count inference stops being load-bearing:
+ * qt_resolve_fmt's collision analysis, which its own comments call a design
+ * landmine, becomes the legacy path rather than the only path. A deployment
+ * that controls its own containers can turn this on and know that no tensor's
+ * identity was guessed from its size. */
+static int g_require_fmt=0;
+
 static void qt_verify_fmt_stamp(const char *name, const char *stamped, int fmt){
-    if(!stamped) return;                       /* unstamped: infer exactly as today */
+    if(!stamped){
+        if(g_require_fmt){
+            fprintf(stderr,
+                "%s: no format stamp, and COLI_REQUIRE_FMT=1 -- refusing rather than "
+                "inferring the format from byte counts (the container must carry "
+                "__metadata__[\"colibri.fmt\"] for every tensor it loads)\n", name);
+            exit(1);
+        }
+        return;                                /* unstamped: infer exactly as today */
+    }
     int stamped_fmt = qt_fmt_by_name(stamped);
     if(stamped_fmt == fmt) return;              /* agree: silent pass-through, loads normally */
     if(stamped_fmt < 0){
@@ -9824,6 +9846,7 @@ int main(int argc, char **argv){
         return 0;
     }
 #endif
+    g_require_fmt = getenv("COLI_REQUIRE_FMT")?atoi(getenv("COLI_REQUIRE_FMT")):0;
     if(getenv("COUPLE")&&*getenv("COUPLE")){    /* coupling-scored cross-layer prefetch (#176) */
         g_couple_k=getenv("COUPLE_K")?atoi(getenv("COUPLE_K")):8;
         if(g_couple_k<1)g_couple_k=1; if(g_couple_k>32)g_couple_k=32;

@@ -1145,6 +1145,77 @@ static void write_stamp_cap_fixture(const char *dir, int n_entries){
     free(hdr);
 }
 
+static void test_require_fmt_refuses_unstamped(void){
+    /* #13: COLI_REQUIRE_FMT=1 is what turns the stamp from available into
+     * MANDATORY -- byte-count inference stops being load-bearing, so
+     * qt_resolve_fmt's collision analysis (its own comments call it a design
+     * landmine) becomes the legacy path rather than the only path.
+     *
+     * Scope worth stating: the mode gates the INFERRED-format path. A bf16
+     * tensor's dtype is declared in the safetensors header, so it never reaches
+     * qt_verify_fmt_stamp and is not affected -- there is nothing being guessed
+     * for the mode to refuse. This fixture is quantized (w + w.qs), which is
+     * where inference actually happens.
+     *
+     * The flag is set directly rather than through the environment: setenv does
+     * not reliably reach getenv in the same process on the Windows CRT, which
+     * broke tests/test_blob_checksum there. */
+    const char *dir="tests/tmp_fp8_require";
+    write_stamp_fixture(dir, NULL);              /* quantized, NO stamp */
+    int saved = g_require_fmt;
+
+    /* default: unstamped loads, exactly as before this mode existed */
+    g_require_fmt = 0;
+    { static Model gm; memset(&gm,0,sizeof gm);
+      st_init(&gm.S, dir);
+      QT t; memset(&t,0,sizeof t);
+      qt_from_disk(&gm,"w",8,256,8,0,&t);
+      CHECK(t.fmt==8); }
+
+#ifndef _WIN32
+    /* strict: the same container is refused, and says why */
+    { int pipefd[2];
+      if(pipe(pipefd)==0){
+          pid_t pid=fork();
+          if(pid==0){
+              dup2(pipefd[1],2); close(pipefd[0]); close(pipefd[1]);
+              g_require_fmt = 1;
+              static Model gm2; memset(&gm2,0,sizeof gm2);
+              st_init(&gm2.S, dir);
+              QT t2; memset(&t2,0,sizeof t2);
+              qt_from_disk(&gm2,"w",8,256,8,0,&t2);   /* must exit(1) */
+              _exit(42);
+          } else if(pid>0){
+              close(pipefd[1]);
+              char buf[1024]; ssize_t n=read(pipefd[0],buf,sizeof buf-1); close(pipefd[0]);
+              if(n<0) n=0; buf[n]=0;
+              int st=0; waitpid(pid,&st,0);
+              if(!(WIFEXITED(st) && WEXITSTATUS(st)==1)){
+                  printf("FAIL: COLI_REQUIRE_FMT did not refuse an unstamped tensor\n"); fails++; }
+              else if(!strstr(buf,"COLI_REQUIRE_FMT")){
+                  printf("FAIL: refusal did not name the knob: %s\n", buf); fails++; }
+              else if(!strstr(buf,"no format stamp")){
+                  printf("FAIL: refusal did not say what was missing: %s\n", buf); fails++; }
+          }
+      } }
+
+    /* and a STAMPED container still loads under the same strict mode -- the
+     * mode must refuse the absence of a stamp, not the presence of one */
+    { const char *sdir="tests/tmp_fp8_require_ok";
+      write_stamp_fixture(sdir, "\"{\\\"w\\\":\\\"fp8-e4m3-b128\\\"}\"");
+      g_require_fmt = 1;
+      static Model gm3; memset(&gm3,0,sizeof gm3);
+      st_init(&gm3.S, sdir);
+      QT t3; memset(&t3,0,sizeof t3);
+      qt_from_disk(&gm3,"w",8,256,8,0,&t3);
+      CHECK(t3.fmt==8);
+      char p3[300]; snprintf(p3,sizeof p3,"%s/model.safetensors",sdir); unlink(p3); rmdir(sdir); }
+#endif
+
+    g_require_fmt = saved;
+    char p[300]; snprintf(p,sizeof p,"%s/model.safetensors",dir); unlink(p); rmdir(dir);
+}
+
 static void test_stamp_map_larger_than_container(void){
     /* #13 made the tight bound "no more stamps than the container has tensors",
      * checked in st_init_multi once S->n is final. It replaces the old
@@ -1226,6 +1297,7 @@ int main(void){
     test_stamp_absent();
     test_stamp_conflicting_duplicate();
     test_stamp_agreeing_duplicate();
+    test_require_fmt_refuses_unstamped();
     test_stamp_map_larger_than_container();
     test_stamp_map_within_container_loads();
     if(fails){ printf("fp8 loader-seam tests: %d FAILED\n", fails); return 1; }

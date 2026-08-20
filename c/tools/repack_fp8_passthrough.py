@@ -48,6 +48,16 @@ scales) is out of scope for this tool as written; the read side (qt_resolve_fmt)
 recognizes and refuses that byte signature by name rather than misread it,
 should a container carrying it ever reach the engine some other way.
 
+NOTE (#13): the reason routed experts are excluded below has CHANGED. It was
+that the engine never consulted a stamp for them -- expert_load_impl and its
+siblings passed NULL by design. That is no longer true: all three routed-expert
+paths now look the stamp up and verify it, so stamping them would be honoured.
+What still holds is that THIS tool does not produce routed experts (it
+byte-preserves resident FP8 tensors; the experts are quantized to int4 by
+convert_fp8_to_int4.py, which writes no metadata yet). So the exclusion here is
+now about scope, not about the reader -- and a container this tool stamps is
+still only partly stamped, which is why COLI_REQUIRE_FMT is opt-in.
+
 SELECTED kinds only: "resident" tensors (shared expert, o_proj, other
 attention projections, dense-MLP first layers, and the generic resident
 fallback) -- routed experts (kind "x" in convert_fp8_to_int4.classify) are

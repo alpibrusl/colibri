@@ -501,3 +501,29 @@ ceiling into an equality: the difference between "this cannot be absurd" and
 fuzzer, a format inspector) and gets the generic bound alone.
 `rans_record_parse`'s signature is deliberately unchanged — it is exposed
 through `tools/rans_ctypes.c`.
+
+## `COLI_REQUIRE_FMT` — making the tag mandatory
+
+`COLI_REQUIRE_FMT=1` refuses any tensor that reaches the loader without a
+`colibri.fmt` stamp. That is what turns the stamp from *available* into
+*mandatory*: byte-count inference stops being load-bearing, and
+`qt_resolve_fmt`'s collision analysis — which its own comments call a design
+landmine — becomes the legacy path rather than the only path.
+
+**Opt-in, and it has to be.** The containers that exist today are not fully
+stamped: `repack_fp8_passthrough.py` stamps resident tensors, and
+`convert_fp8_to_int4.py`, which produces the routed experts, writes no metadata
+at all. Defaulting this on would refuse every real checkpoint. A deployment that
+controls its own containers can turn it on and know no tensor's identity was
+guessed from its size.
+
+**Scope.** The mode gates the *inferred*-format path. A bf16 or f16 tensor's
+dtype is declared in the safetensors header, so it never reaches
+`qt_verify_fmt_stamp` and is unaffected — there is nothing being guessed for the
+mode to refuse. It applies where inference actually happens: quantized tensors
+with a `.qs` companion.
+
+**Remaining before a container can satisfy it.** A converter that stamps routed
+experts. `repack_fp8_passthrough.py`'s exclusion of them was originally
+justified by the engine never consulting their stamps; #47 changed that, so the
+exclusion is now only about which tensors that tool produces.
