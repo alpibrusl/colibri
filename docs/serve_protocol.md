@@ -89,8 +89,26 @@ turn: `HWINFO`, `PERF`, `ENTROPY`, `GPUS`, `TIERS`, `EMAP`, `HITS` (formats belo
 | `GPUS` | `GPUS <n> (<used_gb> <total_gb> <experts>)×n` | per-device VRAM + resident expert count (CUDA builds) |
 | `TOPK` | `TOPK <id> 5 (<logprob> <hextext>)×5` | token text hex-encoded so the line stays line-shaped |
 | `REPIN` | `REPIN <layer> <eid> <old_tier> <gpu>` | one line per hot-store swap (`REPIN=n` mode) |
+| `BYTES` | `BYTES <id> <turn_bytes> <turn_per_token> <all_bytes> <all_per_token>` | expert bytes read from disk: this turn's window, and engine-wide since start (#37) |
 
 All telemetry is advisory: servers render what they know and skip the rest.
+
+### Reading `BYTES`
+
+`turn_bytes` is the engine's expert-read counter over this request's lifetime.
+With `KV_SLOTS>1` that window contains fetches other slots triggered and
+consumed as well — the same caveat `PROF` and the `STAT` hit% already carry.
+
+Here that is the point rather than a wart. When two sessions route to the same
+expert, **one** fetch serves both, and there is no honest way to bill those
+bytes to one of them; any per-session split would have to invent a rule. So
+`all_per_token` — total expert bytes over tokens emitted by every session — is
+the figure to watch. If expert-major scheduling (#37) is worth building, that
+number falls as concurrency rises while the per-turn figure need not.
+
+Both per-token fields are `0` when their denominator is zero, which happens for
+real: a turn ends with nothing emitted when the client sends `STOP` before the
+first token, or the model stops on its first sample.
 
 ## HTTP surface (`openai_server.py`)
 

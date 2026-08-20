@@ -1057,6 +1057,8 @@ tests/test_tier_origin$(EXE): tests/test_tier_origin.c colibri.c st.h uring.h js
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_couple_drift$(EXE): tests/test_couple_drift.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h tier_cache.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_bytes_per_token$(EXE): tests/test_bytes_per_token.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h tier_cache.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_moe_gs_guard$(EXE): tests/test_moe_gs_guard.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
