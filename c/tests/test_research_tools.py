@@ -462,6 +462,16 @@ class ExpertIoReplay(unittest.TestCase):
                 rep._PREAD = saved
 
 
+class PackSizeCurve(unittest.TestCase):
+    """lex-moe#50's gate: does any pack size fix CA's reads without wrecking delta?"""
+
+    def test_selftest(self):
+        proc = _run("pack_size_curve.py")
+        self.assertEqual(proc.returncode, 0,
+                         f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        self.assertIn("selftest: ok", proc.stdout)
+
+
 class LedgerShape(unittest.TestCase):
     """Claims are integers, flat, and scaled the same way everywhere."""
 
