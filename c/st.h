@@ -38,6 +38,19 @@ typedef struct {
     int64_t numel;
     int     rank;
     int64_t shape[ST_MAX_RANK];
+    /* #14: when this tensor lives in a content-addressed store, its bytes are a
+     * whole blob file rather than a range inside a shard. `ca_blob` is the
+     * 64-char hex address (NULL for an ordinary tensor) and `fd` is -1, which
+     * makes the posix_fadvise and mirror-routing sites skip it naturally instead
+     * of each needing to know about CA. Reads go through st_pread_tensor.
+     *
+     * There is deliberately no file descriptor: every CA tensor is a whole file
+     * read from offset 0, so a read can open, pread and close. Two syscalls
+     * against a ~19 MB read that costs ~35 ms is not measurable, and it removes
+     * the fd-lifetime question a bounded pool would have created (an eviction
+     * that closes a descriptor a caller still holds is a use-after-close, and
+     * "the pool is big enough" is a margin argument, not a correctness one). */
+    const char *ca_blob;
     /* #13: this tensor's bytes have been checksum-verified once. Relaxed
      * atomic because expert loads run on the pilot workers as well as the main
      * thread: the worst a race costs is verifying the same tensor twice, which
@@ -87,6 +100,7 @@ typedef struct {
      * Weights load today on trust-by-filename plus size arithmetic; a flipped
      * bit in an int4 shard is read as valid weights, and the declared NaN
      * policy carries corrupt fp8 all the way to the sampler. */
+    char      *ca_root;    /* #14: content-addressed store root, NULL for safetensors */
     int       *sum_hidx;
     int        sum_hcap;
     char     **sum_name;
@@ -926,6 +940,30 @@ static void st_prefetch_rep(shards *S, const char *name, int rep) {
 
 /* legge un tensore in un buffer float32 fornito dal chiamante (numel float).
  * drop=1 -> consiglia al kernel di scartare le pagine (per gli expert in streaming). */
+/* Read a tensor's bytes, whichever container it lives in (#14).
+ *
+ * Ordinary tensors are a range inside a shard file and go straight to
+ * st_pread_full, exactly as before. A CA tensor is a whole blob, opened for the
+ * read and closed after it -- see st_tensor.ca_blob for why that is cheaper than
+ * it sounds and safer than a descriptor pool.
+ *
+ * Byte-identical behaviour when no CA store is open: ca_blob is NULL for every
+ * tensor a safetensors container produces, so the branch is never taken and
+ * nothing on the existing path changes.
+ */
+static void st_pread_tensor(shards *S, st_tensor *t, void *buf, int64_t n, int64_t off, const char *tag) {
+    if (!t->ca_blob) { st_pread_full(t->fd, buf, n, off, tag); return; }
+    char path[4096];
+    if (!S->ca_root ||
+        snprintf(path, sizeof path, "%s/blobs/%.2s/%s",
+                 S->ca_root, t->ca_blob, t->ca_blob + 2) >= (int)sizeof path) {
+        fprintf(stderr, "%s: cannot build a blob path for '%s'\n", tag, t->name); exit(1); }
+    int fd = open(path, COMPAT_O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "%s: cannot open blob %s for '%s'\n", tag, path, t->name); exit(1); }
+    st_pread_full(fd, buf, n, off, tag);
+    close(fd);
+}
+
 static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
@@ -948,7 +986,7 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
                 name, name, (long long)t->numel, (long long)t->nbytes, t->dtype); exit(1); }
     void *raw = malloc(t->nbytes);
     if (!raw) { fprintf(stderr, "malloc %lld bytes for tensor %s failed\n", (long long)t->nbytes, name); exit(1); }
-    st_pread_full(t->fd, raw, t->nbytes, t->off, "pread data");
+    st_pread_tensor(S, t, raw, t->nbytes, t->off, "pread data");
     /* #13: verify the RAW bytes, before the dtype conversion below -- the
      * checksum is over what the container holds, not over the f32 it becomes. */
     st_verify_once(S, t, raw, t->nbytes);
@@ -960,7 +998,7 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
         uint16_t *p = (uint16_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = f16_to_f32(p[i]);
     }
     free(raw);
-    if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
+    if (drop && t->fd >= 0) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
     return t->numel;
 }
 
@@ -1036,10 +1074,10 @@ static int64_t st_read_scale_f32(shards *S, const char *name, float *out, int64_
                 name, (long long)t->numel, (long long)t->nbytes); exit(1); }
     uint8_t *raw = (uint8_t*)malloc((size_t)t->nbytes);
     if (!raw) { fprintf(stderr, "malloc %lld bytes for scale %s failed\n", (long long)t->nbytes, name); exit(1); }
-    st_pread_full(t->fd, raw, t->nbytes, t->off, "pread ue8m0 scale");
+    st_pread_tensor(S, t, raw, t->nbytes, t->off, "pread ue8m0 scale");
     for (int64_t i = 0; i < t->numel; i++) out[i] = ue8m0_to_f32(raw[i]);
     free(raw);
-    if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
+    if (drop && t->fd >= 0) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
     return t->numel;
 }
 
@@ -1060,9 +1098,9 @@ static int64_t st_read_scale_f32(shards *S, const char *name, float *out, int64_
 static void st_read_raw(shards *S, const char *name, void *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
-    st_pread_full(t->fd, out, t->nbytes, t->off, "pread raw");
+    st_pread_tensor(S, t, out, t->nbytes, t->off, "pread raw");
     st_verify_once(S, t, out, t->nbytes);        /* #13: first touch, before anyone reads it */
-    if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
+    if (drop && t->fd >= 0) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
 }
 
 /* st_read_raw with the bound made explicit: `cap` is the byte capacity of `out`, in the
@@ -1094,7 +1132,7 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
     void *raw = malloc(nb);
     if (!raw) { fprintf(stderr, "malloc %lld bytes for slice %s failed\n", (long long)nb, name); exit(1); }
-    st_pread_full(t->fd, raw, nb, boff, "pread slice");   /* dev #331: chunked + EINTR + honest short-read */
+    st_pread_tensor(S, t, raw, nb, boff, "pread slice");   /* dev #331: chunked + EINTR + honest short-read */
     if (t->dtype == 2) memcpy(out, raw, nb);
     else if (t->dtype == 0) { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = bf16_to_f32(p[i]); }
     else { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = f16_to_f32(p[i]); }
