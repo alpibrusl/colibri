@@ -472,6 +472,16 @@ class PackSizeCurve(unittest.TestCase):
         self.assertIn("selftest: ok", proc.stdout)
 
 
+class AdmissionGate(unittest.TestCase):
+    """#37's re-scoped gate: is residency-aware admission worth building?"""
+
+    def test_selftest(self):
+        proc = _run("admission_gate.py")
+        self.assertEqual(proc.returncode, 0,
+                         f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        self.assertIn("selftest: ok", proc.stdout)
+
+
 class LedgerShape(unittest.TestCase):
     """Claims are integers, flat, and scaled the same way everywhere."""
 
