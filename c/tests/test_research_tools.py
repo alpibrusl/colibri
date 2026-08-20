@@ -328,6 +328,67 @@ class ExpertRelayout(unittest.TestCase):
             self.assertEqual(a_bytes, b_bytes, "bytes moved must not change")
 
 
+class SessionOverlap(unittest.TestCase):
+    """#37's kill condition: do concurrent sessions route to disjoint experts?"""
+
+    def _mod(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "session_overlap", TOOLS / "session_overlap.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_selftest(self):
+        proc = _run("session_overlap.py")
+        self.assertEqual(proc.returncode, 0,
+                         f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        self.assertIn("selftest: ok", proc.stdout)
+
+    def test_sessions_are_drawn_without_replacement(self):
+        # With replacement, S=8 drawn from 16 calls collides often enough to
+        # report ~19% amortization on routing built to have exactly none. S
+        # concurrent sessions occupy S DIFFERENT positions.
+        so = self._mod()
+        disjoint = {0: [set(range(i * 4, i * 4 + 4)) for i in range(256)]}
+        res = so.analyse(disjoint, max_s=8, trials=300)
+        drop, _, note = so.verdict(res)
+        self.assertLessEqual(drop, so.AMORTIZATION_THRESHOLD)
+        self.assertIn("nothing to amortize", note)
+
+    def test_call_ids_are_namespaced_per_file(self):
+        # Every ROUTE_TRACE numbers its calls from 0. Keying on the bare id
+        # fuses trace A's call 7 with trace B's, merging two unrelated routing
+        # decisions into one oversized session and inflating mean top-k.
+        so = self._mod()
+        a = HERE / "_tmp_overlap_a.txt"
+        b = HERE / "_tmp_overlap_b.txt"
+        a.write_text("0 0 0 1:0.5 2:0.5\n1 0 0 1:0.5 2:0.5\n")
+        b.write_text("0 0 0 30:0.5 31:0.5\n1 0 0 30:0.5 31:0.5\n")
+        try:
+            merged = so.parse([str(a), str(b)])
+            self.assertEqual(len(merged[0]), 4, "calls from two files were fused")
+            for routed in merged[0]:
+                self.assertEqual(len(routed), 2, "a call absorbed another file's experts")
+        finally:
+            a.unlink(missing_ok=True)
+            b.unlink(missing_ok=True)
+
+    def test_identical_sessions_amortize_and_uniform_sits_on_the_baseline(self):
+        import random
+        so = self._mod()
+        same = {0: [set(range(4)) for _ in range(256)]}
+        drop, _, _ = so.verdict(so.analyse(same, max_s=8, trials=200))
+        self.assertGreater(drop, 0.8, "identical routing must amortize almost fully")
+
+        # uniform independent routing must land ON the analytic line, since that
+        # line is what every real measurement is judged against
+        rng = random.Random(4)
+        sets = [set(rng.sample(range(64), 8)) for _ in range(500)]
+        _, corr, _ = so.verdict(so.analyse({0: sets}, max_s=8, trials=400))
+        self.assertLess(abs(corr), 0.05)
+
+
 class LedgerShape(unittest.TestCase):
     """Claims are integers, flat, and scaled the same way everywhere."""
 
