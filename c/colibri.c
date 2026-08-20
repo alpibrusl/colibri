@@ -1008,6 +1008,42 @@ static int g_couple=0, g_couple_k=8, g_couple_d=1;
 static int16_t *cp_pred=NULL;    /* [(L*2+(dL-1))*E + e]*CP_M + j -> target id (-1 none) */
 static float   *cp_cnt=NULL;
 static long g_cp_enq=0;
+/* COUPLE drift detection (#32). FiDeL's lesson, which motivated this issue: an
+ * offline-fitted model of the machine is only as good as the machine's continued
+ * agreement with it, so the LHC re-measured periodically and let telemetry decide
+ * when. COUPLE's table has exactly that shape -- fitted offline from one
+ * ROUTE_TRACE corpus, then replayed forever -- and it drifts silently, because
+ * g_cp_enq counts hints ISSUED and says nothing about whether any of them landed.
+ *
+ * The origin tag (#39) closed that gap: g_couple_hits counts hints still resident
+ * when demand arrived. Their ratio, tracked as an EWMA over windows of enqueues,
+ * is the table's live hit rate; when it decays below COUPLE_DRIFT_MIN we say so,
+ * once. Pure telemetry: prefetch decisions, the ring, and the output are all
+ * untouched, so this rides ordinary CI with no oracle risk.
+ *
+ * The rate is an estimator, not an exact per-window pairing. A hint enqueued near
+ * the end of a window can be attributed in the next one (so a window may report
+ * more hits than it issued -- clamped below), and one evicted before demand
+ * arrives is never attributed at all. Both are bounded by the window and smoothed
+ * by the EWMA, which is why this reports rather than acts: deciding what to DO
+ * about a stale table (re-fit, fall back to marginal heat, tighten admission) is
+ * #32's cost-aware-admission item, not this one.
+ *
+ * Plain (non-atomic) state, exactly like g_cp_enq beside it: both the enqueue site
+ * (couple_prefetch, from moe()) and the attribution site (moe_resolve_block) run
+ * on the main decode thread. The pilot workers never reach these. */
+#define CP_DRIFT_WIN 256          /* enqueues per window: long enough that the
+                                   * enqueue->attribution lag is a small edge
+                                   * effect, short enough to react within a turn */
+static double g_cp_ewma=-1.0;     /* <0 until the first window closes -- seeding the
+                                   * EWMA at 0 would read as "stale" before any
+                                   * evidence existed */
+static double g_cp_drift_min=0.15;/* COUPLE_DRIFT_MIN */
+static double g_cp_drift_a=0.25;  /* COUPLE_DRIFT_ALPHA */
+static long   g_cp_win_enq=0;     /* enqueues in the window still open */
+static long   g_cp_win_base=0;    /* g_couple_hits when it opened */
+static long   g_cp_windows=0;     /* windows closed (the EWMA's sample count) */
+static int    g_cp_stale=0;       /* warned already; re-arms on recovery */
 /* All grammar-forced-draft state in one struct so it can become per-request
  * in the multiplexed server. Fields (same semantics as the former globals):
  * on = grammar loaded and walker alive; armed = lazy start from the first byte
@@ -5372,6 +5408,34 @@ static void couple_load(Model *m, const char *path){
     g_couple=1;
     fprintf(stderr,"[COUPLE] %s: %ld conditioning entries, K=%d depth=%d\n",path,used,g_couple_k,g_couple_d);
 }
+/* Close a window once COUPLE has issued CP_DRIFT_WIN hints and fold its hit rate
+ * into the EWMA. Driven from the enqueue site so the clock is the predictor's own
+ * activity rather than token boundaries -- the same path serves chat and serve,
+ * and a table that has gone quiet cannot decay a rate it is no longer producing. */
+static void couple_drift_tick(void){
+    /* Only PILOT_REAL stamps an origin: without it the worker takes the fadvise-only
+     * expert_prefetch path, which never touches an ESlot, so g_couple_hits can never
+     * rise however well the table is predicting. Measuring a rate against a counter
+     * that is structurally frozen at 0 would report every healthy table as stale --
+     * the same reason #39 gates its attributed-hits line on g_pilot_real. */
+    if(!g_pilot_real) return;
+    if(++g_cp_win_enq < CP_DRIFT_WIN) return;
+    long hits=(long)atomic_load_explicit(&g_couple_hits,memory_order_relaxed);
+    double rate=(double)(hits-g_cp_win_base)/(double)g_cp_win_enq;
+    if(rate>1.0) rate=1.0;      /* lag: a previous window's hints landing in this one */
+    if(rate<0.0) rate=0.0;      /* counters only ever rise; defensive, not expected */
+    g_cp_ewma = (g_cp_ewma<0.0) ? rate : g_cp_drift_a*rate + (1.0-g_cp_drift_a)*g_cp_ewma;
+    g_cp_win_enq=0; g_cp_win_base=hits; g_cp_windows++;
+    if(!g_cp_stale && g_cp_ewma<g_cp_drift_min){
+        g_cp_stale=1;
+        fprintf(stderr,"[COUPLE] table stale — rebuild from recent ROUTE_TRACE "
+                       "(hit rate %.1f%%, below COUPLE_DRIFT_MIN %.1f%%, over %ld windows of %d hints)\n",
+                100.0*g_cp_ewma,100.0*g_cp_drift_min,g_cp_windows,CP_DRIFT_WIN);
+    }else if(g_cp_stale && g_cp_ewma>g_cp_drift_min*1.5){
+        g_cp_stale=0;           /* recovered with margin, so a table hovering at the
+                                 * threshold reports once, not every other window */
+    }
+}
 /* score + enqueue: called from moe() after FASE A with the position's routed set */
 static void couple_prefetch(Model *m, int layer, const int *idx, int Ke){
     Cfg *c=&m->c; int E=c->n_experts;
@@ -5400,6 +5464,7 @@ static void couple_prefetch(Model *m, int layer, const int *idx, int Ke){
                     atomic_store_explicit(&pilot_q[w&4095].o,TIER_ORIGIN_COUPLE,memory_order_relaxed);
                     __atomic_store_n(&pilot_w,w+1,__ATOMIC_RELEASE);
                     g_cp_enq++;
+                    couple_drift_tick();
                 }
             }
         }
@@ -6904,6 +6969,13 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     if(g_pilot_real) printf("origin-attributed hits: PILOT %ld, COUPLE %ld (demand hit against a still-resident speculative slot)\n",
         (long)atomic_load_explicit(&g_pilot_hits,memory_order_relaxed),
         (long)atomic_load_explicit(&g_couple_hits,memory_order_relaxed));
+    /* the same two counters as a live rate, plus whether the COUPLE table still
+     * matches this workload (#32). Reported whenever a window closed, so a run too
+     * short to measure says nothing rather than reporting a number built from one
+     * partial window. */
+    if(g_cp_windows) printf("couple drift: hit rate %.1f%% (EWMA over %ld windows of %d hints)%s\n",
+        100.0*g_cp_ewma,g_cp_windows,CP_DRIFT_WIN,
+        g_cp_stale?" — STALE, rebuild the table from recent ROUTE_TRACE":"");
     if(g_pilot_two) printf("PILOT_TWO: two-step shared-expert-corrected prefetch active (3 extra matmuls/prediction)\n");
     if(g_looka){
         const char *nm[4]={"previous token (=SPEC prefetch)","layer input, skip attention","next layer (PILOT, stale)","next layer (two-step, shared-expert)"};
@@ -9644,6 +9716,12 @@ int main(int argc, char **argv){
         if(g_couple_k<1)g_couple_k=1; if(g_couple_k>32)g_couple_k=32;
         g_couple_d=getenv("COUPLE_D")?atoi(getenv("COUPLE_D")):1;
         if(g_couple_d<1)g_couple_d=1; if(g_couple_d>2)g_couple_d=2;
+        /* drift thresholds (#32): reporting-only, so the defaults are chosen to be
+         * quiet on a table that is working and audible on one that is not. */
+        g_cp_drift_min=getenv("COUPLE_DRIFT_MIN")?atof(getenv("COUPLE_DRIFT_MIN")):0.15;
+        if(!(g_cp_drift_min>=0.0&&g_cp_drift_min<=1.0))g_cp_drift_min=0.15;  /* also rejects NaN */
+        g_cp_drift_a=getenv("COUPLE_DRIFT_ALPHA")?atof(getenv("COUPLE_DRIFT_ALPHA")):0.25;
+        if(!(g_cp_drift_a>0.0&&g_cp_drift_a<=1.0))g_cp_drift_a=0.25;
         couple_load(&m, getenv("COUPLE"));
     }
     /* CACHE CHE IMPARA: l'uso degli expert si accumula in <SNAP>/.coli_usage tra le sessioni;
