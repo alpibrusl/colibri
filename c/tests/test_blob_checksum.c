@@ -77,17 +77,26 @@ int main(void){
       CHECK(st_verify_once(&S,t,buf,t->nbytes) == 0);  /* second call: skipped */
       rm_fixture(dir); }
 
-    /* 3. COLI_NO_VERIFY=1: the escape hatch skips even a WRONG digest, which is
-     *    what makes it usable for benchmarking rather than a footgun that only
-     *    works on healthy containers. */
+    /* 3. The escape hatch skips even a WRONG digest, which is what makes it
+     *    usable for benchmarking rather than a footgun that only works on
+     *    healthy containers.
+     *
+     *    The flag is set directly rather than through COLI_NO_VERIFY. setenv is
+     *    POSIX and does not reliably reach getenv in the same process on the
+     *    Windows CRT -- an earlier version of this test used it, and on Windows
+     *    the hatch silently never engaged, so the deliberately-wrong digest was
+     *    enforced and the test failed there and only there. What matters here is
+     *    the BEHAVIOUR of the flag; st_init_multi's one-line getenv that sets it
+     *    is not what this case is for. */
     { const char *dir="tests/tmp_sum_off";
       write_fixture(dir,1,"0000000000000000000000000000000000000000000000000000000000000000");
-      setenv("COLI_NO_VERIFY","1",1);
       shards S; st_init(&S,dir);
+      int saved = g_st_no_verify;
+      g_st_no_verify = 1;
       st_read_raw(&S,"w",buf,0);                 /* must not refuse */
       st_tensor *t = st_find(&S,"w");
       CHECK(t->verified == 0);                   /* skipped, not silently marked done */
-      unsetenv("COLI_NO_VERIFY");
+      g_st_no_verify = saved;
       rm_fixture(dir); }
 
     /* 4. wrong digest with verification on: refuses, and says which tensor. */
