@@ -389,6 +389,79 @@ class SessionOverlap(unittest.TestCase):
         self.assertLess(abs(corr), 0.05)
 
 
+class ExpertIoReplay(unittest.TestCase):
+    """#36's last open risk: are fewer, longer reads actually cheaper?"""
+
+    def test_selftest(self):
+        proc = _run("expert_io_replay.py")
+        self.assertEqual(proc.returncode, 0,
+                         f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        self.assertIn("selftest: ok", proc.stdout)
+
+    def test_plan_matches_the_counted_reads(self):
+        # The benchmark must EXECUTE exactly the reads the measurement COUNTS,
+        # or the two report different things under the same name.
+        import importlib.util
+        import json
+        import struct
+        import tempfile
+        from pathlib import Path
+
+        def load(name):
+            spec = importlib.util.spec_from_file_location(name, TOOLS / f"{name}.py")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+
+        sys.path.insert(0, str(TOOLS))
+        try:
+            rep, er = load("expert_io_replay"), load("expert_relayout")
+        finally:
+            sys.path.remove(str(TOOLS))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            names, size = [], 2048
+            for kind in ("qs", "w"):
+                for eid in range(4):
+                    names.append(f"model.layers.0.mlp.experts.{eid}.{kind}")
+            header, cursor = {}, 0
+            for n in names:
+                header[n] = {"dtype": "U8", "shape": [size],
+                             "data_offsets": [cursor, cursor + size]}
+                cursor += size
+            blob = json.dumps(header, separators=(",", ":")).encode()
+            with open(Path(tmp) / "model-00000.safetensors", "wb") as fh:
+                fh.write(struct.pack("<Q", len(blob)))
+                fh.write(blob)
+                for i, _ in enumerate(names):
+                    fh.write(bytes([i % 251]) * size)
+            trace = Path(tmp) / "t.txt"
+            trace.write_text("".join(f"{c} 0 0 0:0.5 2:0.5\n" for c in range(5)))
+
+            plan = rep.plan(str(trace), tmp)
+            counted, counted_bytes = er.count_reads(
+                er.routed_sets(str(trace)), er.byte_ranges(tmp))
+            self.assertEqual(len(plan), counted)
+            self.assertEqual(sum(l for _, _, l in plan), counted_bytes)
+
+            result = rep.bench(str(trace), tmp, cold=False, repeat=1)
+            self.assertEqual(result["bytes"], counted_bytes,
+                             "benchmark moved different bytes than it planned")
+
+            # Both read implementations must agree. os.pread does not exist on
+            # Windows and the seek-then-read fallback only runs there, so
+            # without this it ships untested on every other platform.
+            saved = rep._PREAD
+            try:
+                for impl in (rep._pread_seek, saved):
+                    rep._PREAD = impl
+                    r = rep.bench(str(trace), tmp, cold=False, repeat=1)
+                    self.assertEqual(r["bytes"], counted_bytes,
+                                     f"{impl.__name__} moved the wrong byte count")
+            finally:
+                rep._PREAD = saved
+
+
 class LedgerShape(unittest.TestCase):
     """Claims are integers, flat, and scaled the same way everywhere."""
 
