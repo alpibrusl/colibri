@@ -312,8 +312,61 @@ def _e8_job(item):
     q, s = quant_e8(w)
     return name, q, s
 
+# ---- format stamps (#13) ----------------------------------------------------
+# The engine infers a quantized tensor's format from byte counts, and
+# qt_resolve_fmt's own comments call the collision analysis that needs "THE
+# DESIGN LANDMINE". A stamp lets the container DECLARE what this tool wrote
+# instead, and since #47 the routed-expert load paths consult it too -- which is
+# what makes stamping them worth doing at all.
+#
+# The mapping mirrors the quantize dispatch in convert_shard branch for branch,
+# because it has to: the reader is TRUST-VERIFY-REFUSE (qt_verify_fmt_stamp), so
+# a stamp that disagrees with the byte arithmetic REFUSES the container. That is
+# the right failure mode -- loud, not a silent misread -- but it means this
+# table and that dispatch must not drift. Names, never the fmt ordinal: the
+# container must never depend on an internal number (see colibri.c's QT comment
+# and its PRIVATE ORDINAL BLOCK convention).
+def fmt_name_for(bits, rows, n_scales, is_e8):
+    """The format of what was ACTUALLY written, from the produced scale array.
+
+    Deriving this from the REQUESTED parameters (bits, group_size) is wrong, and
+    the engine says so: with --group-size 128 the dispatch below picks the
+    grouped quantizer, but a tensor whose input dim does not exceed one group
+    comes back with per-ROW scales, and qt_resolve_fmt reads the scale count. A
+    first version of this stamped every such tensor int4-grouped and
+    qt_verify_fmt_stamp refused the container by name:
+
+      kv_b_proj: metadata stamp says 'int4-grouped' but byte-arithmetic
+      inference says fmt=2 (int4-row) -- refusing
+
+    which is the reader working exactly as designed, and the reason the stamp
+    has to describe the OUTPUT. n_scales == rows means one scale per row;
+    anything larger is per-group.
+    """
+    if is_e8:                        return "e8-iq3-lattice"  # fmt=6, single-float tag
+    if bits == 3:                    return "int3-g64"        # fmt=5, inherently group-64
+    if n_scales > rows:              return "int4-grouped"    # fmt=4, O*ng scales
+    if bits <= 2:                    return "int2-row"        # fmt=3
+    if bits <= 4:                    return "int4-row"        # fmt=2
+    return "int8-row"                                         # fmt=1
+
+
+def save_with_stamps(out, path, stamps):
+    """save_file, plus the colibri.fmt map when there is one.
+
+    safetensors metadata values are always strings, so the map is JSON text
+    inside a JSON string -- the convention st.h's st_fmt_stamp_ingest parses and
+    repack_fp8_passthrough.py already writes for resident tensors.
+    """
+    from safetensors.numpy import save_file      # imported here, as its callers do:
+                                                # the module is optional at import time
+    meta = {"colibri.fmt": json.dumps(stamps, separators=(",", ":"), sort_keys=True)} if stamps else None
+    save_file(out, path, metadata=meta)
+
+
 def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
-                  keep_mtp=False, keep_idx=False, group_size=0, bits_map=None):
+                  keep_mtp=False, keep_idx=False, group_size=0, bits_map=None,
+                  stamps=None):
     from safetensors import safe_open
     e8_jobs = []                                # deferred: encoded in a pool after the scan
     with safe_open(path, framework="pt") as f:
@@ -357,16 +410,20 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
                                     quant_int4 if bits <= 4 else quant_int8, w, bits)
                 out_dict[name] = q
                 out_dict[name + ".qs"] = s
+                if stamps is not None:
+                    stamps[name] = fmt_name_for(bits, w.shape[0], int(np.asarray(s).size), False)
     if e8_jobs:
         if E8_JOBS > 1:
             from multiprocessing import get_context
             with get_context("spawn").Pool(E8_JOBS) as pool:   # spawn: safe after BLAS threads
                 for name, q, s in pool.imap(_e8_job, e8_jobs, chunksize=1):
                     out_dict[name] = q; out_dict[name + ".qs"] = s
+                    if stamps is not None: stamps[name] = fmt_name_for(0, 0, 0, True)
         else:
             for item in e8_jobs:
                 name, q, s = _e8_job(item)
                 out_dict[name] = q; out_dict[name + ".qs"] = s
+                if stamps is not None: stamps[name] = fmt_name_for(0, 0, 0, True)
 
 def free_gb(p): return shutil.disk_usage(p).free / 1e9
 
@@ -385,11 +442,11 @@ def _convert_one(args):
     # Convert one shard in a worker; the main process writes the result, so shard numbering
     # and the atomic manifest stay serial and identical to --workers 1.
     i, sp, n_layers, ebits, io_bits, xbits, keep_mtp, keep_idx, group_size, bits_map = args
-    out = {}
+    out, st = {}, {}
     convert_shard(sp, out, n_layers, ebits, io_bits, xbits,
                   keep_mtp=keep_mtp, keep_idx=keep_idx,
-                  group_size=group_size, bits_map=bits_map)
-    return i, out
+                  group_size=group_size, bits_map=bits_map, stamps=st)
+    return i, out, st
 
 def check_or_record_params(outdir, prefix, params):
     """#383-class guard, mirrored onto the --repo download loops from the --indir
@@ -706,17 +763,17 @@ def main():
                 eta = f", ETA {per * (len(shards) - i) / 3600:.1f} h"
             print(f"[{i + 1}/{len(shards)}] {key} ({free_gb(a.outdir):.0f} GB free{eta})", flush=True)
             if _result_it is not None:
-                _ri, out = next(_result_it)               # parallel: converted by a worker, in shard order
+                _ri, out, stamps = next(_result_it)       # parallel: converted by a worker, in shard order
             else:
-                out = {}
+                out, stamps = {}, {}
                 convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits,
                               keep_mtp=a.mtp, keep_idx=a.indexer,
-                              group_size=a.group_size, bits_map=bits_map)
+                              group_size=a.group_size, bits_map=bits_map, stamps=stamps)
             if not out:                                   # shard senza MTP/idx: niente file (come il download path)
                 done[key] = ""
             else:
                 name = f"{prefix}{n:05d}.safetensors"
-                save_file(out, os.path.join(a.outdir, name))
+                save_with_stamps(out, os.path.join(a.outdir, name), stamps)
                 done[key] = name; n += 1; fresh += 1
             tmp_prog = prog_path + ".tmp"                 # scrittura atomica: una ripresa non vede mai un manifest mezzo scritto
             with open(tmp_prog, "w") as f: json.dump(prog, f, indent=1)   # EN: atomic write: a resume never sees a half-written manifest
@@ -985,8 +1042,9 @@ def main():
             if os.path.exists(outp): print(f"[MTP] {outp} already done"); continue
             print(f"[MTP {i+1}/{len(mtp_shards)}] downloading {sh}...", flush=True)
             p = download_retry(a.repo, sh, tmp)
-            out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_mtp=True, group_size=a.group_size, bits_map=bits_map)
-            save_file(out, outp)
+            out, stamps = {}, {}
+            convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_mtp=True, group_size=a.group_size, bits_map=bits_map, stamps=stamps)
+            save_with_stamps(out, outp, stamps)
             os.remove(p)
             for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
                 if os.path.isfile(blob): os.remove(blob)
@@ -1009,8 +1067,9 @@ def main():
             if os.path.exists(outp): continue             # gia' fatto -> ripartibile
             print(f"[IDX {i+1}/{len(idx_shards)}] downloading {sh}...", flush=True)
             p = download_retry(a.repo, sh, tmp)
-            out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_idx=True, group_size=a.group_size, bits_map=bits_map)
-            if out: save_file(out, outp)
+            out, stamps = {}, {}
+            convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_idx=True, group_size=a.group_size, bits_map=bits_map, stamps=stamps)
+            if out: save_with_stamps(out, outp, stamps)
             os.remove(p)
             for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
                 if os.path.isfile(blob): os.remove(blob)
@@ -1027,8 +1086,9 @@ def main():
         if os.path.exists(outp): continue                 # gia' fatto -> ripartibile
         print(f"[{i+1}/{len(shards)}] downloading {sh} ({free_gb(a.outdir):.0f} GB free)...", flush=True)
         p = download_retry(a.repo, sh, tmp)
-        out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, group_size=a.group_size, bits_map=bits_map)
-        save_file(out, outp)
+        out, stamps = {}, {}
+        convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, group_size=a.group_size, bits_map=bits_map, stamps=stamps)
+        save_with_stamps(out, outp, stamps)
         os.remove(p)                                       # <-- cancella subito lo shard fp8
         for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
             if os.path.isfile(blob): os.remove(blob)
