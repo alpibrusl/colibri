@@ -119,13 +119,16 @@ int main(void){
       CHECK(ca_read(&S, NAME, buf, sizeof buf) == -1);   /* refused */
       ca_close(&S);
 
-      /* and the escape hatch lets a benchmark past it, as st.h's does */
-      setenv("CA_NO_VERIFY", "1", 1);
+      /* and the escape hatch lets a benchmark past it, as st.h's does.
+       * The field is set directly rather than through the environment: setting
+       * it that way does not reliably reach getenv in the same process on the
+       * Windows CRT, which broke tests/test_blob_checksum there -- and then
+       * broke this test the same way. What matters is the flag's BEHAVIOUR. */
       ca_store S2;
       CHECK(ca_open(&S2, root, manifest_hex) == 0);
+      S2.no_verify = 1;
       CHECK(ca_read(&S2, NAME, buf, sizeof buf) == 257);
       ca_close(&S2);
-      unsetenv("CA_NO_VERIFY");
 
       if(f){ f = fopen(p, "r+b");                        /* restore */
              fseek(f, 100, SEEK_SET); int c = fgetc(f); fseek(f, 100, SEEK_SET); fputc(c ^ 1, f); fclose(f); } }
@@ -147,29 +150,28 @@ int main(void){
       CHECK(ca_open(&S, root, manifest_hex) == -1);      /* refused: hash disagrees */
       if(orig){ write_all(p, keep, (size_t)klen); free(orig); } }
 
-    /* 5. malformed manifests are refused rather than half-loaded */
-    { char p[1024];
-      snprintf(p, sizeof p, "%s/manifests/%s.json", root, manifest_hex);
-      char keep[2048]; int64_t klen = 0;
-      char *orig = ca_slurp(p, &klen);
-      if(orig && klen < (int64_t)sizeof keep) memcpy(keep, orig, (size_t)klen);
-
-      setenv("CA_NO_VERIFY", "1", 1);                    /* isolate SHAPE from the hash check */
-      const char *bads[] = {
-          "{\"arch\":\"x\"}",                                                  /* no tensors */
-          "{\"arch\":\"x\",\"tensors\":{\"a\":{\"dtype\":\"F32\"}}}",          /* no blob */
-          "{\"arch\":\"x\",\"tensors\":{\"a\":{\"blob\":\"nothex\"}}}",        /* bad hash */
-          "{\"arch\":\"x\",\"tensors\":{\"a\":{\"blob\":\"0123\"}}}",          /* short hash */
+    /* 5. malformed manifests are refused rather than half-loaded.
+     *
+     * Each is written under ITS OWN hash so the content-address check passes and
+     * SHAPE validation is what refuses -- isolating the two without needing the
+     * verify hatch, which is also what keeps this portable. */
+    { const char *bads[] = {
+          "{\"arch\":\"x\"}",                                           /* no tensors */
+          "{\"arch\":\"x\",\"tensors\":{\"a\":{\"dtype\":\"F32\"}}}",   /* no blob */
+          "{\"arch\":\"x\",\"tensors\":{\"a\":{\"blob\":\"nothex\"}}}", /* bad hash */
+          "{\"arch\":\"x\",\"tensors\":{\"a\":{\"blob\":\"0123\"}}}",   /* short hash */
           "not json at all",
       };
       for(size_t i=0;i<sizeof bads/sizeof *bads;i++){
-          write_all(p, bads[i], strlen(bads[i]));
-          ca_store S;
-          if(ca_open(&S, root, manifest_hex) != -1){
-              printf("FAIL: malformed manifest %zu was accepted\n", i); fails++; ca_close(&S); }
-      }
-      unsetenv("CA_NO_VERIFY");
-      if(orig){ write_all(p, keep, (size_t)klen); free(orig); } }
+          char h[65], bp[1024];
+          hex_of(bads[i], strlen(bads[i]), h);
+          snprintf(bp, sizeof bp, "%s/manifests/%s.json", root, h);
+          write_all(bp, bads[i], strlen(bads[i]));
+          ca_store Sb;
+          if(ca_open(&Sb, root, h) != -1){
+              printf("FAIL: malformed manifest %zu was accepted\n", i); fails++; ca_close(&Sb); }
+          unlink(bp);
+      } }
 
     /* 6. a hash that is not 64 lowercase hex is refused up front */
     { ca_store S;
