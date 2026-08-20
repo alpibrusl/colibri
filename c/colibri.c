@@ -2316,7 +2316,28 @@ static int expert_classify(Model *m, int layer, int eid){
     uint32_t age=m->tc.eaccess_clock_dc-last_pre;                  /* ticks since last access, PRE this call's bump */
     return age>g_direct_heat_ticks ? DC_COLD : DC_WARM;         /* '>' not '>=': ties lean warm */
 }
+/* #14: the coalesced expert read has no counterpart in a content-addressed
+ * store. This path loads three weight tensors in ONE pread because they sit
+ * adjacent inside a shard; in a CA store every tensor is its own blob, so that
+ * adjacency does not exist and the same load becomes three scattered reads --
+ * exactly the cost #36 spent an issue measuring (67% more reads) and removing.
+ *
+ * So a CA container is refused here rather than silently taking that
+ * regression. st.h's readers work against one already (st_init_ca); it is this
+ * path, and only this path, that needs the decision: pack blobs so co-activating
+ * experts stay adjacent, or accept the reads and measure what they cost. That
+ * belongs on numbers from tools/expert_io_replay.py, not on a guess made here. */
+static int coli_expert_path_supports_ca(Model *m){
+    if(!m->S.ca_root) return 1;
+    fprintf(stderr,
+        "expert load: this build cannot stream routed experts from a "
+        "content-addressed store -- the coalesced read has no equivalent there "
+        "(#14). Use a safetensors container for expert streaming.\n");
+    return 0;
+}
+
 static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, int demand){
+    if(!coli_expert_path_supports_ca(m)){ if(fatal) exit(1); return -1; }
 #ifdef COLI_CUDA
     /* A live REPIN may reuse a GPU-enabled pinned slot for a different expert.
      * Keep its tier assignment, but invalidate the old device weights. */

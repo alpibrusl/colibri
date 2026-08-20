@@ -65,6 +65,7 @@
 #include "json.h"
 #include "sha256.h"
 #include "compat.h"
+#include "st.h"
 
 #define CA_HEX 64
 #define CA_MAX_TENSORS (1 << 20)     /* same ceiling as ST_FMT_STAMP_MAX: far
@@ -302,6 +303,81 @@ static int64_t ca_nbytes(const ca_store *S, const char *name) {
     if (ca_blob_path(S, t->blob, path, sizeof path) != 0) return -1;
     struct stat st;
     return stat(path, &st) == 0 ? (int64_t)st.st_size : -1;
+}
+
+static void ca_close(ca_store *S);   /* defined below; st_init_ca unwinds through it */
+
+/* Populate a `shards` from a CA manifest, so every existing reader in st.h
+ * works against a content-addressed container unchanged (#14).
+ *
+ * One blob per tensor maps onto st_tensor almost exactly: the blob IS the whole
+ * tensor, so off=0 and nbytes is the file size. fd stays -1 and ca_blob carries
+ * the address; st_pread_tensor dispatches on that, and the posix_fadvise and
+ * mirror-routing sites skip a negative fd on their own.
+ *
+ * What this does NOT give you is the coalesced expert read. colibri.c's
+ * expert_load_impl loads three weight tensors in ONE pread because they are
+ * adjacent inside a shard; in a CA store every tensor is its own file, so that
+ * adjacency does not exist. #36 spent an entire issue proving how much those
+ * scattered reads cost (67% more of them, measured), so the expert path
+ * deliberately refuses a CA container rather than silently taking the
+ * regression -- see coli_expert_path_supports_ca in colibri.c. Resolving that
+ * (pack blobs, or accept the reads and measure) is the next decision, and it
+ * should be made on numbers.
+ *
+ * Returns 0 on success. The store's own verification applies: a manifest whose
+ * bytes do not match its name is refused before a tensor is indexed.
+ */
+static int st_init_ca(shards *S, const char *root, const char *manifest_hex) {
+    ca_store cs;
+    if (ca_open(&cs, root, manifest_hex) != 0) return -1;
+    memset(S, 0, sizeof(*S));
+    S->ca_root = strdup(root);
+    S->cap = cs.n > 0 ? cs.n : 1;
+    S->t = (st_tensor *)calloc((size_t)S->cap, sizeof(st_tensor));
+    if (!S->ca_root || !S->t) { fprintf(stderr, "castore: OOM building shards\n"); ca_close(&cs); return -1; }
+
+    for (int i = 0; i < cs.n; i++) {
+        const ca_entry *e = &cs.t[i];
+        int64_t nb = ca_nbytes(&cs, e->name);
+        if (nb < 0) {
+            fprintf(stderr, "castore: blob for '%s' is missing from the store\n", e->name);
+            ca_close(&cs); return -1; }
+        st_tensor *t = &S->t[S->n++];
+        t->name    = strdup(e->name);
+        t->ca_blob = strdup(e->blob);
+        t->fd      = -1;                 /* no descriptor: see st_tensor.ca_blob */
+        t->off     = 0;                  /* a blob IS the tensor */
+        t->nbytes  = nb;
+        t->dtype   = st_dtype_code(e->dtype);
+        t->numel   = e->numel;
+        t->rank    = e->rank;
+        for (int k = 0; k < e->rank && k < ST_MAX_RANK; k++) t->shape[k] = e->shape[k];
+        if (!t->name || !t->ca_blob) { fprintf(stderr, "castore: OOM\n"); ca_close(&cs); return -1; }
+        /* Same shape/bytes agreement st_init_multi enforces on a shard header:
+         * numel comes from the manifest and nbytes from the file, two
+         * independent facts, and a disagreement would overrun a caller's buffer
+         * sized from the config. U8/I8 are read by byte count, so their numel is
+         * legitimately unused. */
+        { int esz = st_dtype_esz(t->dtype);
+          if (t->dtype != 3 && t->numel * (int64_t)esz != t->nbytes) {
+              fprintf(stderr, "castore: '%s' declares %lld elements but its blob is %lld bytes (dtype %d)"
+                      " -- refusing (manifest disagrees with the store)\n",
+                      t->name, (long long)t->numel, (long long)t->nbytes, t->dtype);
+              ca_close(&cs); return -1; } }
+    }
+
+    S->hcap = 1; while (S->hcap < S->n * 2) S->hcap <<= 1;
+    S->hidx = (int *)malloc((size_t)S->hcap * sizeof(int));
+    if (!S->hidx) { fprintf(stderr, "castore: OOM indexing\n"); ca_close(&cs); return -1; }
+    for (int i = 0; i < S->hcap; i++) S->hidx[i] = -1;
+    for (int i = 0; i < S->n; i++) {
+        uint64_t h = st_hash(S->t[i].name) & (uint64_t)(S->hcap - 1);
+        while (S->hidx[h] >= 0) h = (h + 1) & (uint64_t)(S->hcap - 1);
+        S->hidx[h] = i;
+    }
+    ca_close(&cs);
+    return 0;
 }
 
 static void ca_close(ca_store *S) {

@@ -51,8 +51,12 @@ static void build_store(const char *root, char manifest_hex[65], char blob_hex[6
     snprintf(p, sizeof p, "%s/blobs", root);     mkdirp(p);
     snprintf(p, sizeof p, "%s/manifests", root); mkdirp(p);
 
-    static unsigned char payload[257];
-    for(int i=0;i<257;i++) payload[i] = (unsigned char)((i*7+3) & 0xff);
+    /* 16 x 16 F32 = 1024 bytes: the manifest's shape and the blob's size must
+     * agree, which st_init_ca checks (case 8) and this fixture must satisfy.
+     * It did not before that check existed -- a 257-byte blob under a [16,16]
+     * F32 shape -- and nothing noticed, which is the argument for the check. */
+    static unsigned char payload[1024];
+    for(size_t i=0;i<sizeof payload;i++) payload[i] = (unsigned char)((i*7+3) & 0xff);
     hex_of(payload, sizeof payload, blob_hex);
 
     snprintf(p, sizeof p, "%s/blobs/%.2s", root, blob_hex); mkdirp(p);
@@ -91,16 +95,16 @@ int main(void){
           CHECK(e->layer == 1 && e->expert == 2);   /* optional fields, present here */
       }
       CHECK(ca_find(&S, "no.such.tensor") == NULL);
-      CHECK(ca_nbytes(&S, NAME) == 257);
+      CHECK(ca_nbytes(&S, NAME) == 1024);
       ca_close(&S); }
 
     /* 2. a blob reads back byte-exact, and the hash check passes */
     { ca_store S;
       CHECK(ca_open(&S, root, manifest_hex) == 0);
-      static unsigned char buf[512];
+      static unsigned char buf[2048];
       int64_t n = ca_read(&S, NAME, buf, sizeof buf);
-      CHECK(n == 257);
-      for(int i=0;i<257;i++) if(buf[i] != (unsigned char)((i*7+3) & 0xff)){
+      CHECK(n == 1024);
+      for(int i=0;i<1024;i++) if(buf[i] != (unsigned char)((i*7+3) & 0xff)){
           printf("FAIL: blob byte %d differs\n", i); fails++; break; }
       /* the destination bound is enforced, not assumed */
       CHECK(ca_read(&S, NAME, buf, 16) == -1);
@@ -115,7 +119,7 @@ int main(void){
 
       ca_store S;
       CHECK(ca_open(&S, root, manifest_hex) == 0);
-      static unsigned char buf[512];
+      static unsigned char buf[2048];
       CHECK(ca_read(&S, NAME, buf, sizeof buf) == -1);   /* refused */
       ca_close(&S);
 
@@ -127,7 +131,7 @@ int main(void){
       ca_store S2;
       CHECK(ca_open(&S2, root, manifest_hex) == 0);
       S2.no_verify = 1;
-      CHECK(ca_read(&S2, NAME, buf, sizeof buf) == 257);
+      CHECK(ca_read(&S2, NAME, buf, sizeof buf) == 1024);
       ca_close(&S2);
 
       if(f){ f = fopen(p, "r+b");                        /* restore */
@@ -172,6 +176,52 @@ int main(void){
               printf("FAIL: malformed manifest %zu was accepted\n", i); fails++; ca_close(&Sb); }
           unlink(bp);
       } }
+
+    /* 7. st_init_ca: a CA manifest populates `shards`, and st.h's ordinary
+     *    readers work against it unchanged. That is the whole point of the
+     *    mapping -- one blob per tensor is st_tensor with off=0, nbytes = the
+     *    file size, and no descriptor. */
+    { shards S;
+      CHECK(st_init_ca(&S, root, manifest_hex) == 0);
+      CHECK(S.n == 1);
+      CHECK(S.ca_root != NULL);
+      st_tensor *t = st_find(&S, NAME);          /* the ordinary lookup, unchanged */
+      CHECK(t != NULL);
+      if(t){
+          CHECK(t->ca_blob != NULL && !strcmp(t->ca_blob, blob_hex));
+          CHECK(t->fd == -1);                    /* no descriptor is held */
+          CHECK(t->off == 0);                    /* a blob IS the tensor */
+          CHECK(t->nbytes == 1024);
+          CHECK(st_nbytes(&S, NAME) == 1024);
+      }
+      CHECK(st_find(&S, "no.such.tensor") == NULL);
+
+      /* st_read_raw goes through st_pread_tensor, which opens the blob for the
+       * read and closes it after -- the caller never sees the difference */
+      static unsigned char buf[2048];
+      st_read_raw(&S, NAME, buf, 0);
+      for(int i=0;i<1024;i++) if(buf[i] != (unsigned char)((i*7+3) & 0xff)){
+          printf("FAIL: st_read_raw returned wrong bytes at %d\n", i); fails++; break; }
+
+      /* drop=1 must not posix_fadvise a -1 descriptor */
+      st_read_raw(&S, NAME, buf, 1);
+      CHECK(buf[0] == (unsigned char)3);
+    }
+
+    /* 8. a manifest whose declared shape disagrees with the blob it points at is
+     *    refused: numel comes from the manifest and nbytes from the file, and a
+     *    caller sizing a buffer from the config would otherwise overrun it. */
+    { char man[2048], h[65], p2[1024];
+      int mn = snprintf(man, sizeof man,
+          "{\"arch\":\"olmoe\",\"tensors\":{\"%s\":"
+          "{\"blob\":\"%s\",\"dtype\":\"F32\",\"shape\":[999,999],\"role\":\"dense\"}}}",
+          NAME, blob_hex);
+      hex_of(man, (size_t)mn, h);
+      snprintf(p2, sizeof p2, "%s/manifests/%s.json", root, h);
+      write_all(p2, man, (size_t)mn);
+      shards S;
+      CHECK(st_init_ca(&S, root, h) == -1);
+      unlink(p2); }
 
     /* 6. a hash that is not 64 lowercase hex is refused up front */
     { ca_store S;
