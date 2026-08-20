@@ -4,7 +4,7 @@
  * Historically json_parse could not report failure at all: {"a" 1} parsed
  * (missing colon skipped), an unterminated array became a shorter valid
  * array, an unknown token became J_NUM 0, and {}garbage was accepted. Every
- * caller that checked !root (st.h, cfse_pack, schema_gbnf, deepseek_v4) was
+ * caller that checked !root (st.h, schema_gbnf, deepseek_v4) was
  * written for a contract the parser did not honor. This gates the contract:
  * every well-formed document still parses (including the trailing-space
  * padding safetensors headers carry), every malformed one is refused.

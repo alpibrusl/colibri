@@ -11,7 +11,7 @@
  * diventava J_NUM 0 -- e ogni chiamante doveva accorgersene da solo: con
  * input non fidati (header safetensors da mirror, tokenizer.json, schema del
  * client) il parse silenziosamente parziale e' esattamente il comportamento
- * sbagliato. I chiamanti che gia' controllavano !root (st.h, cfse_pack,
+ * sbagliato. I chiamanti che gia' controllavano !root (st.h,
  * schema_gbnf, deepseek_v4) erano scritti per questo contratto; ora e' vero. */
 #ifndef JSON_H
 #define JSON_H

@@ -178,6 +178,7 @@ typedef enum {
     RANS_E_EMPTY,              /* n_symbols == 0                            */
     RANS_E_COUNT_MISMATCH,     /* packed_bytes != ceil(n_symbols/2)         */
     RANS_E_OVERSIZE,           /* n_symbols impossibly large for payload    */
+    RANS_E_SYMBOL_COUNT,       /* n_symbols != the count the caller expects  */
     RANS_E_OFFSET_FIRST,       /* stream_offsets[0] != 0                    */
     RANS_E_OFFSETS_MONOTONIC,  /* stream_offsets not non-decreasing         */
     RANS_E_STREAM_SHORT,       /* a stream shorter than its 4-byte state    */
@@ -213,6 +214,7 @@ static const char *rans_err_name(rans_err e) {
         case RANS_E_EMPTY:              return "E_EMPTY";
         case RANS_E_COUNT_MISMATCH:     return "E_COUNT_MISMATCH";
         case RANS_E_OVERSIZE:           return "E_OVERSIZE";
+        case RANS_E_SYMBOL_COUNT:       return "E_SYMBOL_COUNT";
         case RANS_E_OFFSET_FIRST:       return "E_OFFSET_FIRST";
         case RANS_E_OFFSETS_MONOTONIC:  return "E_OFFSETS_MONOTONIC";
         case RANS_E_STREAM_SHORT:       return "E_STREAM_SHORT";
@@ -479,6 +481,37 @@ static rans_err rans_record_parse(const uint8_t *blob, uint64_t blob_len,
     out->stream_offsets = offs;
     out->payload = blob + head;
     out->payload_len = payload_len;
+    return RANS_OK;
+}
+
+/* Parse with the symbol count the CALLER already knows (#13).
+ *
+ * rans_record_parse's own bound is the tightest a format-level reader can
+ * state without knowing what it is reading: a symbol costs at least
+ * log2(M/(M-1)) bits under any admissible table, so n_symbols cannot exceed
+ * payload_len * 8 * M_max. That still admits payload x 2^18 -- enough headroom
+ * for a hostile record to make a consumer size a buffer a quarter of a million
+ * times larger than the bytes that justified it.
+ *
+ * A consumer decoding a TENSOR does not need that headroom. It knows the
+ * geometry from the container: an int4 [O,I] weight is exactly O*I nibbles, and
+ * .qs already pins the scale count. Passing that in turns an amplification
+ * CEILING into an equality, which is the difference between "this cannot be
+ * absurd" and "this is what it must be".
+ *
+ * expected_symbols == 0 means the caller genuinely does not know (a fuzzer, a
+ * format inspector) and gets the generic bound alone -- the same behaviour as
+ * rans_record_parse, whose signature is deliberately left alone because it is
+ * exposed through tools/rans_ctypes.c. */
+static rans_err rans_record_parse_expect(const uint8_t *blob, uint64_t blob_len,
+                                         uint32_t n_streams, uint64_t expected_symbols,
+                                         rans_record *out) {
+    rans_err e = rans_record_parse(blob, blob_len, n_streams, out);
+    if (e != RANS_OK) return e;
+    if (expected_symbols && out->n_symbols != expected_symbols) {
+        memset(out, 0, sizeof(*out));       /* no partial acceptance, as above */
+        return RANS_E_SYMBOL_COUNT;
+    }
     return RANS_OK;
 }
 
