@@ -2780,7 +2780,7 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
          * scan that measured tens of seconds per token at GLM's tensor count.
          * Unstamped containers are unaffected: the lookup returns NULL and every
          * decision below is the same byte arithmetic as before. */
-        const char *stamped=st_fmt_stamp(&m->S,l->tw[k]->name);
+        const char *stamped=st_fmt_stamp(&l->m->S,l->tw[k]->name);
         int fmt=qt_resolve_fmt(l->tw[k]->name,OO[k],II[k],nb,l->tq[k]->nbytes,&gs,stamped);
         qt_verify_fmt_stamp(l->tw[k]->name,stamped,fmt);
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
