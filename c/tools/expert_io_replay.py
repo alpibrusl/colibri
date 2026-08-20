@@ -19,7 +19,8 @@ the order of bytes in the file.
 ## Cold vs warm, and why both are reported
 
 `--cold` bypasses the page cache: `F_NOCACHE` on macOS, `POSIX_FADV_DONTNEED`
-per range on Linux. That is the small-RAM box the issue cares about, simulated
+per range on Linux. Windows has neither, and `--cold` says so rather than
+quietly reporting a warm number under a cold label. That is the small-RAM box the issue cares about, simulated
 on a large one, without needing root.
 
 `--warm` (the default) leaves the cache alone. On a host whose RAM exceeds the
@@ -45,6 +46,39 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import expert_relayout as er           # byte_ranges / routed_sets / count_reads
 
 F_NOCACHE = 48                          # <sys/fcntl.h>, macOS only
+
+# os.pread is POSIX-only; Windows has no positional read in the os module.
+# Seek-then-read is equivalent here because a run issues its reads serially
+# from one descriptor -- there is no concurrent user of the file offset.
+def _pread_seek(fd, length, offset):
+    """The Windows path. Kept a named function, not an inline else-branch, so
+    it can be exercised on POSIX too -- an untestable fallback is how os.pread
+    reached CI in the first place."""
+    os.lseek(fd, offset, os.SEEK_SET)
+    buf = bytearray()
+    while len(buf) < length:
+        chunk = os.read(fd, length - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+    return bytes(buf)
+
+
+def _pread_posix(fd, length, offset):
+    return os.pread(fd, length, offset)
+
+
+_pread = _pread_posix if hasattr(os, "pread") else _pread_seek
+_PREAD = _pread
+
+
+def cache_bypass():
+    """What --cold can actually do here. None = it cannot do anything."""
+    if sys.platform == "darwin":
+        return "F_NOCACHE"
+    if hasattr(os, "posix_fadvise"):
+        return "POSIX_FADV_DONTNEED"
+    return None
 
 
 def plan(trace, container):
@@ -103,7 +137,7 @@ def run(reads, fds, cold):
     moved = 0
     t0 = time.monotonic()
     for sid, off, length in reads:
-        got = os.pread(fds[sid], length, off)
+        got = _PREAD(fds[sid], length, off)
         if len(got) != length:
             raise SystemExit(f"short read: wanted {length} at {off} in shard {sid}")
         moved += len(got)
@@ -170,6 +204,17 @@ def selftest():
             ok = False
         want = sum(l for _, _, l in reads)
 
+        # both read implementations, so the Windows path is covered on POSIX too
+        global _PREAD
+        saved = _PREAD
+        for impl in (_pread_posix if hasattr(os, "pread") else _pread_seek, _pread_seek):
+            _PREAD = impl
+            r = bench(trace, tmp, cold=False, repeat=1)
+            if r["bytes"] != want:
+                print(f"selftest: {impl.__name__} moved {r['bytes']}, expected {want}")
+                ok = False
+        _PREAD = saved
+
         for cold in (False, True):
             r = bench(trace, tmp, cold=cold, repeat=2)
             if r["bytes"] != want:
@@ -233,10 +278,13 @@ def main():
     if not trace or not (container or (a and b)):
         raise SystemExit(__doc__)
 
-    mode = "cold (page cache bypassed)" if cold else "warm (page cache in play)"
-    plat = "F_NOCACHE" if sys.platform == "darwin" else "POSIX_FADV_DONTNEED"
+    bypass = cache_bypass()
+    if cold and not bypass:
+        print(f"{os.path.basename(trace)} — WARNING: no cache bypass on {sys.platform}; "
+              "--cold measures the page cache, same as --warm. Treat the numbers as warm.")
+    mode = "cold (page cache bypassed)" if cold and bypass else "warm (page cache in play)"
     print(f"{os.path.basename(trace)} — {mode}"
-          + (f", {plat}" if cold else "")
+          + (f", {bypass}" if cold and bypass else "")
           + f", best of {repeat}")
 
     if container:
