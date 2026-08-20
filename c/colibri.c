@@ -1198,6 +1198,32 @@ static _Atomic long g_pilot_drops=0;     /* predizioni scartate perche' il main 
  * Without this, g_pilot_loads/g_cp_enq say what was FETCHED speculatively but
  * not whether the fetch was ever USED before eviction. */
 static _Atomic long g_pilot_hits=0;
+/* Aggregate emitted tokens across every session (#37). Bytes come from
+ * g_prof_io, which the engine already keeps; what was missing is a denominator
+ * that spans sessions, because bytes-per-token is the metric #37 asks for and
+ * it is only meaningful in aggregate:
+ *
+ *   when two sessions route to the same expert, ONE fetch serves both. There is
+ *   no honest way to bill those bytes to one of them, and any per-session split
+ *   would have to invent a rule. The engine-wide ratio has no such ambiguity,
+ *   and it is the number that should fall as concurrency rises if
+ *   expert-major scheduling is worth building.
+ *
+ * Written only from the serve loop's turn-completion path (single-threaded, the
+ * same place g_prof_io is read for the PROF line), so a plain long suffices --
+ * matching g_cp_enq beside it. */
+static long g_tokens_all=0;
+
+/* The two ratios the BYTES line reports, split out because both denominators
+ * can legitimately be zero and the behaviour there is a contract rather than an
+ * accident: a turn that emits nothing (the client sent STOP, the model stopped
+ * on its first token, or the request was refused after the window opened) must
+ * report 0, not divide by zero and not inherit the previous turn's figure. */
+static void bytes_ratios(int64_t window, int emitted, int64_t io_all, long tok_all,
+                         double *per_turn, double *per_all){
+    *per_turn = emitted > 0 ? (double)window / emitted : 0.0;
+    *per_all  = tok_all > 0 ? (double)io_all / tok_all : 0.0;
+}
 static _Atomic long g_couple_hits=0;
 /* format from `bits`: >=16 f32, 5..8 int8, 4 int4-packed, 3 int3-g64 (group scales), <=2 int2 */
 static void qt_alloc(QT *t, int O, int I, int bits){
@@ -7334,6 +7360,27 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
            edisk_s()-r->pb.edisk,m->t_ewait-r->pb.ewait,m->t_emm-r->pb.emm,
            m->t_attn-r->pb.attn,m->t_head-r->pb.head,
            (unsigned long long)(m->n_fw-r->pb.n_fw));
+    /* BYTES (#37): what this turn's decode cost in expert bytes, and the
+     * engine-wide ratio the amortization claim actually lives in.
+     *
+     * `window` is g_prof_io over this request's lifetime. With KV_SLOTS>1 that
+     * window contains fetches other slots triggered and consumed too -- the same
+     * caveat the PROF line and the STAT hit%% already carry, and here it is the
+     * POINT rather than a wart: a shared fetch is exactly what #37 proposes to
+     * schedule for, so a per-session split would be inventing a number.
+     *
+     * `all_per_tok` is therefore the headline: total expert bytes over total
+     * tokens emitted by every session. If residency-ordered scheduling works,
+     * this falls as sessions are added while the per-session figure does not
+     * have to. A new line kind rather than a field on PROF/DONE, per the
+     * protocol's stated rule that servers ignore line kinds they do not know. */
+    { int64_t io_now=atomic_load_explicit(&g_prof_io,memory_order_relaxed);
+      int64_t window=io_now-r->pb.io; if(window<0) window=0;
+      g_tokens_all += r->emitted;
+      double per_turn, per_all;
+      bytes_ratios(window, r->emitted, io_now, g_tokens_all, &per_turn, &per_all);
+      printf("BYTES %llu %lld %.0f %lld %.0f\n", r->id,
+             (long long)window, per_turn, (long long)io_now, per_all); }
     printf("DONE %llu STAT %d %.2f %.1f %.2f %d %d\n",r->id,r->emitted,
            r->emitted/dt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,rss_gb(),
            r->prompt_tokens,r->length_limited);
