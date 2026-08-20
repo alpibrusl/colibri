@@ -1059,6 +1059,10 @@ tests/test_couple_drift$(EXE): tests/test_couple_drift.c colibri.c st.h uring.h 
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_bytes_per_token$(EXE): tests/test_bytes_per_token.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h tier_cache.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_sha256$(EXE): tests/test_sha256.c sha256.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_blob_checksum$(EXE): tests/test_blob_checksum.c st.h sha256.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_moe_gs_guard$(EXE): tests/test_moe_gs_guard.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
