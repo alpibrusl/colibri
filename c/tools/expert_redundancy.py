@@ -242,15 +242,38 @@ def main():
     if not args:
         raise SystemExit(__doc__)
     model_dir, layers, projs, max_rows, out = args[0], None, None, 8192, None
-    for a in args[1:]:
+    rest = args[1:]
+    i = 0
+
+    def value(flag):
+        """--flag=v and the '--flag v' form this file's own usage line shows.
+
+        The previous parser accepted only the first and reached for split("=")[1]
+        unconditionally, so the documented spelling died with an IndexError
+        instead of a message.
+        """
+        nonlocal i
+        a = rest[i]
+        if "=" in a:
+            i += 1
+            return a.split("=", 1)[1]
+        if i + 1 >= len(rest):
+            raise SystemExit(f"{flag}: expected a value")
+        i += 2
+        return rest[i - 1]
+
+    while i < len(rest):
+        a = rest[i]
         if a.startswith("--layers"):
-            layers = {int(x) for x in a.split("=")[1].split(",")}
+            layers = {int(x) for x in value("--layers").split(",")}
         elif a.startswith("--projs"):
-            projs = set(a.split("=")[1].split(","))
+            projs = set(value("--projs").split(","))
         elif a.startswith("--max-rows"):
-            max_rows = int(a.split("=")[1])
+            max_rows = int(value("--max-rows"))
         elif a.startswith("--out"):
-            out = a.split("=")[1]
+            out = value("--out")
+        else:
+            raise SystemExit(f"unknown argument: {a}")
     groups = load_checkpoint(model_dir, layers, projs)
     if not groups:
         sys.exit("no expert tensors matched — check --layers/--projs and the "
