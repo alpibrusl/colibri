@@ -130,6 +130,37 @@ is the input to `tools/route_pairs.py`, which builds the `.coli_pairs` table use
 computes, and it does disable the device-side router (which would otherwise bypass the CPU
 ranking the trace records).
 
+## Knowing when the table has gone stale
+
+The `.coli_pairs` table is fitted from one trace corpus and then replayed forever, so it
+decays as the workload (or the checkpoint behind it) moves away from what it was fitted to.
+The engine reports that decay rather than leaving it silent (#32).
+
+With `PILOT_REAL` on, each speculatively loaded slot carries the predictor that published
+it, and a demand hit against a still-resident slot is credited to that predictor once — the
+fetch *paying off*, as distinct from the fetch merely completing, which the enqueue counters
+already reported. The ratio of attributed hits to enqueued hints, EWMA'd over windows of 256
+hints, is the table's live hit rate. `coli chat` prints it at the end of a run:
+
+```
+couple drift: hit rate 41.2% (EWMA over 37 windows of 256 hints)
+```
+
+and when it decays below `COUPLE_DRIFT_MIN` the engine says so once, on stderr:
+
+```
+[COUPLE] table stale — rebuild from recent ROUTE_TRACE (hit rate 11.3%, below COUPLE_DRIFT_MIN 15.0%, over 37 windows of 256 hints)
+```
+
+which is the cue to capture a fresh `ROUTE_TRACE` on the current workload and rebuild the
+table with `tools/route_pairs.py`, as above. Tune the thresholds with `COUPLE_DRIFT_MIN` and
+`COUPLE_DRIFT_ALPHA`.
+
+Reporting only: nothing about the prefetch decisions, the routing or the output changes, and
+a stale table keeps working — it just predicts worse than a fresh one would. The report needs
+`PILOT_REAL`, because the fadvise-only prefetch path never occupies a cache slot and so has
+no origin to attribute; without it the drift line is simply absent rather than wrong.
+
 ## Using it from a new engine
 
 ```c

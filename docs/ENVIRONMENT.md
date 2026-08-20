@@ -96,6 +96,8 @@ Format: `VAR` — default — effect.
 | `COUPLE` | unset | Path to a coupling-score file driving cross-layer expert prefetch (#176). When set, `couple_load` reads it. |
 | `COUPLE_K` | `8` | Top-K coupled experts per layer when `COUPLE` is set. |
 | `COUPLE_D` | `1` | Coupling lookahead depth (`1` or `2`) when `COUPLE` is set. |
+| `COUPLE_DRIFT_MIN` | `0.15` | Attributed-hit rate below which the `COUPLE` table reports itself stale (#32). Needs `PILOT_REAL`, the only path that stamps a slot origin. |
+| `COUPLE_DRIFT_ALPHA` | `0.25` | EWMA weight for that hit rate, over windows of 256 enqueued hints. |
 | `CACHE_ROUTE` | `0` (off) | Opt-in max-rank cache-aware MoE routing (pin∪LRU prefer within top-M). See [CACHE_ROUTE.md](CACHE_ROUTE.md). |
 | `ROUTE_J` | `2` | Sacred top ranks always taken when `CACHE_ROUTE=1`. |
 | `ROUTE_M` | `12` | Max-rank window for resident preference when `CACHE_ROUTE=1`. |
