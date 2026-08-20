@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include "json.h"
 #include "compat.h"
+#include "sha256.h"
 
 /* tetto sulla dimensione dell'header safetensors: gli header reali sono piccoli
  * (KB..pochi MB). Un file crafted che dichiara un hlen enorme causerebbe una
@@ -37,6 +38,12 @@ typedef struct {
     int64_t numel;
     int     rank;
     int64_t shape[ST_MAX_RANK];
+    /* #13: this tensor's bytes have been checksum-verified once. Relaxed
+     * atomic because expert loads run on the pilot workers as well as the main
+     * thread: the worst a race costs is verifying the same tensor twice, which
+     * is correct but wasted, and the alternative (a lock on the load path) is
+     * not worth buying that back. Zero from st_init_multi's calloc. */
+    unsigned char verified;
 } st_tensor;
 
 typedef struct {
@@ -75,6 +82,16 @@ typedef struct {
      * below). */
     int       *fmt_hidx;   /* name -> fmt_name/fmt_val index, open addressing (see above) */
     int        fmt_hcap;
+    /* BLOB CHECKSUMS (#13): __metadata__["colibri.sha256"], the same
+     * {tensor_name: value} shape as colibri.fmt above and indexed the same way.
+     * Weights load today on trust-by-filename plus size arithmetic; a flipped
+     * bit in an int4 shard is read as valid weights, and the declared NaN
+     * policy carries corrupt fp8 all the way to the sampler. */
+    int       *sum_hidx;
+    int        sum_hcap;
+    char     **sum_name;
+    char     **sum_val;    /* 64 lowercase hex chars */
+    int        sum_n, sum_cap;
     char     **fmt_name;   /* stamped tensor name */
     char     **fmt_val;    /* stamped format NAME string */
     int        fmt_n, fmt_cap;
@@ -324,37 +341,50 @@ static void st_pread_full(int fd, void *buf, int64_t n, int64_t off, const char 
  *
  * Open addressing with linear probing, kept at <=50% load, mirroring that index
  * exactly. Indices into fmt_name/fmt_val stay valid across their reallocs. */
-static void st_fmt_rehash(shards *S, int want) {
+/* The checksum map is the same {name -> value} shape as the stamp map, and
+ * lives on the same load path, so it gets the same open-addressed index rather
+ * than a second hand-rolled one. These take the arrays by pointer so one
+ * implementation serves both. */
+static void st_map_rehash(int **hidx, int *hcap, char **names, int n, int want, const char *what) {
     int cap = 1; while (cap < want * 2) cap <<= 1;
-    if (cap <= S->fmt_hcap) return;
+    if (cap <= *hcap) return;
     int *idx = malloc((size_t)cap * sizeof(int));
-    if (!idx) { fprintf(stderr, "OOM indexing %d format stamps\n", want); exit(1); }
+    if (!idx) { fprintf(stderr, "OOM indexing %d %s entries\n", want, what); exit(1); }
     for (int i = 0; i < cap; i++) idx[i] = -1;
-    for (int i = 0; i < S->fmt_n; i++) {
-        uint64_t h = st_hash(S->fmt_name[i]) & (uint64_t)(cap - 1);
+    for (int i = 0; i < n; i++) {
+        uint64_t h = st_hash(names[i]) & (uint64_t)(cap - 1);
         while (idx[h] >= 0) h = (h + 1) & (uint64_t)(cap - 1);
         idx[h] = i;
     }
-    free(S->fmt_hidx);
-    S->fmt_hidx = idx; S->fmt_hcap = cap;
+    free(*hidx);
+    *hidx = idx; *hcap = cap;
 }
 
-/* Index of `name` in fmt_name/fmt_val, or -1. */
-static int st_fmt_idx(shards *S, const char *name) {
-    if (!S->fmt_hidx) return -1;
-    uint64_t h = st_hash(name) & (uint64_t)(S->fmt_hcap - 1);
-    while (S->fmt_hidx[h] >= 0) {
-        int i = S->fmt_hidx[h];
-        if (!strcmp(S->fmt_name[i], name)) return i;
-        h = (h + 1) & (uint64_t)(S->fmt_hcap - 1);
+static int st_map_idx(const int *hidx, int hcap, char **names, const char *name) {
+    if (!hidx) return -1;
+    uint64_t h = st_hash(name) & (uint64_t)(hcap - 1);
+    while (hidx[h] >= 0) {
+        int i = hidx[h];
+        if (!strcmp(names[i], name)) return i;
+        h = (h + 1) & (uint64_t)(hcap - 1);
     }
     return -1;
 }
 
+static void st_map_insert(int *hidx, int hcap, char **names, int i) {
+    uint64_t h = st_hash(names[i]) & (uint64_t)(hcap - 1);
+    while (hidx[h] >= 0) h = (h + 1) & (uint64_t)(hcap - 1);
+    hidx[h] = i;
+}
+
+static void st_fmt_rehash(shards *S, int want) {
+    st_map_rehash(&S->fmt_hidx, &S->fmt_hcap, S->fmt_name, S->fmt_n, want, "format stamp");
+}
+static int st_fmt_idx(shards *S, const char *name) {
+    return st_map_idx(S->fmt_hidx, S->fmt_hcap, S->fmt_name, name);
+}
 static void st_fmt_insert(shards *S, int i) {
-    uint64_t h = st_hash(S->fmt_name[i]) & (uint64_t)(S->fmt_hcap - 1);
-    while (S->fmt_hidx[h] >= 0) h = (h + 1) & (uint64_t)(S->fmt_hcap - 1);
-    S->fmt_hidx[h] = i;
+    st_map_insert(S->fmt_hidx, S->fmt_hcap, S->fmt_name, i);
 }
 
 /* Parses one shard's __metadata__["colibri.fmt"] value (a safetensors metadata
@@ -384,6 +414,75 @@ static void st_fmt_insert(shards *S, int i) {
  * never a tensor, which is how to tell this abort surface apart from the
  * later per-tensor one at a glance. See docs/FORMATS.md's own section on
  * this. */
+/* Parses one shard's __metadata__["colibri.sha256"] -- the same
+ * {tensor_name: value} JSON-inside-a-string shape as colibri.fmt, with the
+ * value a 64-char lowercase hex SHA-256 of the tensor's bytes as they sit in
+ * the container (#13).
+ *
+ * Absent is not an error: an unchecksummed container loads exactly as before.
+ * Present but malformed refuses, on the same reasoning the stamp ingest gives
+ * -- a checksum the engine cannot make sense of must not be silently ignored,
+ * because that is indistinguishable from a real mismatch going unnoticed.
+ *
+ * The digest is validated for SHAPE here (length and alphabet) so a typo fails
+ * at container discovery rather than as a spurious corruption report on the
+ * first expert load, thousands of tensors later. */
+static int st_is_hex64(const char *v) {
+    int n = 0;
+    for (; v[n]; n++) {
+        char c = v[n];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return 0;
+    }
+    return n == 64;
+}
+
+static void st_sum_ingest(shards *S, jval *root, const char *shard_path) {
+    jval *meta = json_get(root, "__metadata__");
+    if (!meta || meta->t != J_OBJ) return;
+    jval *blob = json_get(meta, "colibri.sha256");
+    if (!blob) return;                                     /* unchecksummed: fine */
+    if (blob->t != J_STR) {
+        fprintf(stderr, "%s: __metadata__[\"colibri.sha256\"] is not a JSON string -- "
+                "malformed checksum map, refusing (untrusted container)\n", shard_path); exit(1); }
+    char *arena3 = NULL;
+    jval *inner = json_parse(blob->str, &arena3);
+    if (!inner || inner->t != J_OBJ) {
+        fprintf(stderr, "%s: __metadata__[\"colibri.sha256\"] does not parse as a JSON object -- "
+                "malformed checksum map, refusing (untrusted container)\n", shard_path); exit(1); }
+    for (int i = 0; i < inner->len; i++) {
+        jval *v = inner->kids[i];
+        if (v->t != J_STR || !st_is_hex64(v->str)) {
+            fprintf(stderr, "%s: colibri.sha256 entry '%s' is not a 64-char lowercase hex digest -- "
+                    "refusing (untrusted container)\n", shard_path, inner->keys[i]); exit(1); }
+        /* Same duplicate discipline as the stamp map: an identical repeat is
+         * collapsed (a centralized writer may stamp one map into every shard),
+         * a CONTRADICTING digest refuses -- a container that disagrees with
+         * itself about a tensor's bytes is corrupt or hostile. */
+        int dup = st_map_idx(S->sum_hidx, S->sum_hcap, S->sum_name, inner->keys[i]);
+        if (dup >= 0) {
+            if (!strcmp(S->sum_val[dup], v->str)) continue;
+            fprintf(stderr, "%s: colibri.sha256 gives tensor '%s' digest %s, but an earlier shard's "
+                    "map gave %s -- conflicting checksums, refusing (untrusted container)\n",
+                    shard_path, inner->keys[i], v->str, S->sum_val[dup]); exit(1); }
+        if (S->sum_n >= ST_FMT_STAMP_MAX) {
+            fprintf(stderr, "%s: __metadata__[\"colibri.sha256\"] holds more than %d entries -- "
+                    "far beyond any real model's tensor count, refusing (untrusted container)\n",
+                    shard_path, ST_FMT_STAMP_MAX); exit(1); }
+        if (S->sum_n == S->sum_cap) {
+            S->sum_cap = S->sum_cap ? S->sum_cap * 2 : 16;
+            S->sum_name = realloc(S->sum_name, S->sum_cap * sizeof(char*));
+            S->sum_val  = realloc(S->sum_val,  S->sum_cap * sizeof(char*));
+            if (!S->sum_name || !S->sum_val) { fprintf(stderr, "OOM ingesting checksums\n"); exit(1); }
+        }
+        S->sum_name[S->sum_n] = strdup(inner->keys[i]);
+        S->sum_val[S->sum_n]  = strdup(v->str);
+        st_map_rehash(&S->sum_hidx, &S->sum_hcap, S->sum_name, S->sum_n, S->sum_n + 1, "checksum");
+        st_map_insert(S->sum_hidx, S->sum_hcap, S->sum_name, S->sum_n);
+        S->sum_n++;
+    }
+    free(arena3);
+}
+
 static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
     jval *meta = json_get(root, "__metadata__");
     if (!meta || meta->t != J_OBJ) return;                /* no metadata object: unstamped, fine */
@@ -472,6 +571,61 @@ static const char *st_fmt_stamp(shards *S, const char *name) {
     return i >= 0 ? S->fmt_val[i] : NULL;
 }
 
+/* COLI_NO_VERIFY=1 -- #13's escape hatch. Verification hashes every tensor's
+ * bytes on first touch, and SHA-256 runs at a fraction of NVMe read speed, so a
+ * benchmark measuring the I/O path needs a way to take it out of the
+ * measurement. Off by default: a checksummed container is verified. */
+static int g_st_no_verify = 0;
+
+/* This tensor's expected digest, or NULL if the container gives none. */
+static const char *st_sum(shards *S, const char *name) {
+    if (S->sum_n <= 0) return NULL;
+    int i = st_map_idx(S->sum_hidx, S->sum_hcap, S->sum_name, name);
+    return i >= 0 ? S->sum_val[i] : NULL;
+}
+
+/* Verify a tensor's bytes against the container's checksum, ONCE.
+ *
+ * Verify-on-first-touch, not verify-everything-at-startup and not
+ * verify-on-every-load. Startup verification would hash the whole checkpoint
+ * before the first token (~20s for a 14 GB model, and pointless for the experts
+ * a given session never routes to); per-load verification would re-hash a hot
+ * expert on every miss. First touch pays for exactly the bytes a session
+ * actually reads, exactly once, which is where a corrupt shard would do its
+ * damage.
+ *
+ * A mismatch is FATAL. The alternative is continuing with weights known to be
+ * wrong, which produces plausible-looking output -- the failure mode this
+ * whole feature exists to prevent (and the NaN policy guarantees corrupt fp8
+ * reaches the sampler rather than announcing itself).
+ *
+ * Returns 1 if it hashed, 0 if it skipped (no digest, disabled, or already
+ * done), so callers can account for the cost. */
+static int st_verify_once(shards *S, st_tensor *t, const void *p, int64_t n) {
+    if (g_st_no_verify || !t) return 0;
+    if (__atomic_load_n(&t->verified, __ATOMIC_RELAXED)) return 0;
+    const char *want = st_sum(S, t->name);
+    if (!want) return 0;                         /* unchecksummed tensor: nothing to check */
+    if (n != t->nbytes) {                        /* caller handed us a different span */
+        fprintf(stderr, "%s: checksum verify got %lld bytes, tensor declares %lld -- "
+                "refusing (untrusted container)\n", t->name, (long long)n, (long long)t->nbytes);
+        exit(1);
+    }
+    Sha256 sh; sha256_init(&sh);
+    sha256_update(&sh, p, (size_t)n);
+    unsigned char d[32]; sha256_final(&sh, d);
+    char got[65]; sha256_hex(d, got);
+    if (strcmp(got, want)) {
+        fprintf(stderr, "%s: CHECKSUM MISMATCH\n  expected %s\n  got      %s\n"
+                "  the bytes on disk are not the bytes this container promises -- refusing "
+                "(corrupt or tampered shard; COLI_NO_VERIFY=1 skips this check)\n",
+                t->name, want, got);
+        exit(1);
+    }
+    __atomic_store_n(&t->verified, 1, __ATOMIC_RELAXED);
+    return 1;
+}
+
 /* Scan one directory for *.safetensors shards, appending to files[] (dedup by
  * basename, so a list of directories acts as a SEARCH PATH: the same shard
  * present on two drives is taken from the first-listed one only). *added
@@ -509,6 +663,7 @@ static void st_scan_dir(const char *dir, char files[][1024], int *nf, int *added
  * tokenizer / .coli_usage / .coli_kv) is read from snap_dir only. */
 static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dirs) {
     memset(S, 0, sizeof(*S));
+    { const char *nv = getenv("COLI_NO_VERIFY"); g_st_no_verify = (nv && atoi(nv)) ? 1 : 0; }
     S->cap = 4096; S->t = calloc(S->cap, sizeof(st_tensor));
     /* raccoglie ordinatamente i nomi dei file shard */
     static char files[ST_MAX_SHARDS][1024]; int nf = 0;
@@ -559,6 +714,7 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
         if (!root || root->t != J_OBJ) {
             fprintf(stderr, "%s: safetensors header is not a JSON object\n", files[fi]); exit(1); }
         st_fmt_stamp_ingest(S, root, files[fi]);
+        st_sum_ingest(S, root, files[fi]);
         for (int i = 0; i < root->len; i++) {
             const char *name = root->keys[i];
             if (!strcmp(name, "__metadata__")) continue;
@@ -652,6 +808,12 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
      * when S->n is not yet final; this is the tight bound, checked once it is.
      * An adversarial map padded with names for tensors that do not exist fails
      * here rather than being carried forward. */
+    if (S->sum_n > S->n) {
+        fprintf(stderr, "container gives %d checksums but holds only %d tensors -- "
+                "refusing (untrusted container, checksum map larger than the container)\n",
+                S->sum_n, S->n);
+        exit(1);
+    }
     if (S->fmt_n > S->n) {
         fprintf(stderr, "container stamps %d tensor names but holds only %d tensors -- "
                 "refusing (untrusted container, stamp map larger than the container)\n",
@@ -787,6 +949,9 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     void *raw = malloc(t->nbytes);
     if (!raw) { fprintf(stderr, "malloc %lld bytes for tensor %s failed\n", (long long)t->nbytes, name); exit(1); }
     st_pread_full(t->fd, raw, t->nbytes, t->off, "pread data");
+    /* #13: verify the RAW bytes, before the dtype conversion below -- the
+     * checksum is over what the container holds, not over the f32 it becomes. */
+    st_verify_once(S, t, raw, t->nbytes);
     if (t->dtype == 2) {
         memcpy(out, raw, t->nbytes);
     } else if (t->dtype == 0) {
@@ -896,6 +1061,7 @@ static void st_read_raw(shards *S, const char *name, void *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
     st_pread_full(t->fd, out, t->nbytes, t->off, "pread raw");
+    st_verify_once(S, t, out, t->nbytes);        /* #13: first touch, before anyone reads it */
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
 }
 

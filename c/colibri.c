@@ -2542,6 +2542,15 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
             if(dc_on) dc_wall_exit(dc_cls,now_s());       /* pair the enter on the non-fatal unwind */
             return -1; }
         fp[k]=s->fslab+fo; fo+=tq[k]->nbytes/4; }
+    /* #13: every byte of this expert is now in the slabs and nothing has looked
+     * at it yet -- the one point on this path where all six tensors (3 weights,
+     * 3 scale arrays) are resident and still unread. Verified once per tensor,
+     * for the lifetime of the process; a hot expert reloaded after eviction
+     * does not re-hash. No-op on a container without checksums. */
+    for(int k=0;k<3;k++){
+        st_verify_once(&m->S, tw[k], s->slab+pos[k], tw[k]->nbytes);
+        st_verify_once(&m->S, tq[k], (const char*)fp[k], tq[k]->nbytes);
+    }
     atomic_fetch_add_explicit(&g_prof_io,wtot+fo*4,memory_order_relaxed);
     if(dc_on){                                    /* DISK-CLASS accounting, see dc_needed() */
         double dc_t1=now_s();                     /* one clock read for thread-ns AND the wall exit */
