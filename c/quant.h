@@ -1434,7 +1434,7 @@ static const float mx4_lut[16] = {0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f,
 static inline float mx4_scale(uint8_t s){
     union { uint32_t u; float f; } b; b.u = (uint32_t)s << 23; return b.f;
 }
-static void matmul_mxfp4(float *y, const float *x, const uint8_t *q4, const uint8_t *e8s,
+static void matmul_mxfp4_scalar_or_avx2(float *y, const float *x, const uint8_t *q4, const uint8_t *e8s,
                          int S, int I, int O){
     int rb=(I+1)/2, ng=(I+31)/32;
     #pragma omp parallel for schedule(static)
@@ -1563,7 +1563,7 @@ static void matmul_mxfp4_rows4(float *y, const float *x, const uint8_t *q4,
 static void matmul_mxfp4_dispatch(float *y, const float *x, const uint8_t *q4,
                                   const uint8_t *e8s, int S, int I, int O){
 #if defined(__AVX2__)
-    matmul_mxfp4_dispatch(y, x, q4, e8s, S, I, O);
+    matmul_mxfp4_scalar_or_avx2(y, x, q4, e8s, S, I, O);   /* AVX2 arm inside */
 #else
     matmul_mxfp4_rows4(y, x, q4, e8s, S, I, O);
 #endif
