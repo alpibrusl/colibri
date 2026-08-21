@@ -3173,6 +3173,11 @@ static int moe_token(float *output,
         route_weights, indices, input, gate, bias,
         weights->plan.uses_hash_router ? indices : NULL,
         n, d, topk, config->routed_scaling_factor);
+    /* One row per call on this path; the gates are the scaled ones the layer
+     * will apply, matching what colibri.c and olmoe.c emit (#62). Traced only
+     * when routing succeeded -- indices is uninitialised otherwise. */
+    if (!result) coli_v4_rt_route(weights->plan.layer, 0, indices,
+                                  route_weights, topk);
 
     ColiTensorView w1, w2, w3;
     if (!result && (fp8_view(&w1, weights, "ffn.shared_experts.w1") ||
@@ -3205,6 +3210,7 @@ static int moe_token(float *output,
             output[i] = coli_bf16_round(output[i] + shared_output[i]);
     free(shared_output); free(expert_output); free(indices);
     free(route_weights); free(gate);
+    coli_v4_rt_call_end();          /* this moe invocation is fully traced */
     return result;
 }
 
@@ -3704,6 +3710,12 @@ static int moe_token_pipeline(float *output,
         weights->plan.uses_hash_router ? indices : NULL,
         n, d, topk, config->routed_scaling_factor);
 #endif
+    /* After the #endif, so the bf16 router and the fp8 fallback are traced by
+     * one hook. Putting it inside either arm would make the capture depend on
+     * how the binary was configured, which is precisely the kind of difference
+     * a replay comparison must not silently absorb (#62). */
+    if (!result) coli_v4_rt_route(weights->plan.layer, 0, indices,
+                                  route_weights, topk);
 
     int selected = 0;
     for (int expert_id = 0; !result && expert_id < n; expert_id++) {
@@ -3858,6 +3870,7 @@ static int moe_token_pipeline(float *output,
     coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_MOE_TOTAL,
                               coli_v4_block_profile_now() - profile_moe_began);
 #endif
+    coli_v4_rt_call_end();          /* this moe invocation is fully traced */
     return result;
 }
 
@@ -4012,6 +4025,13 @@ static int v4_moe_batch_union(
             weights->plan.uses_hash_router ? item_indices : NULL,
             n, d, topk, config->routed_scaling_factor);
 #endif
+        /* Prefill routes a batch, so `row` is the position within it -- the
+         * same field colibri.c fills with its sequence index. Traced here,
+         * inside the per-item loop and before the union walk below reorders
+         * the work by expert id, because the trace records what the ROUTER
+         * chose; the union is a scheduling decision downstream of it (#62). */
+        if (!result) coli_v4_rt_route(weights->plan.layer, item, item_indices,
+                                      item_weights, topk);
         if (!result)
             for (int rank = 0; rank < topk; rank++) {
                 if (item_indices[rank] >= 0 && item_indices[rank] < n)
@@ -4127,6 +4147,7 @@ static int v4_moe_batch_union(
 
     free(keys); free(used); free(expert_output); free(shared);
     free(indices); free(route_weights); free(gate);
+    coli_v4_rt_call_end();          /* one moe invocation, `batch` rows traced */
     return result ? -1 : 0;
 }
 
@@ -6735,6 +6756,66 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
 }
 #endif /* COLI_V4_UNIT_ROUTE_BF16 */
 
+#ifdef COLI_V4_UNIT_ROUTE_TRACE
+/* ######## deepseek_v4_route_trace.c / routing telemetry (#62) ######## */
+#include "deepseek_v4_internal.h"
+#include "route_trace.h"
+
+/* The single owner of route_trace.h's state for the whole amalgamation.
+ *
+ * route_trace.h keeps its stream, its call counter and its counters in
+ * file-scope statics. That is right for the four engines that use it, each of
+ * which is one translation unit. It is wrong here: deepseek_v4.c is compiled
+ * once per COLI_V4_UNIT_*, so including the header from both the router
+ * (BLOCK_HYBRID) and the decode loop (GENERATE_STATS) would give each object
+ * its own rt_fp and its own rt_call. The routing lines and the token records
+ * would then be written to two different FILE* handles for the same path, with
+ * two independent call sequences -- a trace that looks well-formed and whose
+ * call ids do not mean what every consumer assumes they mean. Nothing would
+ * report an error.
+ *
+ * So the header is included exactly once, here, and every other unit reaches
+ * the trace through the four functions below. test_v4_route_trace_wiring.py
+ * enforces that single inclusion.
+ */
+
+void coli_v4_rt_begin(int n_layers, int n_experts) {
+    static int begun;
+    if (begun) return;                      /* one run, one header */
+    begun = 1;
+    rt_init("deepseek_v4", n_layers, n_experts);
+    /* V4's sampler is greedy: --temp and --top-p are parsed and then reported
+     * as ignored (the "[V4] temperature ... ignored; target engine is greedy"
+     * notices in GENERATE_STATS). The record states what the run actually did,
+     * not what was asked for, because its whole purpose is to make two runs
+     * comparable -- a header echoing an unused --temp 0.7 would mark two
+     * identical runs as different, and two different ones as the same. */
+    rt_record_header("deepseek_v4", n_layers, n_experts, 0ull, 0.0, 1.0);
+}
+
+/* Deliberately rt_trace() and not rt_route(), for the reason olmoe.c gives at
+ * its own call site: rt_route() also bumps route_trace.h's per-expert counters,
+ * and V4 already keeps its own usage history -- the `.coli_usage` file behind
+ * v4_autopin. A second set of counters that nothing in this engine reads, saves
+ * or decays is dead state that would drift out of agreement with the one that
+ * actually drives placement. */
+void coli_v4_rt_route(int layer, int row, const int *ids, const float *gates,
+                      int k) {
+    rt_trace(layer, row, ids, gates, k);
+}
+
+/* Once per moe() invocation, after that call's rows are traced -- the same
+ * contract colibri.c and olmoe.c follow, so a V4 capture's <call> field counts
+ * the same thing theirs does and the shared tools need no V4 special case. */
+void coli_v4_rt_call_end(void) { rt_trace_end(); }
+
+/* Only for a token the run actually committed. V4 drafts speculatively
+ * (n-gram, Markov and full MTP), and a draft that verification rejects was
+ * never emitted; recording one would put tokens in the replay record that the
+ * run did not produce. session_emit_token() is the single commit point. */
+void coli_v4_rt_token(int token) { rt_record_token(token); }
+#endif /* COLI_V4_UNIT_ROUTE_TRACE */
+
 #ifdef COLI_V4_UNIT_RUNTIME
 /* ######## deepseek_v4_runtime.c / engine ######## */
 #include "deepseek_v4_internal.h"
@@ -8212,6 +8293,13 @@ static int session_emit_token(ColiV4Session *session,
                               ColiV4SessionTokenFn on_token, void *user_data,
                               int token, float logit, int position, int ordinal,
                               int stop_at_sentence) {
+    /* #15/#62: the record correlates routing with output, so it must see every
+     * token the run committed and no token it did not. This is the one place a
+     * token becomes output -- the three decode paths (exact, n-gram, MTP) all
+     * arrive here, and a speculative draft that verification rejected never
+     * does. Recording at the draft sites instead would put tokens in the
+     * record that the run never emitted. */
+    coli_v4_rt_token(token);
     if (on_token) {
         if (on_token(user_data, token, logit, position, ordinal)) return 1;
     } else {
@@ -9392,6 +9480,14 @@ int main(int argc, char **argv) {
             cli.prompt_mode == COLI_V4_PROMPT_RAW ? "raw" :
             cli.prompt_mode == COLI_V4_PROMPT_THINKING ? "thinking" : "chat",
             cli.memory_gib > 0.0 ? "limited" : "auto", target_only);
+    /* Open the trace and stamp the replay header here, where the run's
+     * configuration is final -- the same point colibri.c and olmoe.c choose,
+     * and for the reason rt_record_header documents: a header describing
+     * settings the run did not end up using would make two records look
+     * comparable when they are not. No-op unless ROUTE_TRACE or
+     * COLI_REPLAY_RECORD is set. */
+    coli_v4_rt_begin(engine->config.num_hidden_layers,
+                     engine->config.n_routed_experts);
 
     int session_context = engine->runtime.context_tokens;
     ColiV4SessionCreateOptions session_opts = {

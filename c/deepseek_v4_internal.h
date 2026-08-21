@@ -141,6 +141,17 @@ int coli_v4_route(float *weights, int *indices, const float *hidden,
 int coli_v4_swiglu(float *output, const float *gate, const float *up,
                    int dimension, float limit);
 
+/* Routing telemetry (#62). Defined by COLI_V4_UNIT_ROUTE_TRACE, which is the
+ * only unit that may include route_trace.h -- see the comment there for why a
+ * second inclusion would produce a well-formed but meaningless trace. Callers
+ * need no ROUTE_TRACE/COLI_REPLAY_RECORD check: all four are no-ops when the
+ * environment does not ask for a capture. */
+void coli_v4_rt_begin(int n_layers, int n_experts);
+void coli_v4_rt_route(int layer, int row, const int *ids, const float *gates,
+                      int k);
+void coli_v4_rt_call_end(void);
+void coli_v4_rt_token(int token);
+
 #ifdef __cplusplus
 }
 #endif
