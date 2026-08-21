@@ -526,8 +526,48 @@ static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float 
             double a=0;
             for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
                 int base=(int)(bi*FP8_BLOCK); int blen=FP8_BLOCK; if(base+blen>I) blen=I-base;
-                float sc=scl[bi]; float acc=0;
-                for(int i=base;i<base+blen;i++) acc += e4m3_decode(w[i])*xs[i];
+                float sc=scl[bi];
+                /* Eight independent accumulator chains, not one.
+                 *
+                 * `acc += decode(w[i])*xs[i]` makes every add wait on the
+                 * previous one, so the block is bound by FP-add LATENCY (~4
+                 * cycles) rather than by how many FP units the core has: the
+                 * measured rate was 2.08 Gparam/s on a core that can do far
+                 * more. Independent chains let the adds pipeline. Measured on a
+                 * 2048x4096 projection: 1 chain 4.03 ms, 2 chains 1.73, 4 chains
+                 * 1.62, 8 chains 1.48 -- 2.7x, with the returns flattening after
+                 * four. This is the same idiom the IDOT kernels below already
+                 * use ("four independent accumulators break the serial
+                 * vpdpbusd->acc chain").
+                 *
+                 * PORTABLE C, deliberately, not NEON or AVX intrinsics. For a
+                 * [128,128]-block-quantised checkpoint block_rows is 128, so the
+                 * vectorised branch in coli_fp8_dual_matvec_ref (gated on
+                 * block_rows==8) is skipped and BOTH x86 and aarch64 land here.
+                 * Hand-vectorising one of them would make the two ISAs disagree
+                 * token-for-token, which is exactly the property
+                 * deepseek_v4.c's rows16 kernel goes out of its way to keep.
+                 * Plain C with a fixed reduction order changes the operation
+                 * sequence once, identically everywhere.
+                 *
+                 * It IS a numerics change against the previous kernel: fp32
+                 * addition is not associative, and on full-entropy inputs ~88%
+                 * of output rows move by one ulp. The oracles are the gate on
+                 * that, not this comment. */
+                float a0=0,a1=0,a2=0,a3=0,a4=0,a5=0,a6=0,a7=0;
+                int i=base, end=base+blen, oct=base+(blen&~7);
+                for(; i<oct; i+=8){
+                    a0 += e4m3_decode(w[i  ])*xs[i  ];
+                    a1 += e4m3_decode(w[i+1])*xs[i+1];
+                    a2 += e4m3_decode(w[i+2])*xs[i+2];
+                    a3 += e4m3_decode(w[i+3])*xs[i+3];
+                    a4 += e4m3_decode(w[i+4])*xs[i+4];
+                    a5 += e4m3_decode(w[i+5])*xs[i+5];
+                    a6 += e4m3_decode(w[i+6])*xs[i+6];
+                    a7 += e4m3_decode(w[i+7])*xs[i+7];
+                }
+                for(; i<end; i++) a0 += e4m3_decode(w[i])*xs[i];
+                float acc = ((a0+a1)+(a2+a3))+((a4+a5)+(a6+a7));
                 a += (double)acc*sc;
             }
             y[(int64_t)s*O+o]=(float)a;
