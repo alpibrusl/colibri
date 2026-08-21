@@ -6475,6 +6475,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         /* g_intr / g_mux_*: stessa uscita del tetto n_new (#678) */
         int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
         if((eos>=0 && next==eos) || is_stop(next)) break;
+        rt_record_token(next);           /* #15: correlate routing with output */
         emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
         gr_feed(&g_grd,next);                           /* il walker segue l'output emesso */
         /* One-shot generation does not need logits or KV for the last token.
@@ -6549,6 +6550,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
                    accept = (rndu() < g_pbuf[draft[k]]); }
             if(!accept){ if(g_temp>0) carry_ban=draft[k]; break; }
             if((eos>=0 && draft[k]==eos) || is_stop(draft[k])){ done=1; break; }
+            rt_record_token(draft[k]);   /* an accepted speculative draft is still emitted */
             emit(draft[k],ud); all[kv+1+k]=draft[k]; emitted++; m->n_emit++;
             gr_feed(&g_grd,draft[k]); k++;
         }
@@ -6998,8 +7000,22 @@ static void couple_attribution_report(void){
         100.0*g_cp_ewma,g_cp_windows,CP_DRIFT_WIN,
         g_cp_stale?" — STALE, rebuild the table from recent ROUTE_TRACE":"");
 }
+/* #15: stamp the replay record's header. Called from EVERY generation entry
+ * point, not just run_text -- the record opens on this call, so a path that
+ * does not make it produces no record at all, silently. That is exactly how
+ * #41's attributed-hits line ended up missing from run_replay, which is the
+ * default invocation. Stamped here rather than at rt_init because the seed,
+ * temperature and nucleus are only final once a path has resolved them, and a
+ * header describing settings the run did not use would make two records look
+ * comparable when they are not. No-op unless COLI_REPLAY_RECORD is set. */
+static void coli_replay_stamp(Model *m){
+    rt_record_header("glm_moe_dsa", m->c.n_layers, m->c.n_experts,
+                     (unsigned long long)g_rng, (double)g_temp, (double)g_nuc);
+}
+
 static void run_replay(Model *m, const int *full, int nfull, int np){
     if(np<2||nfull<=np){ fprintf(stderr,"REPLAY requires a non-empty prompt and continuation\n"); return; }
+    coli_replay_stamp(m);
     kv_alloc(m,nfull+2);
     float *logit=step(m,full,np-1,0); free(logit);
     m->hits=m->miss=m->ereq=m->gpu_expert_calls=0; m->hit_pin=m->hit_ecache=0; m->hit_vk=0;
@@ -7036,6 +7052,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     grammar_setup(&g_grd,&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
     if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
                                           * distribuzione int4 e' rumore di quantizzazione */
+    coli_replay_stamp(m);
     int cap=(int)strlen(prompt)+16; int *pids=malloc((cap+2)*sizeof(int));
     int np=tok_encode(&T,prompt,(int)strlen(prompt),pids,cap);
     if(np<1){ fprintf(stderr,"prompt is empty after tokenization\n"); return; }

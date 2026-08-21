@@ -482,6 +482,48 @@ class AdmissionGate(unittest.TestCase):
         self.assertIn("selftest: ok", proc.stdout)
 
 
+class ReplayDiff(unittest.TestCase):
+    """#15: two runs, and where they first stopped agreeing."""
+
+    def test_selftest(self):
+        proc = _run("replay_diff.py")
+        self.assertEqual(proc.returncode, 0,
+                         f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        self.assertIn("selftest: ok", proc.stdout)
+
+    def test_record_lines_stay_out_of_route_trace(self):
+        """The record is a SEPARATE stream, and this is why.
+
+        The first design put `# colibri-replay ...` and `T <call> <token>` lines
+        into ROUTE_TRACE. Two of the five tools that parse that stream crash on
+        the header (int(parts[1]) on 'colibri-replay'), and a `T` line has three
+        integer-parseable fields, so a tool that does not also check the line
+        length would read it as a routing line and be silently wrong. This pins
+        that the parsers are not expected to tolerate either.
+        """
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "replay_diff", TOOLS / "replay_diff.py")
+        rd = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rd)
+
+        path = HERE / "_tmp_replay_record.txt"
+        path.write_text(
+            "# colibri-replay 1 engine=x layers=2 experts=8 "
+            "seed=7 temp=0.700000 top_p=0.900000\n"
+            "0 0 0 1:0.5 2:0.5\n"
+            "T 0 42\n")
+        try:
+            header, routes, tokens, n = rd.parse(str(path))
+            self.assertEqual(header["seed"], "7")
+            self.assertEqual(header["engine"], "x")
+            self.assertEqual(n, 1)                       # the T line is not routing
+            self.assertEqual(routes[(0, 0, 0)], [1, 2])
+            self.assertEqual(tokens[0], 42)
+        finally:
+            path.unlink(missing_ok=True)
+
+
 class LedgerShape(unittest.TestCase):
     """Claims are integers, flat, and scaled the same way everywhere."""
 

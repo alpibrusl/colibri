@@ -79,6 +79,7 @@ static int rt_nl = -1, rt_ne;                   /* rows 0..rt_nl inclusive */
 static uint32_t rt_id;                          /* this engine's id */
 static const char *rt_engine = "";
 static FILE *rt_fp;                             /* ROUTE_TRACE stream, NULL = off */
+static FILE *rr_fp;                             /* replay record (#15), NULL = off */
 static int rt_call;                             /* moe-call counter, first trace field */
 
 /* n_layers is inclusive: rows 0..n_layers exist, matching the extra MTP row GLM keeps at
@@ -138,13 +139,70 @@ static void rt_count(int layer, const int *ids, int k){
 
 /* trace only — once per (row), with the gates the layer will actually apply */
 static void rt_trace(int layer, int row, const int *ids, const float *gates, int k){
-    if(!rt_fp || !ids || !gates) return;
-    fprintf(rt_fp, "%d %d %d", rt_call, row, layer);
-    for(int i = 0; i < k; i++) fprintf(rt_fp, " %d:%.4f", ids[i], gates[i]);
-    fputc('\n', rt_fp);
+    if(!ids || !gates) return;
+    if(rt_fp){
+        fprintf(rt_fp, "%d %d %d", rt_call, row, layer);
+        for(int i = 0; i < k; i++) fprintf(rt_fp, " %d:%.4f", ids[i], gates[i]);
+        fputc('\n', rt_fp);
+    }
+    if(rr_fp){                                   /* the record stands alone (#15) */
+        fprintf(rr_fp, "%d %d %d", rt_call, row, layer);
+        for(int i = 0; i < k; i++) fprintf(rr_fp, " %d:%.4f", ids[i], gates[i]);
+        fputc('\n', rr_fp);
+    }
 }
+/* ---- replay record (#15) -------------------------------------------------
+ * A ROUTE_TRACE says which experts each call routed to. It does not say what
+ * the run was CONFIGURED as, or what it emitted -- so two traces cannot be
+ * compared without an out-of-band claim that they came from equivalent runs,
+ * and a divergence cannot be located in token space.
+ *
+ * The record is its OWN stream (COLI_REPLAY_RECORD=<path>), not extra line
+ * kinds inside ROUTE_TRACE. That was the first design and it was wrong: five
+ * tools parse the trace (route_pairs, route_temporal, expert_layout,
+ * trace_health, expert_relayout) and a `# colibri-replay ...` header crashes
+ * two of them on int(parts[1]). Worse, a `T <call> <token>` line has three
+ * integer-parseable fields, so a tool that does not also check the line length
+ * would read it as a routing line and be silently wrong -- the failure mode
+ * this repo works hardest to avoid. A separate stream cannot do either.
+ *
+ * The record duplicates the routing lines so it stands alone. Recording is a
+ * debugging activity, not a hot path, and a self-contained artifact is worth
+ * more than the bytes.
+ *
+ *   # colibri-replay 1 engine=<name> layers=<n> experts=<n> seed=<u64> temp=<f> top_p=<f>
+ *   <call> <row> <layer> <id>:<gate> ...
+ *   T <call> <token>
+ */
+static void rr_open(void){
+    if(rr_fp) return;
+    const char *p = getenv("COLI_REPLAY_RECORD");
+    if(!p || !*p) return;
+    rr_fp = fopen(p, "w");
+    if(!rr_fp) fprintf(stderr, "[REPLAY] cannot open %s for writing\n", p);
+}
+
+/* The header is stamped once the run's configuration is FINAL -- a header
+ * describing settings the run did not use would make two records look
+ * comparable when they are not, which is the one thing the comparator must
+ * never be fooled by. */
+static void rt_record_header(const char *engine, int n_layers, int n_experts,
+                             unsigned long long seed, double temp, double top_p){
+    rr_open();
+    if(!rr_fp) return;
+    fprintf(rr_fp, "# colibri-replay 1 engine=%s layers=%d experts=%d "
+                   "seed=%llu temp=%.6f top_p=%.6f\n",
+            engine ? engine : "?", n_layers, n_experts, seed, temp, top_p);
+    fflush(rr_fp);
+}
+
+static void rt_record_token(int token){
+    if(!rr_fp) return;
+    fprintf(rr_fp, "T %d %d\n", rt_call, token);
+}
+
 /* advance the call counter: once per moe() invocation, after its rows are traced */
-static void rt_trace_end(void){ if(rt_fp) rt_call++; }
+static void rt_trace_end(void){ if(rt_fp || rr_fp) rt_call++; }
 
 /* both, for an engine that does not need them at separate points in its router */
 static void rt_route(int layer, int row, const int *ids, const float *gates, int k){
