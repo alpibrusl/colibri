@@ -533,9 +533,11 @@ class ReplayRecordCoverage(unittest.TestCase):
     route_trace.h:373 names as this tree's recurring defect, and the reason #12
     exists. This makes the next omission a test failure instead of a silent one.
 
-    deepseek_v4 is excluded on purpose: it does not include route_trace.h at
-    all, so it has no routing telemetry to extend. That is a larger gap, tracked
-    separately, not an oversight here.
+    deepseek_v4 joined in #62. It reaches route_trace.h through the wrappers in
+    COLI_V4_UNIT_ROUTE_TRACE rather than including the header directly, because
+    the file is compiled once per COLI_V4_UNIT_* and the header's statics make a
+    second inclusion a second, independent trace -- so it is checked separately
+    below and in test_v4_route_trace_wiring.py.
     """
 
     ENGINES = ("colibri", "olmoe", "inkling", "kimi_k3")
@@ -549,11 +551,22 @@ class ReplayRecordCoverage(unittest.TestCase):
             self.assertIn("rt_record_token", text,
                           f"{e}.c traces routing but never records a token")
 
-    def test_deepseek_v4_has_no_routing_telemetry_yet(self):
-        """Pins the known gap so it is a documented fact, not a surprise."""
+    def test_deepseek_v4_records_through_its_owner_unit(self):
+        """#62 closed the gap this test used to pin open.
+
+        V4 cannot satisfy the loop above: it reaches rt_record_header and
+        rt_record_token through COLI_V4_UNIT_ROUTE_TRACE's wrappers, since the
+        amalgamation compiles the same file once per unit and two inclusions of
+        route_trace.h would give two independent traces. The requirement is the
+        same one -- an engine that traces routing must also record a replay.
+        """
         text = (HERE.parent / "deepseek_v4.c").read_text(errors="replace")
-        self.assertNotIn("route_trace.h", text)
-        self.assertNotIn("rt_trace", text)
+        self.assertIn("rt_record_header", text,
+                      "deepseek_v4.c traces routing but never stamps a replay header")
+        self.assertIn("rt_record_token", text,
+                      "deepseek_v4.c traces routing but never records a token")
+        self.assertIn("rt_trace(", text,
+                      "deepseek_v4.c no longer traces routing")
 
 
 class LedgerShape(unittest.TestCase):
