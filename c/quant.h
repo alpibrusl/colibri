@@ -513,14 +513,60 @@ static inline int64_t fp8_nblk(int n){ return ((int64_t)n + FP8_BLOCK - 1) / FP8
  * is the GPU one; a vectorized CPU kernel is future work if measured needed).
  * Mirrors matmul_i3's double-accumulate-across-groups / float-within-group
  * convention so cross-block cancellation doesn't cost precision unfairly. */
+/* Four output rows at a time, each keeping its own single accumulator.
+ *
+ * The block loop `acc += e4m3_decode(w[i])*xs[i]` has one accumulator, so every
+ * add waits on the previous one and the kernel is bound by FP-add LATENCY
+ * (~4 cycles) rather than by the core's FP throughput -- measured 2.08
+ * Gparam/s on a core capable of several times that.
+ *
+ * The obvious fix is several accumulators WITHIN a block, and it is wrong here:
+ * it reassociates the sum. fp32 addition is not associative, ~88% of output
+ * rows then move by one ulp, and on the real 284B checkpoint that is enough to
+ * flip a near-tie and send greedy decoding down a different path -- measured,
+ * the text diverged at token ~30. The tiny CI oracle did not catch it.
+ *
+ * Interleaving ACROSS ROWS gets the same instruction-level parallelism with
+ * none of that: each row still sums its own block strictly in ascending i, so
+ * every row is bit-identical to the previous kernel, while four independent
+ * chains let the adds pipeline. Rows o..o+3 share a scale block because
+ * FP8_BLOCK is a multiple of 4, so the group never straddles a boundary.
+ *
+ * Portable C, not intrinsics, deliberately: for a [128,128]-block checkpoint
+ * block_rows is 128, so coli_fp8_dual_matvec_ref's vectorised branch (gated on
+ * block_rows==8) is skipped and BOTH x86 and aarch64 land here. Vectorising one
+ * of them by hand would make the two ISAs disagree token-for-token. */
 static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float *bscale,
                        int S, int I, int O){
     int64_t nblkI = fp8_nblk(I);
+    int Oq = O & ~3;
     #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){
+    for(int o=0;o<Oq;o+=4){
+        const uint8_t *w0 = q8 + (int64_t)o*I, *w1 = w0+I, *w2 = w1+I, *w3 = w2+I;
+        const float *scl = bscale + ((int64_t)o / FP8_BLOCK)*nblkI;
+        for(int s=0;s<S;s++){
+            const float *xs = x + (int64_t)s*I;
+            double a0=0,a1=0,a2=0,a3=0;
+            for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
+                int base=(int)(bi*FP8_BLOCK); int blen=FP8_BLOCK; if(base+blen>I) blen=I-base;
+                float sc=scl[bi]; float c0=0,c1=0,c2=0,c3=0;
+                for(int i=base;i<base+blen;i++){
+                    float xi = xs[i];
+                    c0 += e4m3_decode(w0[i])*xi;
+                    c1 += e4m3_decode(w1[i])*xi;
+                    c2 += e4m3_decode(w2[i])*xi;
+                    c3 += e4m3_decode(w3[i])*xi;
+                }
+                a0 += (double)c0*sc; a1 += (double)c1*sc;
+                a2 += (double)c2*sc; a3 += (double)c3*sc;
+            }
+            y[(int64_t)s*O+o  ]=(float)a0; y[(int64_t)s*O+o+1]=(float)a1;
+            y[(int64_t)s*O+o+2]=(float)a2; y[(int64_t)s*O+o+3]=(float)a3;
+        }
+    }
+    for(int o=Oq;o<O;o++){                     /* O is 2048/4096 in practice */
         const uint8_t *w = q8 + (int64_t)o*I;
-        int64_t blkO = o / FP8_BLOCK;
-        const float *scl = bscale + blkO*nblkI;
+        const float *scl = bscale + ((int64_t)o / FP8_BLOCK)*nblkI;
         for(int s=0;s<S;s++){
             const float *xs = x + (int64_t)s*I;
             double a=0;
