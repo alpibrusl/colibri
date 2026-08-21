@@ -1057,7 +1057,7 @@ static void expert_apply(Model *m, Slot *s, const float *z, float wk,
     if(g_k3_cuda && cuda_expert_apply(m,w1p,w1s,w2p,w2s,w3p,w3s,z,wk,u,gate,up,hz)) return;
 #endif
     void (*mm)(float*,const float*,const uint8_t*,const uint8_t*,int,int,int)
-        = g_k3_idot ? matmul_mxfp4_i8 : matmul_mxfp4;
+        = g_k3_idot ? matmul_mxfp4_i8 : matmul_mxfp4_dispatch;
     mm(gate,z,w1p,w1s,1,c->latent,c->moe_inter);
     mm(up,z,w3p,w3s,1,c->latent,c->moe_inter);
     for(int i=0;i<c->moe_inter;i++) gate[i]=situf_(gate[i],up[i],c->situ_b1,c->situ_b2);

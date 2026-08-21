@@ -28,6 +28,31 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def strip_comments(text):
+    """Blank out C comments, preserving line numbers.
+
+    The lint is about what the code REFERENCES, not about what the prose around
+    it discusses: these files legitimately name a kernel family in a comment
+    while calling a specific member of it.
+    """
+    out, i, n = [], 0, len(text)
+    while i < n:
+        if text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append("".join(ch if ch == "\n" else " " for ch in text[i:j]))
+            i = j
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            out.append(" " * (j - i))
+            i = j
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
 def function_bodies(text):
     """-> {name: body} for every static function definition in the file."""
     out = {}
@@ -45,11 +70,16 @@ def function_bodies(text):
 
 
 class KernelDispatchTest(unittest.TestCase):
-    SOURCES = ("quant.h", "deepseek_v4.c")
+    # every source that can name a kernel, not just the two that did when
+    # this was written -- kimi_k3.c took the retired name through a function
+    # POINTER, which the first version of this file was too narrow to see.
+    SOURCES = ("quant.h", "deepseek_v4.c", "kimi_k3.c", "colibri.c",
+               "olmoe.c", "inkling.c")
 
     def test_no_dispatcher_calls_itself(self):
         for src in self.SOURCES:
-            text = (ROOT / src).read_text(encoding="utf-8", errors="replace")
+            text = strip_comments(
+                (ROOT / src).read_text(encoding="utf-8", errors="replace"))
             for name, body in function_bodies(text).items():
                 if not name.endswith("_dispatch"):
                     continue
@@ -61,7 +91,7 @@ class KernelDispatchTest(unittest.TestCase):
 
     def test_mxfp4_dispatch_reaches_both_arms(self):
         """Every arm must name a DIFFERENT function, or one target is dead."""
-        text = (ROOT / "quant.h").read_text(encoding="utf-8")
+        text = strip_comments((ROOT / "quant.h").read_text(encoding="utf-8"))
         body = function_bodies(text)["matmul_mxfp4_dispatch"]
         called = set(re.findall(r"\b(matmul_mxfp4\w*)\s*\(", body))
         self.assertEqual(
@@ -70,19 +100,26 @@ class KernelDispatchTest(unittest.TestCase):
             f"one per arm; it calls {sorted(called) or 'none'}")
         self.assertNotIn("matmul_mxfp4_dispatch", called)
 
-    def test_no_stale_callers_of_the_renamed_kernel(self):
-        """`matmul_mxfp4(` no longer exists; a caller using it must not compile.
+    def test_nothing_names_the_retired_kernel(self):
+        """The bare name `matmul_mxfp4` is retired; nothing may reference it.
 
         The original was renamed to matmul_mxfp4_scalar_or_avx2 precisely so a
-        stale or accidentally-rewritten call is a compile error rather than a
-        silent slow path or a silent loop.
+        stale reference is a compile error rather than a silent slow path or a
+        silent loop.
+
+        Matched as an IDENTIFIER, not as a call. kimi_k3.c selects the kernel
+        through a function pointer — `g_k3_idot ? matmul_mxfp4_i8 :
+        matmul_mxfp4` — with no parenthesis anywhere, and a call-shaped pattern
+        walks straight past it. That is exactly how this caller survived the
+        rename and broke four CI builds.
         """
         for src in self.SOURCES:
-            text = (ROOT / src).read_text(encoding="utf-8", errors="replace")
-            self.assertNotRegex(
-                text, r"(?<!coli_cuda_)\bmatmul_mxfp4\s*\(",
-                f"{src}: calls matmul_mxfp4() — that name was retired; use "
-                "matmul_mxfp4_dispatch()")
+            text = strip_comments(
+                (ROOT / src).read_text(encoding="utf-8", errors="replace"))
+            for m in re.finditer(r"(?<![\w])matmul_mxfp4(?![\w])", text):
+                line = text.count("\n", 0, m.start()) + 1
+                self.fail(f"{src}:{line} names the retired kernel matmul_mxfp4; "
+                          "use matmul_mxfp4_dispatch()")
 
 
 if __name__ == "__main__":
