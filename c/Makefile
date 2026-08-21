@@ -1001,6 +1001,14 @@ endif
 tests/test_route_trace$(EXE): tests/test_route_trace.c route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# Unconditional, like the other V4 infrastructure tests: COLI_V4_UNIT_BLOCK_PROFILE
+# is clock_gettime plus __atomic_fetch_add, so it is a portable gate on every host
+# even where the V4 runtime itself is not supported. Compiling deepseek_v4.c with
+# only this unit defined leaves every other unit's #ifdef inactive.
+tests/test_v4_block_profile$(EXE): tests/test_v4_block_profile.c deepseek_v4.c \
+		deepseek_v4.h deepseek_v4_internal.h
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_BLOCK_PROFILE $< deepseek_v4.c -o $@ -pthread $(LDFLAGS)
+
 tests/test_dsa_select$(EXE): tests/test_dsa_select.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

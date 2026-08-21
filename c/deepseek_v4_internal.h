@@ -152,6 +152,34 @@ void coli_v4_rt_route(int layer, int row, const int *ids, const float *gates,
 void coli_v4_rt_call_end(void);
 void coli_v4_rt_token(int token);
 
+/* Phase attribution (#62 gate 2). The V4 baseline measured device time at ~2.5%
+ * of a run and the expert cache within 0.14 pp of its ceiling, leaving ~97% of
+ * wall clock unaccounted for. These counters name where it goes.
+ *
+ * Defined by COLI_V4_UNIT_BLOCK_PROFILE, which owns them for the same reason
+ * COLI_V4_UNIT_ROUTE_TRACE owns the trace: this file is compiled once per
+ * COLI_V4_UNIT_*, so a counter defined in a header would be a different counter
+ * in every object, and each total would hold only the fraction of the run that
+ * happened to run in that unit -- a plausible number that is quietly wrong.
+ *
+ * Always on, like the expert-store disk/matmul accounting and unlike the
+ * compile-gated scaffold this replaces: a profiler you have to rebuild for
+ * cannot answer "where did this run's time go", and the cost is two
+ * clock_gettime calls per MoE invocation and per expert load -- ~7k reads in a
+ * run that takes 138 s, measured below the run-to-run noise floor.
+ */
+enum {
+    COLI_V4_BLOCK_PROFILE_MOE_TOTAL = 0,
+    COLI_V4_BLOCK_PROFILE_GATE_DECODE = 1,
+    COLI_V4_BLOCK_PROFILE_LOADER_START = 2,
+    COLI_V4_BLOCK_PROFILE_LOADER_WAIT = 3,
+    COLI_V4_BLOCK_PROFILE_ATTENTION = 4,
+    COLI_V4_BLOCK_PROFILE_KINDS = 5,
+};
+double coli_v4_block_profile_now(void);
+void coli_v4_block_profile_add(int kind, double seconds);
+double coli_v4_block_profile_seconds(int kind);
+
 #ifdef __cplusplus
 }
 #endif
