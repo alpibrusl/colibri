@@ -9,6 +9,20 @@ asserted. The baseline is below, and the single most important thing in it is
 that **the headline metric depends almost entirely on how many tokens you
 generate**. A hit rate quoted without a sequence length is not a measurement.
 
+> **Correction, same day (#62 gate 2).** Every timing below was measured on a
+> binary built **single-threaded**: this host had no `libomp`, so the Makefile's
+> Darwin branch silently fell back, on a 16-core machine. Installing it makes the
+> same prompt **4.6× faster** (95.1 s → 20.7 s) and the 128-token run **7.5×
+> faster** (948.9 s → 125.9 s, 0.161 → 1.017 tok/s), with byte-identical counters
+> and identical output. That accounts for most of the "~97% of wall clock
+> unaccounted for" this document reports below.
+>
+> Hit rates, byte counts, ceilings and the sequence-length finding are
+> **unaffected** — they are properties of routing and the cache, and OpenMP
+> changes neither (counters verified identical to the digit). Read the *timings*
+> as single-threaded; `deepseek-v4-phase-attribution-2026-08-21.md` is the
+> authority on where time goes.
+
 ## The baseline
 
 Prompt `What is the capital of France?` (9 generated tokens), one workstation:
@@ -121,6 +135,14 @@ out of 948.9 s — about 2.5%**, and the device has ~35× more throughput than t
 engine draws. Compression, smaller experts and cheaper container formats — the
 levers that pay when streaming is bandwidth-bound — cannot buy much here. The
 bytes are not the problem.
+
+**This conclusion survives the OpenMP correction**, which is not obvious and was
+worth testing rather than assuming. On a properly built binary the run is 7.5×
+faster while the reads are not, so I/O is far more exposed — `loader_wait` goes
+from ~0.4% of wall to ~10%. Measured directly at 128 tokens under OpenMP,
+`--ram 24` against `--ram 32` is **22% more bytes for 1.2% more wall clock** and
+0.3% more MoE time. Still decoupled: I/O is closer to binding than it was, and
+still not binding.
 
 So: **~97% of the wall clock is somewhere we cannot see** — compute, or failure
 to overlap fetch with compute, or scheduling.
