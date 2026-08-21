@@ -7513,11 +7513,55 @@ static int head_argmax(ColiV4Engine *engine, const float *hidden,
     if (resident) {
         float *scores = malloc((size_t)vocab * sizeof(*scores));
         if (!scores) return -1;
+        /* Four vocabulary rows in flight, each keeping its own serial sum.
+         *
+         * head_bf16_dot accumulates one `sum` over 4096 columns, so every add
+         * waits on the previous and the dot is bound by FP-add latency rather
+         * than by the core's FP throughput -- the same defect #68 fixed in
+         * matmul_fp8 and #71 in matmul_mxfp4. It matters here for the same
+         * reason it mattered there: the head is 129280 x 4096 bf16, 1.06 GB
+         * read per token, and a sampled profile puts this function at 9.0% of
+         * all compute -- third behind the two expert kernels.
+         *
+         * Interleaving across ROWS, not within a row, is what keeps the logits
+         * unchanged: each row still sums its columns in ascending order, so
+         * every score is bit-identical and the argmax below cannot see the
+         * difference. Reassociating inside a row would be faster still and
+         * would move the logits, which on a 129280-way argmax is exactly where
+         * a near-tie flips -- #68 measured that happening on the real
+         * checkpoint from a one-ulp change.
+         *
+         * The tail keeps the original one-row call, so a vocab that is not a
+         * multiple of four is unaffected. */
+        /* x86 keeps head_bf16_dot: its AVX2 arm already vectorises the products
+         * (then sums them serially, to hold the accumulation order). Replacing
+         * that with a scalar four-row loop would trade a vectorised inner loop
+         * for row-level ILP on a platform that has both -- possibly a
+         * regression, and not measurable from here. aarch64 has no arm at all,
+         * so it is pure gain. Both forms produce identical scores, so this is a
+         * code-path split and not an output split. */
+#if defined(__AVX2__)
+        int vocab_quad = 0;
+#else
+        int vocab_quad = vocab & ~3;
+#endif
         #pragma omp parallel for schedule(static)
-        for (int row = 0; row < vocab; row++) {
-            const uint16_t *weight = resident + (size_t)row * d;
-            scores[row] = head_bf16_dot(weight, hidden, d);
+        for (int row = 0; row < vocab_quad; row += 4) {
+            const uint16_t *w0 = resident + (size_t)row * d;
+            const uint16_t *w1 = w0 + d, *w2 = w1 + d, *w3 = w2 + d;
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+            for (int column = 0; column < d; column++) {
+                float h = hidden[column];
+                s0 += coli_bf16_decode(w0[column]) * h;
+                s1 += coli_bf16_decode(w1[column]) * h;
+                s2 += coli_bf16_decode(w2[column]) * h;
+                s3 += coli_bf16_decode(w3[column]) * h;
+            }
+            scores[row] = s0; scores[row + 1] = s1;
+            scores[row + 2] = s2; scores[row + 3] = s3;
         }
+        for (int row = vocab_quad; row < vocab; row++)
+            scores[row] = head_bf16_dot(resident + (size_t)row * d, hidden, d);
         int winner = -1;
         float maximum = -FLT_MAX;
         for (int row = 0; row < vocab; row++)
