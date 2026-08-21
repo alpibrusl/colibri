@@ -3144,6 +3144,7 @@ static int moe_token(float *output,
                      const ColiDeepSeekV4LayerWeights *weights,
                      const ColiDeepSeekV4Config *config,
                      ColiExpertStore *store, const float *input, int token) {
+    double profile_moe_began = coli_v4_block_profile_now();
     int d = config->hidden_size;
     int n = config->n_routed_experts;
     int topk = config->num_experts_per_tok;
@@ -3210,6 +3211,8 @@ static int moe_token(float *output,
             output[i] = coli_bf16_round(output[i] + shared_output[i]);
     free(shared_output); free(expert_output); free(indices);
     free(route_weights); free(gate);
+    coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_MOE_TOTAL,
+                              coli_v4_block_profile_now() - profile_moe_began);
     coli_v4_rt_call_end();          /* this moe invocation is fully traced */
     return result;
 }
@@ -3240,11 +3243,14 @@ static int block_token_impl(float *output_hc,
     memcpy(residual, input_hc, hd * sizeof(*residual));
     int result = normalized_hc_pre(reduced, post, comb, normalized, input_hc,
                                    weights, config, "attn", "attn_norm.weight");
+    double profile_attn_began = coli_v4_block_profile_now();
     if (!result) result = attention
         ? coli_v4_attention_window_token_ref(branch, attention, weights, config,
                                              normalized, position, error, error_size)
         : coli_v4_attention_token_ref(branch, weights, config, normalized,
                                       position, error, error_size);
+    coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_ATTENTION,
+                              coli_v4_block_profile_now() - profile_attn_began);
     if (!result) result = coli_v4_hc_post(state, branch, residual, post, comb, hc, d);
     if (!result) coli_bf16_round_array(state, hd);
 
@@ -3602,17 +3608,6 @@ static int expert_load_finish(ExpertLoadHandle *handle) {
 #endif
 }
 
-#ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
-enum {
-    COLI_V4_BLOCK_PROFILE_MOE_TOTAL = 0,
-    COLI_V4_BLOCK_PROFILE_GATE_DECODE = 1,
-    COLI_V4_BLOCK_PROFILE_LOADER_START = 2,
-    COLI_V4_BLOCK_PROFILE_LOADER_WAIT = 3,
-};
-double coli_v4_block_profile_now(void);
-void coli_v4_block_profile_add(int kind, double seconds);
-#endif
-
 /* #890: expert-forward compute accounting — defined in the expert-store unit,
  * called here around the matmul, read per-turn in the serve loop. Always on
  * (unlike the block profiler above), because the dashboard always needs it. */
@@ -3627,26 +3622,18 @@ static double v4_now_mono(void) {   /* #890 phase timing, same clock as disk_sec
 
 static int profiled_expert_load_start(ExpertLoadHandle *handle,
                                       ExpertLoadJob *job) {
-#ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     double began = coli_v4_block_profile_now();
-#endif
     int result = expert_load_start(handle, job);
-#ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_LOADER_START,
                               coli_v4_block_profile_now() - began);
-#endif
     return result;
 }
 
 static int profiled_expert_load_finish(ExpertLoadHandle *handle) {
-#ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     double began = coli_v4_block_profile_now();
-#endif
     int result = expert_load_finish(handle);
-#ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_LOADER_WAIT,
                               coli_v4_block_profile_now() - began);
-#endif
     return result;
 }
 
@@ -3655,9 +3642,7 @@ static int moe_token_pipeline(float *output,
                               const ColiDeepSeekV4Config *config,
                               ColiExpertStore *store,
                               const float *input, int token) {
-#ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     double profile_moe_began = coli_v4_block_profile_now();
-#endif
     int d = config->hidden_size;
     int n = config->n_routed_experts;
     int topk = config->num_experts_per_tok;
@@ -3682,15 +3667,15 @@ static int moe_token_pipeline(float *output,
         free(expert_ids); free(indices); free(route_weights); free(gate);
         return -1;
     }
+/* GATE_DECODE reports 0 in a default build: the whole block is inside
+ * COLI_V4_DISABLE_BF16_ROUTE, so the fp8 gate decode it times does not run
+ * unless the bf16 router was compiled out. Reported anyway rather than
+ * dropped -- a phase that is genuinely zero is information. */
 #ifdef COLI_V4_DISABLE_BF16_ROUTE
-#ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     double profile_gate_began = coli_v4_block_profile_now();
-#endif
     decode_bf16(gate, value(weights, "ffn.gate.weight", NULL), gate_count);
-#ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_GATE_DECODE,
                               coli_v4_block_profile_now() - profile_gate_began);
-#endif
 #endif
     const int64_t *table = value(weights, "ffn.gate.tid2eid", NULL);
     const float *bias = value(weights, "ffn.gate.bias", NULL);
@@ -3866,10 +3851,8 @@ static int moe_token_pipeline(float *output,
 
     free(shared_output); free(expert_output); free(expert_weights);
     free(expert_ids); free(indices); free(route_weights); free(gate);
-#ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_MOE_TOTAL,
                               coli_v4_block_profile_now() - profile_moe_began);
-#endif
     coli_v4_rt_call_end();          /* this moe invocation is fully traced */
     return result;
 }
@@ -3900,11 +3883,14 @@ static int block_token_pipeline(float *output_hc,
     memcpy(residual, input_hc, hd * sizeof(*residual));
     int result = normalized_hc_pre(reduced, post, comb, normalized, input_hc,
                                    weights, config, "attn", "attn_norm.weight");
+    double profile_attn_began = coli_v4_block_profile_now();
     if (!result) result = attention
         ? coli_v4_attention_window_token_ref(branch, attention, weights, config,
                                              normalized, position, error, error_size)
         : coli_v4_attention_token_ref(branch, weights, config, normalized,
                                       position, error, error_size);
+    coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_ATTENTION,
+                              coli_v4_block_profile_now() - profile_attn_began);
     if (!result) result = coli_v4_hc_post(state, branch, residual,
                                           post, comb, hc, d);
     if (!result) coli_bf16_round_array(state, hd);
@@ -3975,6 +3961,7 @@ static int v4_moe_batch_union(
     float *outputs, const ColiDeepSeekV4LayerWeights *weights,
     const ColiDeepSeekV4Config *config, ColiExpertStore *store,
     const float *inputs, const int *tokens, int batch) {
+    double profile_moe_began = coli_v4_block_profile_now();
     int d = config->hidden_size;
     int n = config->n_routed_experts;
     int topk = config->num_experts_per_tok;
@@ -4147,6 +4134,8 @@ static int v4_moe_batch_union(
 
     free(keys); free(used); free(expert_output); free(shared);
     free(indices); free(route_weights); free(gate);
+    coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_MOE_TOTAL,
+                              coli_v4_block_profile_now() - profile_moe_began);
     coli_v4_rt_call_end();          /* one moe invocation, `batch` rows traced */
     return result ? -1 : 0;
 }
@@ -4198,9 +4187,12 @@ int coli_v4_block_window_batch_ref(
             inputs_hc + (size_t)item * hd,
             weights, config, "attn", "attn_norm.weight");
     phase = "attention";
+    double profile_attn_began = coli_v4_block_profile_now();
     if (!result) result = coli_v4_attention_window_batch_ref(
         branches, attention, weights, config, normalized,
         start_position, batch, error, error_size);
+    coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_ATTENTION,
+                              coli_v4_block_profile_now() - profile_attn_began);
     if (!result) phase = "attention post / FFN hyper-connection";
     for (int item = 0; !result && item < batch; item++) {
         float *state = states + (size_t)item * hd;
@@ -6815,6 +6807,44 @@ void coli_v4_rt_call_end(void) { rt_trace_end(); }
  * run did not produce. session_emit_token() is the single commit point. */
 void coli_v4_rt_token(int token) { rt_record_token(token); }
 #endif /* COLI_V4_UNIT_ROUTE_TRACE */
+
+#ifdef COLI_V4_UNIT_BLOCK_PROFILE
+/* ######## deepseek_v4_block_profile.c / phase attribution (#62 gate 2) ######## */
+#include "deepseek_v4_internal.h"
+
+#include <stdint.h>
+#include <time.h>
+
+/* Nanoseconds in uint64_t, not seconds in double.
+ *
+ * The expert loaders are real pthreads (dual_loader_pool, persistent_loader),
+ * so `total += seconds` from a loader thread is a data race: ThreadSanitizer
+ * fails it in CI, and before that it silently drops samples, which is the worse
+ * outcome because the total still looks like a number. __atomic_fetch_add on an
+ * integer is the idiom v4_direct_reads already uses in this file; there is no
+ * portable lock-free add for a double.
+ *
+ * Nanoseconds hold ~584 years in uint64_t, so overflow is not a concern. */
+static uint64_t v4_phase_ns[COLI_V4_BLOCK_PROFILE_KINDS];
+
+double coli_v4_block_profile_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);   /* same clock as v4_now_mono/disk_sec */
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+void coli_v4_block_profile_add(int kind, double seconds) {
+    if (kind < 0 || kind >= COLI_V4_BLOCK_PROFILE_KINDS) return;
+    if (!(seconds > 0.0)) return;          /* also rejects NaN */
+    __atomic_fetch_add(&v4_phase_ns[kind],
+                       (uint64_t)(seconds * 1e9), __ATOMIC_RELAXED);
+}
+
+double coli_v4_block_profile_seconds(int kind) {
+    if (kind < 0 || kind >= COLI_V4_BLOCK_PROFILE_KINDS) return 0.0;
+    return (double)__atomic_load_n(&v4_phase_ns[kind], __ATOMIC_RELAXED) * 1e-9;
+}
+#endif /* COLI_V4_UNIT_BLOCK_PROFILE */
 
 #ifdef COLI_V4_UNIT_RUNTIME
 /* ######## deepseek_v4_runtime.c / engine ######## */
@@ -9552,6 +9582,37 @@ int main(int argc, char **argv) {
     if (out_len) fwrite(out_text, 1, out_len, stderr);
     fprintf(stderr, "\ntiming time_to_first_token=%.3fs after_first=%.3fs\n",
            gen_stats.time_to_first_token_sec, gen_stats.decode_sec);
+
+    /* Phase attribution (#62 gate 2). The V4 baseline could say what the run was
+     * NOT bound by -- device time ~2.5%, the expert cache within 0.14 pp of its
+     * ceiling -- and could not say what it WAS bound by. This line answers that.
+     *
+     * `other` is the residual: hyper-connections, norms, the head, embedding and
+     * tokenisation, plus any phase nobody has timed yet. It is deliberately a
+     * subtraction rather than a sum of named parts, so a phase that is missing
+     * shows up as a large unexplained remainder instead of silently vanishing
+     * from a total that still adds to 100%.
+     *
+     * moe and attention are wall-clock spans that CONTAIN their own sub-phases:
+     * loader_start/loader_wait/expert_disk/expert_matmul all happen inside moe,
+     * so those must not be added to it. They are printed as a breakdown of moe,
+     * not as siblings. With OpenMP the loader figures are summed across threads
+     * and can exceed the moe span they sit inside; that is thread-seconds, not
+     * wall-seconds, and the label says so. */
+    double phase_wall = gen_stats.time_to_first_token_sec + gen_stats.decode_sec;
+    double phase_moe = coli_v4_block_profile_seconds(COLI_V4_BLOCK_PROFILE_MOE_TOTAL);
+    double phase_attn = coli_v4_block_profile_seconds(COLI_V4_BLOCK_PROFILE_ATTENTION);
+    fprintf(stderr,
+            "v4_phase wall=%.3f moe=%.3f attention=%.3f other=%.3f\n"
+            "v4_phase_moe_inner gate_decode=%.3f loader_start=%.3f "
+            "loader_wait=%.3f expert_disk=%.3f expert_matmul=%.3f (thread-seconds)\n",
+            phase_wall, phase_moe, phase_attn,
+            phase_wall - phase_moe - phase_attn,
+            coli_v4_block_profile_seconds(COLI_V4_BLOCK_PROFILE_GATE_DECODE),
+            coli_v4_block_profile_seconds(COLI_V4_BLOCK_PROFILE_LOADER_START),
+            coli_v4_block_profile_seconds(COLI_V4_BLOCK_PROFILE_LOADER_WAIT),
+            engine->experts ? coli_v4_expert_store_disk_sec(engine->experts) : 0.0,
+            engine->experts ? coli_v4_expert_store_matmul_sec(engine->experts) : 0.0);
 
     /* Alias session buffers for optional record-oracle path.
      * cleanup must destroy the session and must not free these aliases. */
