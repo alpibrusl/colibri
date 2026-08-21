@@ -524,6 +524,38 @@ class ReplayDiff(unittest.TestCase):
             path.unlink(missing_ok=True)
 
 
+class ReplayRecordCoverage(unittest.TestCase):
+    """Every engine that can trace routing must also record a replay (#15).
+
+    The record shipped covering colibri.c alone. Four other engines call
+    rt_trace, and on any of them COLI_REPLAY_RECORD silently produced nothing --
+    exactly the "a fix lands in one engine and not its siblings" shape
+    route_trace.h:373 names as this tree's recurring defect, and the reason #12
+    exists. This makes the next omission a test failure instead of a silent one.
+
+    deepseek_v4 is excluded on purpose: it does not include route_trace.h at
+    all, so it has no routing telemetry to extend. That is a larger gap, tracked
+    separately, not an oversight here.
+    """
+
+    ENGINES = ("colibri", "olmoe", "inkling", "kimi_k3")
+
+    def test_every_tracing_engine_records(self):
+        src = HERE.parent
+        for e in self.ENGINES:
+            text = (src / f"{e}.c").read_text(errors="replace")
+            self.assertIn("rt_record_header", text,
+                          f"{e}.c traces routing but never stamps a replay header")
+            self.assertIn("rt_record_token", text,
+                          f"{e}.c traces routing but never records a token")
+
+    def test_deepseek_v4_has_no_routing_telemetry_yet(self):
+        """Pins the known gap so it is a documented fact, not a surprise."""
+        text = (HERE.parent / "deepseek_v4.c").read_text(errors="replace")
+        self.assertNotIn("route_trace.h", text)
+        self.assertNotIn("rt_trace", text)
+
+
 class LedgerShape(unittest.TestCase):
     """Claims are integers, flat, and scaled the same way everywhere."""
 

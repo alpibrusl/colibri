@@ -1594,8 +1594,11 @@ static int sample_prob_desc(const void *a,const void *b){
     float d=((const SampleProb*)b)->p-((const SampleProb*)a)->p;
     return d>0?1:d<0?-1:0;
 }
+/* #15: token stream taken inside the sampler -- kimi_k3 has no speculative
+ * decode, so sampled == emitted, and every call site is covered by construction
+ * rather than by remembering to hook each one. */
 static int sample_tok(const float *lo, int V, float temp, float top_p){
-    if(temp<=0.f){ int b=0; for(int i=1;i<V;i++) if(lo[i]>lo[b]) b=i; return b; }
+    if(temp<=0.f){ int b=0; for(int i=1;i<V;i++) if(lo[i]>lo[b]) b=i; return (rt_record_token(b), b); }
     SampleProb *rank=malloc((size_t)V*sizeof(SampleProb)); float mx=lo[0];
     if(!rank){ fprintf(stderr,"OOM sampling\n"); exit(1); }
     for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];
@@ -1606,7 +1609,7 @@ static int sample_tok(const float *lo, int V, float temp, float top_p){
     while(n<V&&kept<cut) kept+=rank[n++].p;
     double r=((double)rand()/RAND_MAX)*kept, acc=0; int pick=rank[0].id;
     for(int i=0;i<n;i++){ acc+=rank[i].p; if(acc>=r){ pick=rank[i].id; break; } }
-    free(rank); return pick;
+    free(rank); return (rt_record_token(pick), pick);
 }
 
 /* ---------- K3 XTML chat format (faithful to the shipped encoding_k3.py) --
@@ -1819,6 +1822,7 @@ static void serve_data(const char *id, const char *p, int n){
 }
 
 static void serve_one(Model *m, Tok *T, ServeReq *q){
+    rt_record_header("kimi_k3", m->c.n_layers, m->c.n_experts, 0ULL, (double)q->temp, (double)q->top_p);
     int cap=65536, *ids=malloc((size_t)cap*sizeof(int)), np=0;
     if(!ids){ printf("ERROR %s out of memory\n",q->id); fflush(stdout); return; }
     int sp[4]={-1,-1,-1,-1}, chat=0, thinking=0;
