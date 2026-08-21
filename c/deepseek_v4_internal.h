@@ -174,7 +174,14 @@ enum {
     COLI_V4_BLOCK_PROFILE_LOADER_START = 2,
     COLI_V4_BLOCK_PROFILE_LOADER_WAIT = 3,
     COLI_V4_BLOCK_PROFILE_ATTENTION = 4,
-    COLI_V4_BLOCK_PROFILE_KINDS = 5,
+    /* Naming MoE's remainder. Gate 2 left ~40% of the MoE span unattributed;
+     * these two split it. The shared expert is one fp8 expert per layer per
+     * token running a different kernel from the six routed int4 ones, and the
+     * router decodes a 256 x hidden gate every call -- both plausible, neither
+     * measured until now. */
+    COLI_V4_BLOCK_PROFILE_SHARED_EXPERT = 5,
+    COLI_V4_BLOCK_PROFILE_ROUTER = 6,
+    COLI_V4_BLOCK_PROFILE_KINDS = 7,
 };
 double coli_v4_block_profile_now(void);
 void coli_v4_block_profile_add(int kind, double seconds);

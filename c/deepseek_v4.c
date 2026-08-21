@@ -3184,8 +3184,11 @@ static int moe_token(float *output,
     if (!result && (fp8_view(&w1, weights, "ffn.shared_experts.w1") ||
                     fp8_view(&w2, weights, "ffn.shared_experts.w2") ||
                     fp8_view(&w3, weights, "ffn.shared_experts.w3"))) result = -1;
+    double profile_shared_began = coli_v4_block_profile_now();
     if (!result) result = coli_v4_shared_expert_forward_ref(
         shared_output, &w1, &w2, &w3, input, config->swiglu_limit);
+    coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_SHARED_EXPERT,
+                              coli_v4_block_profile_now() - profile_shared_began);
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
     for (int expert_id = 0; !result && expert_id < n; expert_id++) {
         int rank = -1;
@@ -3684,6 +3687,7 @@ static int moe_token_pipeline(float *output,
     if (!result && weights->plan.uses_hash_router)
         for (int i = 0; i < topk; i++)
             indices[i] = (int)table[(size_t)token * topk + i];
+    double profile_router_began = coli_v4_block_profile_now();
 #ifndef COLI_V4_DISABLE_BF16_ROUTE
     if (!result) result = coli_v4_route_bf16(
         route_weights, indices, input, raw_gate, bias,
@@ -3695,6 +3699,8 @@ static int moe_token_pipeline(float *output,
         weights->plan.uses_hash_router ? indices : NULL,
         n, d, topk, config->routed_scaling_factor);
 #endif
+    coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_ROUTER,
+                              coli_v4_block_profile_now() - profile_router_began);
     /* After the #endif, so the bf16 router and the fp8 fallback are traced by
      * one hook. Putting it inside either arm would make the capture depend on
      * how the binary was configured, which is precisely the kind of difference
@@ -3764,8 +3770,11 @@ static int moe_token_pipeline(float *output,
     if (!result && (fp8_view(&w1, weights, "ffn.shared_experts.w1") ||
                     fp8_view(&w2, weights, "ffn.shared_experts.w2") ||
                     fp8_view(&w3, weights, "ffn.shared_experts.w3"))) result = -1;
+    double profile_shared_began = coli_v4_block_profile_now();
     if (!result) result = coli_v4_shared_expert_forward_ref(
         shared_output, &w1, &w2, &w3, input, config->swiglu_limit);
+    coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_SHARED_EXPERT,
+                              coli_v4_block_profile_now() - profile_shared_began);
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
@@ -4034,10 +4043,13 @@ static int v4_moe_batch_union(
          fp8_view(&w2, weights, "ffn.shared_experts.w2") ||
          fp8_view(&w3, weights, "ffn.shared_experts.w3")))
         result = -1;
+    double profile_shared_began = coli_v4_block_profile_now();
     for (int item = 0; !result && item < batch; item++)
         result = coli_v4_shared_expert_forward_ref(
             shared + (size_t)item * d, &w1, &w2, &w3,
             inputs + (size_t)item * d, config->swiglu_limit);
+    coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_SHARED_EXPERT,
+                              coli_v4_block_profile_now() - profile_shared_began);
     if (!result)
         memset(outputs, 0, (size_t)batch * d * sizeof(*outputs));
 
@@ -9593,26 +9605,35 @@ int main(int argc, char **argv) {
      * shows up as a large unexplained remainder instead of silently vanishing
      * from a total that still adds to 100%.
      *
-     * moe and attention are wall-clock spans that CONTAIN their own sub-phases:
-     * loader_start/loader_wait/expert_disk/expert_matmul all happen inside moe,
-     * so those must not be added to it. They are printed as a breakdown of moe,
-     * not as siblings. With OpenMP the loader figures are summed across threads
-     * and can exceed the moe span they sit inside; that is thread-seconds, not
-     * wall-seconds, and the label says so. */
+     * moe and attention are wall-clock spans that CONTAIN their own sub-phases,
+     * so a sub-phase must never be added to the span it sits inside.
+     *
+     * The sub-phases are NOT all the same kind of number, which is the trap.
+     * routed_matmul, shared_expert, router, loader_wait and loader_start are
+     * all measured on the calling thread around serial work, so they are
+     * wall-clock and comparable with the moe span directly. expert_disk is
+     * accumulated by whichever loader lane performed the read, so it is
+     * thread-seconds: it overlaps compute and can exceed the span that contains
+     * it. It gets its own line saying so, because printing it next to
+     * wall-clock figures invites exactly the comparison that is invalid. */
     double phase_wall = gen_stats.time_to_first_token_sec + gen_stats.decode_sec;
     double phase_moe = coli_v4_block_profile_seconds(COLI_V4_BLOCK_PROFILE_MOE_TOTAL);
     double phase_attn = coli_v4_block_profile_seconds(COLI_V4_BLOCK_PROFILE_ATTENTION);
     fprintf(stderr,
             "v4_phase wall=%.3f moe=%.3f attention=%.3f other=%.3f\n"
-            "v4_phase_moe_inner gate_decode=%.3f loader_start=%.3f "
-            "loader_wait=%.3f expert_disk=%.3f expert_matmul=%.3f (thread-seconds)\n",
+            "v4_phase_moe_inner routed_matmul=%.3f shared_expert=%.3f "
+            "router=%.3f loader_wait=%.3f loader_start=%.3f gate_decode=%.3f\n"
+            "v4_phase_io expert_disk=%.3f (thread-seconds: summed across the "
+            "loader lanes and overlapped with compute, NOT a wall-clock span)\n",
             phase_wall, phase_moe, phase_attn,
             phase_wall - phase_moe - phase_attn,
-            coli_v4_block_profile_seconds(COLI_V4_BLOCK_PROFILE_GATE_DECODE),
-            coli_v4_block_profile_seconds(COLI_V4_BLOCK_PROFILE_LOADER_START),
+            engine->experts ? coli_v4_expert_store_matmul_sec(engine->experts) : 0.0,
+            coli_v4_block_profile_seconds(COLI_V4_BLOCK_PROFILE_SHARED_EXPERT),
+            coli_v4_block_profile_seconds(COLI_V4_BLOCK_PROFILE_ROUTER),
             coli_v4_block_profile_seconds(COLI_V4_BLOCK_PROFILE_LOADER_WAIT),
-            engine->experts ? coli_v4_expert_store_disk_sec(engine->experts) : 0.0,
-            engine->experts ? coli_v4_expert_store_matmul_sec(engine->experts) : 0.0);
+            coli_v4_block_profile_seconds(COLI_V4_BLOCK_PROFILE_LOADER_START),
+            coli_v4_block_profile_seconds(COLI_V4_BLOCK_PROFILE_GATE_DECODE),
+            engine->experts ? coli_v4_expert_store_disk_sec(engine->experts) : 0.0);
 
     /* Alias session buffers for optional record-oracle path.
      * cleanup must destroy the session and must not free these aliases. */
