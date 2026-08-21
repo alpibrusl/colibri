@@ -6654,13 +6654,17 @@ int coli_v4_expert_forward_ref(float *output, const ColiExpertView *expert,
                                const float *input, float route_weight,
                                float swiglu_limit) {
 #ifndef COLI_FP4_ROWS16_KERNEL
+    coli_v4_expert_path_count(COLI_V4_EXPERT_PATH_FALLBACK);
     return coli_v4_expert_forward_v17_fallback(
         output, expert, input, route_weight, swiglu_limit);
 #else
     if (!expert || expert->gate.block_rows != 16 ||
-        expert->down.block_rows != 16 || expert->up.block_rows != 16)
+        expert->down.block_rows != 16 || expert->up.block_rows != 16) {
+        coli_v4_expert_path_count(COLI_V4_EXPERT_PATH_FALLBACK);
         return coli_v4_expert_forward_v17_fallback(
             output, expert, input, route_weight, swiglu_limit);
+    }
+    coli_v4_expert_path_count(COLI_V4_EXPERT_PATH_ROWS16);
     if (!output || !input || swiglu_limit < 0.0f) return -1;
     size_t intermediate = (size_t)expert->gate.rows;
     size_t output_size = (size_t)expert->down.rows;
@@ -6855,6 +6859,22 @@ void coli_v4_block_profile_add(int kind, double seconds) {
 double coli_v4_block_profile_seconds(int kind) {
     if (kind < 0 || kind >= COLI_V4_BLOCK_PROFILE_KINDS) return 0.0;
     return (double)__atomic_load_n(&v4_phase_ns[kind], __ATOMIC_RELAXED) * 1e-9;
+}
+
+/* Relaxed atomics again: the expert forward runs on the calling thread, but
+ * nothing here guarantees a single caller, and a torn counter would make the
+ * one artefact that explains an oracle failure untrustworthy. */
+static uint64_t v4_expert_path_n[COLI_V4_EXPERT_PATHS];
+
+void coli_v4_expert_path_count(int path) {
+    if (path < 0 || path >= COLI_V4_EXPERT_PATHS) return;
+    __atomic_fetch_add(&v4_expert_path_n[path], UINT64_C(1), __ATOMIC_RELAXED);
+}
+
+unsigned long long coli_v4_expert_path_get(int path) {
+    if (path < 0 || path >= COLI_V4_EXPERT_PATHS) return 0;
+    return (unsigned long long)__atomic_load_n(&v4_expert_path_n[path],
+                                               __ATOMIC_RELAXED);
 }
 #endif /* COLI_V4_UNIT_BLOCK_PROFILE */
 
@@ -9619,6 +9639,17 @@ int main(int argc, char **argv) {
     double phase_wall = gen_stats.time_to_first_token_sec + gen_stats.decode_sec;
     double phase_moe = coli_v4_block_profile_seconds(COLI_V4_BLOCK_PROFILE_MOE_TOTAL);
     double phase_attn = coli_v4_block_profile_seconds(COLI_V4_BLOCK_PROFILE_ATTENTION);
+    /* #69: two kernels can compute an expert, and which one runs depends on
+     * cache layout rather than on the model. Printed next to the phase timings
+     * because it is the first thing to check when two supposedly identical runs
+     * disagree -- a differing mix here IS the explanation. */
+    unsigned long long path_packed = coli_v4_expert_path_get(COLI_V4_EXPERT_PATH_ROWS16);
+    unsigned long long path_fallback = coli_v4_expert_path_get(COLI_V4_EXPERT_PATH_FALLBACK);
+    fprintf(stderr, "v4_dispatch rows16=%llu fallback=%llu fallback_pct=%.3f\n",
+            path_packed, path_fallback,
+            (path_packed + path_fallback)
+                ? 100.0 * (double)path_fallback / (double)(path_packed + path_fallback)
+                : 0.0);
     fprintf(stderr,
             "v4_phase wall=%.3f moe=%.3f attention=%.3f other=%.3f\n"
             "v4_phase_moe_inner routed_matmul=%.3f shared_expert=%.3f "
@@ -11142,7 +11173,7 @@ int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
         free(activation_scales);
         return -1;
     }
-    matmul_mxfp4(output, activation, weight->data, weight->scales,
+    matmul_mxfp4_dispatch(output, activation, weight->data, weight->scales,
                  1, (int)columns, (int)rows);
     free(activation_scales);
     free(activation);
@@ -11273,9 +11304,9 @@ int coli_fp4_dual_matvec_ref(float *output_a, float *output_b,
                                     input, columns, 128) != 0) {
         free(activation_scales); free(activation); return -1;
     }
-    matmul_mxfp4(output_a, activation, a->data, a->scales,
+    matmul_mxfp4_dispatch(output_a, activation, a->data, a->scales,
                  1, (int)columns, (int)rows);
-    matmul_mxfp4(output_b, activation, b->data, b->scales,
+    matmul_mxfp4_dispatch(output_b, activation, b->data, b->scales,
                  1, (int)columns, (int)rows);
     free(activation_scales); free(activation); return 0;
 }
@@ -11472,7 +11503,7 @@ int coli_fp4_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
                 inputs + (size_t)item * columns, columns, 128) != 0) {
             free(activation_scales); free(activations); return -1;
         }
-    matmul_mxfp4(outputs, activations, weight->data, weight->scales,
+    matmul_mxfp4_dispatch(outputs, activations, weight->data, weight->scales,
                  batch, (int)columns, (int)rows);
     free(activation_scales); free(activations); return 0;
 }

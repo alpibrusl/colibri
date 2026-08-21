@@ -187,6 +187,28 @@ double coli_v4_block_profile_now(void);
 void coli_v4_block_profile_add(int kind, double seconds);
 double coli_v4_block_profile_seconds(int kind);
 
+/* Which expert kernel actually ran (#69).
+ *
+ * coli_v4_expert_forward_ref dispatches on CACHE LAYOUT, not on the model: an
+ * expert whose slot got rows16-packed runs the packed int4 kernel, one that did
+ * not runs coli_v4_expert_forward_v17_fallback on a different layout. Nothing
+ * claims the two agree bit-for-bit, and how many slots get packed varies between
+ * otherwise identical runs -- so a performance decision silently selects which
+ * arithmetic computes each expert, and a token-exactness oracle can pass or fail
+ * by luck.
+ *
+ * Counting the split does not fix that. It makes it VISIBLE: an oracle failure
+ * that comes with a different dispatch mix is explained, where today it is
+ * simply mysterious. Owned by COLI_V4_UNIT_BLOCK_PROFILE for the same
+ * single-owner reason as the phase counters. */
+enum {
+    COLI_V4_EXPERT_PATH_ROWS16 = 0,   /* packed int4 NEON/AVX kernel */
+    COLI_V4_EXPERT_PATH_FALLBACK = 1, /* v17 fallback, unpacked layout */
+    COLI_V4_EXPERT_PATHS = 2,
+};
+void coli_v4_expert_path_count(int path);
+unsigned long long coli_v4_expert_path_get(int path);
+
 #ifdef __cplusplus
 }
 #endif

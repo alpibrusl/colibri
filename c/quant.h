@@ -1434,7 +1434,7 @@ static const float mx4_lut[16] = {0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f,
 static inline float mx4_scale(uint8_t s){
     union { uint32_t u; float f; } b; b.u = (uint32_t)s << 23; return b.f;
 }
-static void matmul_mxfp4(float *y, const float *x, const uint8_t *q4, const uint8_t *e8s,
+static void matmul_mxfp4_scalar_or_avx2(float *y, const float *x, const uint8_t *q4, const uint8_t *e8s,
                          int S, int I, int O){
     int rb=(I+1)/2, ng=(I+31)/32;
     #pragma omp parallel for schedule(static)
@@ -1485,6 +1485,90 @@ static void matmul_mxfp4(float *y, const float *x, const uint8_t *q4, const uint
     }
 }
 
+/* Four rows at a time -- the scalar path above, latency-hidden (#69).
+ *
+ * matmul_mxfp4's scalar arm has one `ga` chain per group, so every add waits on
+ * the previous and the loop is bound by FP-add latency rather than by the core's
+ * FP throughput. x86 has a full AVX2 arm and never feels it; aarch64 has none
+ * and does, which matters more than it looks: coli_v4_expert_forward_ref
+ * dispatches on cache layout, and on a real V4 run 72.5% of expert applications
+ * take this path rather than the packed rows16 kernel.
+ *
+ * Interleaving across OUTPUT ROWS rather than within a group is what keeps this
+ * safe. Each row still accumulates its own groups in the original order, so
+ * every row is bit-identical to the loop above; four rows in flight simply give
+ * the adds something to pipeline. The alternative -- several accumulators inside
+ * one group -- reassociates the sum, and #68 measured what that costs on the
+ * real checkpoint: text diverging at token ~30 while every CI oracle passed.
+ *
+ * Rows carry independent weight and scale pointers, so no grouping constraint
+ * applies here (unlike matmul_fp8, where a group of four had to share a scale
+ * block). */
+static void matmul_mxfp4_rows4(float *y, const float *x, const uint8_t *q4,
+                               const uint8_t *e8s, int S, int I, int O){
+    int rb=(I+1)/2, ng=(I+31)/32, Oq=O&~3;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<Oq;o+=4){
+        const uint8_t *w0=q4+(int64_t)o*rb,     *w1=w0+rb, *w2=w1+rb, *w3=w2+rb;
+        const uint8_t *c0=e8s+(int64_t)o*ng,    *c1=c0+ng, *c2=c1+ng, *c3=c2+ng;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I;
+            float a0=0,a1=0,a2=0,a3=0;
+            for(int g=0;g<ng;g++){
+                int base=g*32, glen=32; if(base+glen>I) glen=I-base;
+                float g0=0,g1=0,g2=0,g3=0;
+                for(int i=base;i<base+glen;i+=2){
+                    float x0=xs[i];
+                    uint8_t b0=w0[i>>1],b1=w1[i>>1],b2=w2[i>>1],b3=w3[i>>1];
+                    g0+=x0*mx4_lut[b0&0xF]; g1+=x0*mx4_lut[b1&0xF];
+                    g2+=x0*mx4_lut[b2&0xF]; g3+=x0*mx4_lut[b3&0xF];
+                    if(i+1<base+glen){
+                        float x1=xs[i+1];
+                        g0+=x1*mx4_lut[b0>>4]; g1+=x1*mx4_lut[b1>>4];
+                        g2+=x1*mx4_lut[b2>>4]; g3+=x1*mx4_lut[b3>>4];
+                    }
+                }
+                a0+=g0*mx4_scale(c0[g]); a1+=g1*mx4_scale(c1[g]);
+                a2+=g2*mx4_scale(c2[g]); a3+=g3*mx4_scale(c3[g]);
+            }
+            y[(int64_t)s*O+o  ]=a0; y[(int64_t)s*O+o+1]=a1;
+            y[(int64_t)s*O+o+2]=a2; y[(int64_t)s*O+o+3]=a3;
+        }
+    }
+    for(int o=Oq;o<O;o++){                       /* O is 2048/4096 in practice */
+        const uint8_t *w=q4+(int64_t)o*rb, *scl=e8s+(int64_t)o*ng;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I; float a=0;
+            for(int g=0;g<ng;g++){
+                int base=g*32, glen=32; if(base+glen>I) glen=I-base;
+                float sc=mx4_scale(scl[g]), ga=0;
+                for(int i=base;i<base+glen;i+=2){
+                    uint8_t byte=w[i>>1];
+                    ga+=xs[i]*mx4_lut[byte&0xF];
+                    if(i+1<base+glen) ga+=xs[i+1]*mx4_lut[byte>>4];
+                }
+                a+=ga*sc;
+            }
+            y[(int64_t)s*O+o]=a;
+        }
+    }
+}
+
+/* One entry point, so callers do not each have to know which arm exists.
+ *
+ * On x86 matmul_mxfp4 has a full AVX2 arm and is already latency-free; leave it
+ * exactly as it is. Everywhere else it falls to a scalar loop with a single
+ * accumulator chain, and matmul_mxfp4_rows4 is that same loop with four rows in
+ * flight -- bit-identical per row, so this changes speed and nothing else. */
+static void matmul_mxfp4_dispatch(float *y, const float *x, const uint8_t *q4,
+                                  const uint8_t *e8s, int S, int I, int O){
+#if defined(__AVX2__)
+    matmul_mxfp4_scalar_or_avx2(y, x, q4, e8s, S, I, O);   /* AVX2 arm inside */
+#else
+    matmul_mxfp4_rows4(y, x, q4, e8s, S, I, O);
+#endif
+}
+
 /* IDOT variant of matmul_mxfp4: per-32-group int8 activation quantization +
  * integer dots. The doubled e2m1 values are exact int8 (same LUT as the float
  * path), so a group reduces to maddubs(|w|, sign(x,w)) like dot_i4i8 — no
@@ -1494,7 +1578,7 @@ static void matmul_mxfp4(float *y, const float *x, const uint8_t *q4, const uint
  * with K3_IDOT=0 in the K3 engine for exact-float A/B. */
 static void matmul_mxfp4_i8(float *y, const float *x, const uint8_t *q4, const uint8_t *e8s,
                             int S, int I, int O){
-    if(I%32){ matmul_mxfp4(y,x,q4,e8s,S,I,O); return; }
+    if(I%32){ matmul_mxfp4_dispatch(y,x,q4,e8s,S,I,O); return; }
     int rb=I/2, ng=I/32;
     int8_t *xq=(int8_t*)malloc((size_t)S*I);
     float *xsc=(float*)malloc((size_t)S*ng*sizeof(float));
