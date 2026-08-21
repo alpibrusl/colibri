@@ -1047,7 +1047,20 @@ static int fmt_user_turn(char *out, int cap, const char *msg, int first_turn) {
  * previous turns' cached keys/values: real multi-turn context, not a fresh
  * generate() call per message. ctx_cap capped at 4096: attention()'s per-head
  * score buffer (sc[4096]) is fixed-size, any position >= 4096 would overflow it. */
+/* #15: stamp the replay record header. One helper, called from every generation
+ * entry point -- run_chat and serve_one -- because the record OPENS on this
+ * call, so a path that does not make it produces no record at all, silently.
+ * That is how the record shipped covering colibri.c alone: the same
+ * "a fix lands in one engine and not its siblings" shape route_trace.h:373
+ * names as this tree's recurring defect. No-op unless COLI_REPLAY_RECORD is
+ * set. */
+static void olmoe_replay_stamp(Model *m){
+    rt_record_header("olmoe", m->c.n_layers, m->c.n_experts,
+                     0ULL, (double)g_temp, (double)g_nuc);
+}
+
 static void run_chat(Model *m, Tok *T, int ctx_cap) {
+    olmoe_replay_stamp(m);
     Cfg *c = &m->c;
     m->max_t = ctx_cap;
     m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
@@ -1106,6 +1119,7 @@ static void run_chat(Model *m, Tok *T, int ctx_cap) {
         int ngen = 0;
         for (int s = 0; s < max_new; s++) {
             int nt = pick_tok(logit, c->vocab, -1);
+            rt_record_token(nt);            /* #15 */
             free(logit); logit = NULL;
             if (is_stop(nt)) break;
             hist[hist_len] = nt; gen[ngen++] = nt; hist_len++;
@@ -1180,6 +1194,7 @@ static int serve_read_cmd(const char *cur_id) {
 }
 
 static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
+    olmoe_replay_stamp(m);
     Cfg *c = &m->c;
     int cap = q->plen + 16;
     int *ids = malloc((size_t)cap * sizeof(int));
@@ -1206,6 +1221,7 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     char buf[512];
     for (int s = 0; s < q->max_tok && !cancelled; s++) {
         int nt = pick_tok(logit, c->vocab, -1);
+        rt_record_token(nt);                /* #15 */
         free(logit); logit = NULL;
         if (is_stop(nt)) { limited = 0; break; }
         int nb = tok_decode(T, &nt, 1, buf, sizeof(buf)-1);

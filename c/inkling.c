@@ -1761,10 +1761,15 @@ static int pi_desc(const void *a, const void *b) {
     float d = ((const PI*)b)->p - ((const PI*)a)->p;
     return d > 0 ? 1 : d < 0 ? -1 : 0;
 }
+/* #15: the replay record's token stream is taken HERE, inside the sampler,
+ * rather than at each call site. inkling has no speculative decode, so a
+ * sampled token is an emitted token, and hooking the one place every path funnels
+ * through means a future call site cannot silently miss it -- which is exactly
+ * how the record shipped covering colibri.c alone. */
 static int sample_logits(const float *logit, int n, float temp, float top_p) {
     int best = 0;
     for (int i = 1; i < n; i++) if (logit[i] > logit[best]) best = i;
-    if (temp <= 0.f) return best;
+    if (temp <= 0.f) return (rt_record_token(best), best);
     PI *c = malloc((size_t)n * sizeof(PI));
     double sum = 0;
     for (int i = 0; i < n; i++) {
@@ -1779,7 +1784,7 @@ static int sample_logits(const float *logit, int n, float temp, float top_p) {
     int pick = c[0].i;
     for (int i = 0; i < k; i++) { run += c[i].p; if (run >= r) { pick = c[i].i; break; } }
     free(c);
-    return pick;
+    return (rt_record_token(pick), pick);
 }
 
 /* light repeat guard: recently emitted tokens get their logit divided by pen>1 */
@@ -1862,6 +1867,7 @@ static int serve_read_cmd(const char *cur_id) {
 }
 
 static void serve_one(Model *m, Tok *T, SReq *q) {
+    rt_record_header("inkling", m->c.n_layers, m->c.n_experts, 0ULL, (double)q->temp, (double)q->top_p);
     Cfg *c = &m->c;
     int cap = q->plen + 16;
     int *ids = malloc((size_t)cap * sizeof(int));
