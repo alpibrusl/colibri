@@ -91,6 +91,23 @@ CFLAGS = -D_GNU_SOURCE -O3 -ffp-contract=off $(OMPC) -pthread -include pthread.h
 	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 LDFLAGS = -lm $(OMPL) -pthread
 V4_BINARY := deepseek_v4
+
+# METAL=1 hands the fp8 dense projections of attention PREFILL to the GPU.
+#
+# Opt-in and macOS-only, the same convention the parent Makefile uses. Decode is
+# deliberately NOT routed: measured on V4's own shape (I=4096, O=2048) the GPU is
+# 0.52x at S=1 and 5.26x at S=64, because a batch-1 GEMV over ~8 MB is too small
+# a unit of work to hand across a dispatch. Prefill batches; decode does not.
+#
+# It is opt-in for a second reason: the GPU reduces across 32 SIMD lanes where
+# the CPU sums each row serially, so results are not bit-identical and enabling
+# it changes what the model emits.
+ifeq ($(METAL),1)
+CFLAGS  += -DCOLI_V4_METAL
+LDFLAGS += -framework Metal -framework Foundation -lc++
+V4_METAL_OBJ = backend_metal.o
+METALXX = clang++ -x objective-c++ -std=gnu++17 -fobjc-arc -O3
+endif
 else
 CC = gcc
 ARCH ?= native
@@ -119,8 +136,11 @@ V4_OBJS = $(TARGET_OBJS)
 .PHONY: deepseek-v4 deepseek-v4-clean deepseek-v4-test-objs
 deepseek-v4: $(V4_BINARY)
 
-$(V4_BINARY): $(V4_OBJS)
-	$(CC) $(V4_OBJS) -o $@ $(LDFLAGS)
+backend_metal.o: backend_metal.mm backend_metal.h
+	$(METALXX) -c backend_metal.mm -o $@
+
+$(V4_BINARY): $(V4_OBJS) $(V4_METAL_OBJ)
+	$(CC) $(V4_OBJS) $(V4_METAL_OBJ) -o $@ $(LDFLAGS)
 
 $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h \
