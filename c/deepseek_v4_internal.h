@@ -187,6 +187,15 @@ double coli_v4_block_profile_now(void);
 void coli_v4_block_profile_add(int kind, double seconds);
 double coli_v4_block_profile_seconds(int kind);
 
+/* bf16-dense cache (#80). Defined by COLI_V4_UNIT_BLOCK_PROFILE, which owns it
+ * for the same reason it owns the phase counters: this file is compiled once
+ * per COLI_V4_UNIT_*, and the single-row and dual matvecs live in DIFFERENT
+ * units, so a static cache would be two caches -- each packing the same tensor
+ * again and doubling the memory it exists to justify. Returns NULL when the
+ * feature is off, the budget is spent, or the allocation failed; every caller
+ * then uses the fp8 path, so a miss costs speed rather than correctness. */
+const uint16_t *v4_bf16_lookup(const ColiTensorView *weight);
+
 /* Which expert kernel actually ran (#69).
  *
  * coli_v4_expert_forward_ref dispatches on CACHE LAYOUT, not on the model: an
