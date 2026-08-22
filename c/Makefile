@@ -975,7 +975,8 @@ tests/test_gpu_ops_registry$(EXE): tests/test_gpu_ops_registry.c gpu_ops.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_native_quant$(EXE): tests/test_native_quant.c deepseek_v4.c native_quant.h tensor.h quant.h
-	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT deepseek_v4.c $< -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT -DCOLI_V4_UNIT_BLOCK_PROFILE \
+		deepseek_v4.c $< -o $@ $(LDFLAGS)
 
 ifeq ($(COLI_V4_SUPPORTED),1)
 include Makefile.deepseek-v4.units
@@ -987,13 +988,15 @@ V4_TEST_LINK_OBJS = \
 	COLI_V4_UNIT_RESOURCE_PLAN.o \
 	COLI_V4_UNIT_PROMPT.o \
 	$(addsuffix .o,$(V4_TEST_UNITS)) \
-	COLI_V4_UNIT_NATIVE_QUANT.o
+	COLI_V4_UNIT_NATIVE_QUANT.o \
+	COLI_V4_UNIT_BLOCK_PROFILE.o
 
 tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c deepseek_v4.c deepseek_v4.h \
 		Makefile.deepseek-v4.units
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
 		COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
-		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o
+		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o \
+		COLI_V4_UNIT_BLOCK_PROFILE.o
 	$(CC) $(CFLAGS) $< $(V4_TEST_LINK_OBJS) -o $@ -pthread $(LDFLAGS)
 
 V4_OWN_DIR = build/ownership

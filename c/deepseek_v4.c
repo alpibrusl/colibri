@@ -6877,6 +6877,11 @@ void coli_v4_rt_token(int token) { rt_record_token(token); }
 #include "deepseek_v4_internal.h"
 #include "quant.h"        /* bf16_pack_rows4, for the bf16-dense cache below */
 
+/* Explicit rather than relying on -include pthread.h: the V4 Makefile passes
+ * that flag, the parent Makefile's standalone test rules do not, and this unit
+ * is now linked into both. */
+#include <pthread.h>
+
 #include <stdint.h>
 #include <time.h>
 
