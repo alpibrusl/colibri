@@ -11499,6 +11499,59 @@ int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
 #pragma GCC diagnostic pop
 #endif
 
+#ifdef COLI_V4_METAL
+#include "backend_metal.h"
+
+/* Metal needs each weight buffer registered before resolve() can find it; an
+ * unregistered pointer makes coli_metal_gemm return 0 and we fall back to the
+ * CPU, so a missed registration costs speed rather than correctness. Tensors are
+ * resident for the run and few (a handful per layer), so a small append-only
+ * table under a mutex is enough -- registration happens once per tensor, on its
+ * first batched use, not per call. */
+#define V4_METAL_MAX_TENSORS 1024
+static const void *v4_metal_seen[V4_METAL_MAX_TENSORS];
+static int v4_metal_seen_n;
+static pthread_mutex_t v4_metal_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int v4_metal_min_batch(void) {
+    static int minimum = -1;
+    if (minimum < 0) {
+        const char *value = getenv("V4_METAL_MIN_BATCH");
+        minimum = value ? atoi(value) : 8;   /* 8 is where the GPU first wins */
+        if (minimum < 1) minimum = 1;
+    }
+    return minimum;
+}
+
+static int v4_metal_ready(void) {
+    static int ready = -1;
+    if (ready < 0) ready = coli_metal_init() && coli_metal_available();
+    return ready;
+}
+
+/* Register this tensor's data and scales once. Returns 1 if the GPU may be
+ * asked for it. */
+static int v4_metal_claim(const ColiTensorView *weight) {
+    if (!v4_metal_ready() || !weight || !weight->data || !weight->scales) return 0;
+    int ok = 1;
+    pthread_mutex_lock(&v4_metal_lock);
+    for (int pass = 0; pass < 2; pass++) {
+        const void *base = pass ? (const void *)weight->scales
+                                : (const void *)weight->data;
+        size_t len = pass ? weight->scale_bytes : weight->data_bytes;
+        int found = 0;
+        for (int i = 0; i < v4_metal_seen_n; i++)
+            if (v4_metal_seen[i] == base) { found = 1; break; }
+        if (found) continue;
+        if (v4_metal_seen_n >= V4_METAL_MAX_TENSORS) { ok = 0; break; }
+        coli_metal_register((void *)base, len);
+        v4_metal_seen[v4_metal_seen_n++] = base;
+    }
+    pthread_mutex_unlock(&v4_metal_lock);
+    return ok;
+}
+#endif /* COLI_V4_METAL */
+
 int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
                               const float *inputs, int batch) {
     if (!outputs || !weight || !inputs || batch < 1 || batch > 64 ||
@@ -11564,6 +11617,23 @@ int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
                                  (size_t)tile * 8, sums[item]);
         }
         free(activation_scales); free(activations); return 0;
+    }
+#endif
+#ifdef COLI_V4_METAL
+    /* Attention PREFILL only. Measured on this shape (I=4096, O=2048) against
+     * the CPU kernel: S=1 0.52x, S=8 1.67x, S=32 4.43x, S=64 5.26x. A batch-1
+     * GEMV over ~8 MB is too small a unit of work to send across a dispatch,
+     * which is why decode keeps the CPU path and only the batched projections
+     * come here. V4_METAL_MIN_BATCH moves the threshold for measuring it.
+     *
+     * Results are NOT bit-identical: the shader reduces across 32 SIMD lanes
+     * where matmul_fp8 sums each row serially into a float and folds the block
+     * scale into a double. That is why the whole path is behind METAL=1. */
+    if (batch >= v4_metal_min_batch() && v4_metal_claim(weight)) {
+        if (coli_metal_gemm(outputs, activations, weight->data, weight->scales,
+                            8, batch, (int)columns, (int)rows, 0)) {
+            free(activation_scales); free(activations); return 0;
+        }
     }
 #endif
     matmul_fp8(outputs, activations, weight->data, weight->scales,

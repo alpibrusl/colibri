@@ -1122,7 +1122,14 @@ extern "C" int coli_metal_layer_decode(float *x,
 static id<MTLBuffer> g_gx, g_gy; static size_t g_gx_cap, g_gy_cap;
 extern "C" int coli_metal_gemm(float *y, const float *x, const void *wp, const float *sp,
                                int fmt, int S, int I, int O, int gs) {
-  if (!g_dev || (fmt!=1 && fmt!=2 && fmt!=4)) return 0;
+  /* fmt=8 (fp8 e4m3, per-128x128-block scale) was implemented in the GEMV
+   * shader and in the size helpers below, but never admitted here, so nothing
+   * could reach it. DeepSeek V4's dense weights are exactly that format and its
+   * attention prefill batches the q/kv/o projections, which is the regime this
+   * entry point exists for. Measured on V4's shape (I=4096, O=2048): S=8 1.67x,
+   * S=32 4.43x, S=64 5.26x against the CPU kernel -- and S=1 0.52x, which is why
+   * the caller gates on batch size rather than calling this for decode. */
+  if (!g_dev || (fmt!=1 && fmt!=2 && fmt!=4 && fmt!=8)) return 0;
   @autoreleasepool {
     uint64_t wa=0,sa=0; id<MTLBuffer> wb=resolve(wp,&wa), sb=resolve(sp,&sa);
     if(!wb||!sb) return 0;
