@@ -5997,27 +5997,35 @@ static int hot_is_pinned(const V4HotPolicy *policy, int layer, int expert) {
     return 0;
 }
 
-/* V4_ROWS16=0 turns off rows16 packing entirely (#69).
+/* rows16 packing is OFF by default; V4_ROWS16=1 opts back in (#69).
  *
  * coli_v4_expert_forward_ref picks its kernel from a slot's LAYOUT: a packed
  * slot takes the rows16 kernel, an unpacked one takes the v17 fallback, and
  * neither kernel accepts the other's layout -- so the choice cannot be
- * overridden at the call site, only removed here. How many slots get packed
- * varies between otherwise identical runs (measured: 6553 / 6554 / 6576
- * rows16 applications across three), which is why a V4 run is not currently
- * reproducible with itself and why the token-exactness oracles can pass or
- * fail by luck.
+ * overridden at the call site, only removed here. The two kernels compute
+ * different answers, and how many slots get packed varies between otherwise
+ * identical runs, so with packing on a V4 run is not reproducible with itself:
+ * measured 6553 / 6554 / 6576 rows16 applications across three identical
+ * invocations, and on one prompt that was enough to flip a near-tie and send
+ * greedy decoding down a different continuation.
  *
- * With packing off every expert takes the fallback, the dispatch mix is 0/100
- * by construction, and a run becomes comparable with another run of the same
- * binary. It costs the packed kernel's speed, so this is a diagnostic and a
- * gate for oracles and replay_diff -- not a default, and not the fix. The fix
- * is for the two kernels to agree. */
+ * The default is off because packing turned out to cost rather than pay.
+ * Interleaved, cold, two rounds over five prompts, disabling it was faster or
+ * neutral in 8 of 8 measurements, median about -3%. Individual deltas sit near
+ * this host's noise floor; the sign consistency is the evidence. Two reasons:
+ * coli_fp4_pack_rows16_v10 is ~0.7% of compute in a sampled profile and slots
+ * are repacked as they churn, and the fallback got faster (#71), so whatever
+ * margin the packed kernel once had has since been eaten.
+ *
+ * Kept rather than deleted, and behind a knob rather than an #ifdef, because
+ * that measurement is one machine. The packed kernel has AVX2 and AVX-512 arms
+ * that nothing here exercises; if it earns its keep on x86, V4_ROWS16=1 turns
+ * it back on and the nondeterminism comes back with it. */
 static int v4_rows16_packing_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
         const char *value_text = getenv("V4_ROWS16");
-        enabled = !value_text || atoi(value_text) != 0;
+        enabled = value_text && atoi(value_text) != 0;
     }
     return enabled;
 }
