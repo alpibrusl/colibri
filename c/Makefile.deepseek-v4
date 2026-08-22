@@ -34,7 +34,33 @@ endif
 ifneq ($(IS_WIN),)
 CC = gcc
 ARCH ?= x86-64-v3
-CFLAGS = -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp \
+# Floating-point contraction is PINNED, not left to the compiler (#76).
+#
+# deepseek_v4.c's rows16 kernel documents that its NEON, AVX2, AVX-512 and
+# scalar arms hold one operation sequence "so all three produce bit-identical
+# rows. No fused multiply-add." The hand-written vector arms honour that with
+# separate multiply and add. The scalar side did not: `s += a[i]*b[i]` becomes a
+# single fmadd, and the default differs per compiler -- clang contracts within a
+# statement, gcc contracts ACROSS statements, MSVC not at all. The invariant was
+# a property of whichever toolchain happened to build it.
+#
+# Measured before pinning: a NEON variant matched the scalar loop exactly with a
+# fused op and differed on 1547 of 2048 rows without one; with -ffp-contract=off
+# the comparison inverts. Half the rows move either way.
+#
+# `off` rather than `fast` because it is the setting the code already claims.
+#
+# This DOES change generated text on some prompts, and that is the argument for
+# it rather than against. Measured on the real 284B checkpoint: three prompts
+# were byte-identical either way -- bf16 rounding after each projection usually
+# absorbs a single-rounding difference -- but a fourth (the Spanish one) is
+# stable across three runs of each build and differs BETWEEN them. So the output
+# already depended on a flag nobody set, and a gcc build (contract=fast) and a
+# clang build (contract=on) could disagree on such a prompt today. Pinning makes
+# the result a property of the source instead. Wall clock is within run-to-run
+# noise. The oracles need re-blessing once, which is the one-time cost of making
+# this deterministic across toolchains.
+CFLAGS = -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -O3 -ffp-contract=off -march=$(ARCH) -fopenmp \
 	-include pthread.h -Wall -Wextra -Wno-unused-parameter \
 	-Wno-misleading-indentation -Wno-unused-function \
 	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
@@ -57,7 +83,7 @@ $(warning libomp not found: building deepseek_v4 single-threaded. brew install l
 OMPC =
 OMPL =
 endif
-CFLAGS = -D_GNU_SOURCE -O3 $(OMPC) -pthread -include pthread.h \
+CFLAGS = -D_GNU_SOURCE -O3 -ffp-contract=off $(OMPC) -pthread -include pthread.h \
 	-Wall -Wextra -Wno-unused-parameter \
 	-Wno-misleading-indentation -Wno-unused-function \
 	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
@@ -68,7 +94,7 @@ V4_BINARY := deepseek_v4
 else
 CC = gcc
 ARCH ?= native
-CFLAGS = -D_GNU_SOURCE -O3 -march=$(ARCH) -fopenmp -pthread -include pthread.h \
+CFLAGS = -D_GNU_SOURCE -O3 -ffp-contract=off -march=$(ARCH) -fopenmp -pthread -include pthread.h \
 	-Wall -Wextra -Wno-unused-parameter \
 	-Wno-misleading-indentation -Wno-unused-function \
 	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \

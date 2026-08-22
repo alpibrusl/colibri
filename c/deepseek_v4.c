@@ -11705,7 +11705,14 @@ static inline void avx2_decode_scales(__m256 values[2],
 /* The 16 packed rows map onto four float32x4 accumulators. Per-row work is
  * (activation * value) * scale added once per column, columns ascending —
  * the exact operation sequence of the scalar reference and of the AVX-512
- * kernel, so all three produce bit-identical rows. No fused multiply-add. */
+ * kernel, so all three produce bit-identical rows. No fused multiply-add.
+ *
+ * That last sentence has a dependency the code cannot state on its own: it only
+ * holds while the compiler is forbidden to contract `s += a*b` in the scalar
+ * arm into an fmadd. The Makefiles pin -ffp-contract=off for this reason (#76);
+ * without it clang contracts within a statement, gcc across statements, and
+ * MSVC not at all, so the arms would agree or disagree depending on which
+ * toolchain built them. test_fp_contract.py keeps the flag from going missing. */
 
 typedef struct NeonRows16Tables {
     /* The 16-value E2M1 table is exactly 64 bytes, so one four-register TBL
