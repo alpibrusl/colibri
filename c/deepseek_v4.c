@@ -6875,6 +6875,12 @@ void coli_v4_rt_token(int token) { rt_record_token(token); }
 #ifdef COLI_V4_UNIT_BLOCK_PROFILE
 /* ######## deepseek_v4_block_profile.c / phase attribution (#62 gate 2) ######## */
 #include "deepseek_v4_internal.h"
+#include "quant.h"        /* bf16_pack_rows4, for the bf16-dense cache below */
+
+/* Explicit rather than relying on -include pthread.h: the V4 Makefile passes
+ * that flag, the parent Makefile's standalone test rules do not, and this unit
+ * is now linked into both. */
+#include <pthread.h>
 
 #include <stdint.h>
 #include <time.h>
@@ -6924,6 +6930,75 @@ unsigned long long coli_v4_expert_path_get(int path) {
     return (unsigned long long)__atomic_load_n(&v4_expert_path_n[path],
                                                __ATOMIC_RELAXED);
 }
+/* V4_BF16_DENSE=1 converts each fp8 dense weight to bf16, four rows interleaved,
+ * on its first use and reuses it thereafter (#80).
+ *
+ * matmul_fp8 pays two loads per MAC -- the weight byte plus a dependent gather
+ * into a 256-entry float table that no SIMD unit can vectorise. bf16 replaces
+ * the gather with a shift and vectorises; measured 2.07x on the kernel, and
+ * bit-identical because every e4m3 value is exactly representable in bf16 and
+ * each row still sums in ascending order.
+ *
+ * OFF BY DEFAULT because of what it costs in memory, stated plainly: the cache
+ * sits ALONGSIDE the fp8 original rather than replacing it, so V4's 6.27 GiB of
+ * dense weights become 6.27 + 12.54 = 18.81 GiB. Replacing instead of caching
+ * would cost 12.54 GiB total, but that means converting inside the resident
+ * loader and teaching the memory planner about the new size -- a bigger change
+ * than this, and one worth making only once the end-to-end gain is confirmed.
+ * Until then this is measurable without being something a default build pays
+ * for. V4_BF16_DENSE_GB caps the cache so a large model cannot silently
+ * exhaust RAM; past the cap, tensors keep the fp8 path. */
+#define V4_BF16_MAX_TENSORS 1024
+static struct { const void *key; uint16_t *packed; } v4_bf16_tab[V4_BF16_MAX_TENSORS];
+static int v4_bf16_n;
+static size_t v4_bf16_bytes;
+static pthread_mutex_t v4_bf16_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int v4_bf16_dense_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("V4_BF16_DENSE");
+        on = v && atoi(v) != 0;
+    }
+    return on;
+}
+
+static size_t v4_bf16_budget_bytes(void) {
+    static size_t cap;
+    if (!cap) {
+        const char *v = getenv("V4_BF16_DENSE_GB");
+        double gb = v ? atof(v) : 16.0;
+        if (gb < 0.25) gb = 0.25;
+        cap = (size_t)(gb * 1073741824.0);
+    }
+    return cap;
+}
+
+/* -> the packed copy, or NULL to use the fp8 path. */
+const uint16_t *v4_bf16_lookup(const ColiTensorView *weight) {
+    if (!v4_bf16_dense_enabled() || !weight || !weight->data) return NULL;
+    size_t need = (size_t)weight->rows * (size_t)weight->columns * sizeof(uint16_t);
+    const uint16_t *found = NULL;
+    pthread_mutex_lock(&v4_bf16_lock);
+    for (int i = 0; i < v4_bf16_n; i++)
+        if (v4_bf16_tab[i].key == weight->data) { found = v4_bf16_tab[i].packed; break; }
+    if (!found && v4_bf16_n < V4_BF16_MAX_TENSORS &&
+        v4_bf16_bytes + need <= v4_bf16_budget_bytes()) {
+        uint16_t *packed = malloc(need);
+        if (packed) {
+            bf16_pack_rows4(packed, weight->data,
+                            (int)weight->columns, (int)weight->rows);
+            v4_bf16_tab[v4_bf16_n].key = weight->data;
+            v4_bf16_tab[v4_bf16_n].packed = packed;
+            v4_bf16_n++;
+            v4_bf16_bytes += need;
+            found = packed;
+        }
+    }
+    pthread_mutex_unlock(&v4_bf16_lock);
+    return found;
+}
+
 #endif /* COLI_V4_UNIT_BLOCK_PROFILE */
 
 #ifdef COLI_V4_UNIT_RUNTIME
@@ -11038,6 +11113,7 @@ int coli_v4_config_load(ColiDeepSeekV4Config *config, const char *model_dir,
  * units below dispatch through the shared matmul_fp8 implementation instead.
  */
 #include "native_quant.h"
+#include "deepseek_v4_internal.h"   /* v4_bf16_lookup: owned by BLOCK_PROFILE */
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-variable"
@@ -11335,8 +11411,15 @@ int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
         free(activation_scales); free(activation); return 0;
     }
 #endif
-    matmul_fp8(output, activation, weight->data, weight->scales,
-               1, (int)columns, (int)rows);
+    {
+        const uint16_t *packed = v4_bf16_lookup(weight);
+        if (packed)
+            matmul_bf16_rows4(output, activation, packed, weight->scales,
+                              1, (int)columns, (int)rows);
+        else
+            matmul_fp8(output, activation, weight->data, weight->scales,
+                       1, (int)columns, (int)rows);
+    }
     free(activation_scales);
     free(activation);
     return 0;
@@ -11346,6 +11429,7 @@ int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
 #ifdef COLI_V4_UNIT_NATIVE_QUANT_DUAL
 /* Folded into the DeepSeek V4 engine translation units. */
 #include "native_quant_dual.h"
+#include "deepseek_v4_internal.h"   /* v4_bf16_lookup: owned by BLOCK_PROFILE */
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -11471,10 +11555,17 @@ int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
         free(activation_scales); free(activation); return 0;
     }
 #endif
-    matmul_fp8(output_a, activation, a->data, a->scales,
-               1, (int)columns, (int)rows);
-    matmul_fp8(output_b, activation, b->data, b->scales,
-               1, (int)columns, (int)rows);
+    {
+        const uint16_t *pa = v4_bf16_lookup(a), *pb = v4_bf16_lookup(b);
+        if (pa) matmul_bf16_rows4(output_a, activation, pa, a->scales,
+                                  1, (int)columns, (int)rows);
+        else    matmul_fp8(output_a, activation, a->data, a->scales,
+                           1, (int)columns, (int)rows);
+        if (pb) matmul_bf16_rows4(output_b, activation, pb, b->scales,
+                                  1, (int)columns, (int)rows);
+        else    matmul_fp8(output_b, activation, b->data, b->scales,
+                           1, (int)columns, (int)rows);
+    }
     free(activation_scales); free(activation); return 0;
 }
 #endif /* COLI_V4_UNIT_NATIVE_QUANT_DUAL */

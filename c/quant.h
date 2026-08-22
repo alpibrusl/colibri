@@ -1485,6 +1485,100 @@ static void matmul_mxfp4_scalar_or_avx2(float *y, const float *x, const uint8_t 
     }
 }
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+/* bf16 is the top 16 bits of the fp32 it came from, so widening is exact.
+ * Named locally: st.h has its own bf16_to_f32, and quant.h must not depend on
+ * whether a translation unit happened to include it first. */
+static inline float q_bf16_to_f32(uint16_t h){
+    uint32_t bits = (uint32_t)h << 16; float f; memcpy(&f,&bits,4); return f;
+}
+
+/* Same matvec as matmul_fp8, but reading weights already converted to bf16 and
+ * interleaved four rows deep. See tools/bench_bf16_dense.c and #80.
+ *
+ * matmul_fp8 costs TWO loads per MAC: the weight byte, and a dependent gather
+ * into a 256-entry float table that no SIMD unit can vectorise -- which is why
+ * an interleaved-fp8 layout only reached 1.3x. e4m3 carries 3 mantissa bits and
+ * bf16 carries 7, so every e4m3 value is EXACTLY representable in bf16 and
+ * bf16 -> fp32 is a 16-bit shift. Converting once removes the table and leaves a
+ * load, a shift and a multiply-add, which does vectorise: 2.07x measured.
+ *
+ * Interleaving four rows means one load supplies all four, and each row still
+ * sums its columns in ascending order, so every output is bit-identical to
+ * matmul_fp8. Separate multiply and add rather than a fused op, matching the
+ * scalar loop under the tree's pinned -ffp-contract=off (#76).
+ *
+ * Layout: B[(o/4)*I*4 + i*4 + (o%4)]; scales are the fp8 tensor's, unchanged. */
+static void matmul_bf16_rows4(float *y, const float *x, const uint16_t *B,
+                              const float *bscale, int S, int I, int O){
+    int64_t nblkI = fp8_nblk(I);
+    int Oq = O & ~3;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<Oq;o+=4){
+        const uint16_t *p = B + (size_t)(o/4)*(size_t)I*4;
+        const float *scl = bscale + ((int64_t)o / FP8_BLOCK)*nblkI;
+        for(int s=0;s<S;s++){
+            const float *xs = x + (int64_t)s*I;
+            double a0=0,a1=0,a2=0,a3=0;
+            for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
+                int base=(int)(bi*FP8_BLOCK); int blen=FP8_BLOCK; if(base+blen>I) blen=I-base;
+                float sc=scl[bi];
+#if defined(__aarch64__)
+                float32x4_t c = vdupq_n_f32(0.0f);
+                for(int i=base;i<base+blen;i++){
+                    uint16x4_t raw = vld1_u16(p + (size_t)i*4);
+                    float32x4_t v = vreinterpretq_f32_u32(vshll_n_u16(raw,16));
+                    c = vaddq_f32(c, vmulq_n_f32(v, xs[i]));
+                }
+                float t[4]; vst1q_f32(t,c);
+                a0+=(double)t[0]*sc; a1+=(double)t[1]*sc;
+                a2+=(double)t[2]*sc; a3+=(double)t[3]*sc;
+#else
+                float c0=0,c1=0,c2=0,c3=0;
+                for(int i=base;i<base+blen;i++){
+                    const uint16_t *q = p + (size_t)i*4; float xi = xs[i];
+                    c0 += q_bf16_to_f32(q[0])*xi; c1 += q_bf16_to_f32(q[1])*xi;
+                    c2 += q_bf16_to_f32(q[2])*xi; c3 += q_bf16_to_f32(q[3])*xi;
+                }
+                a0+=(double)c0*sc; a1+=(double)c1*sc;
+                a2+=(double)c2*sc; a3+=(double)c3*sc;
+#endif
+            }
+            y[(int64_t)s*O+o  ]=(float)a0; y[(int64_t)s*O+o+1]=(float)a1;
+            y[(int64_t)s*O+o+2]=(float)a2; y[(int64_t)s*O+o+3]=(float)a3;
+        }
+    }
+    for(int o=Oq;o<O;o++){
+        const uint16_t *p = B + (size_t)(o/4)*(size_t)I*4 + (size_t)(o%4);
+        const float *scl = bscale + ((int64_t)o / FP8_BLOCK)*nblkI;
+        for(int s=0;s<S;s++){
+            const float *xs = x + (int64_t)s*I; double a=0;
+            for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
+                int base=(int)(bi*FP8_BLOCK); int blen=FP8_BLOCK; if(base+blen>I) blen=I-base;
+                float sc=scl[bi], acc=0;
+                for(int i=base;i<base+blen;i++) acc += q_bf16_to_f32(p[(size_t)i*4])*xs[i];
+                a += (double)acc*sc;
+            }
+            y[(int64_t)s*O+o]=(float)a;
+        }
+    }
+}
+
+/* Convert an fp8 e4m3 weight matrix into that layout. Exact: no e4m3 value
+ * needs a mantissa bit below bf16 (verified over all 2^8 codes). */
+static void bf16_pack_rows4(uint16_t *out, const uint8_t *q8, int I, int O){
+    for(int o=0;o<O;o++)
+        for(int i=0;i<I;i++){
+            float f = e4m3_decode(q8[(size_t)o*I + i]);
+            uint32_t bits; memcpy(&bits,&f,4);
+            out[(size_t)(o/4)*(size_t)I*4 + (size_t)i*4 + (size_t)(o%4)] =
+                (uint16_t)(bits >> 16);
+        }
+}
+
 /* Four rows at a time -- the scalar path above, latency-hidden (#69).
  *
  * matmul_mxfp4's scalar arm has one `ga` chain per group, so every add waits on
