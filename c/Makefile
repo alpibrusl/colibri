@@ -1001,11 +1001,15 @@ tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c deepseek_v4.c deepseek_v4
 
 V4_OWN_DIR = build/ownership
 V4_OWN_CFLAGS = $(CFLAGS) -DCOLI_V4_TEST_HOOKS
+# NATIVE_QUANT calls v4_bf16_lookup, which COLI_V4_UNIT_BLOCK_PROFILE owns
+# (the single-row and dual matvecs sit in different units, so the cache cannot
+# be static in either). Any target linking NATIVE_QUANT needs BLOCK_PROFILE too.
 V4_OWNERSHIP_OBJS = \
 	$(V4_OWN_DIR)/COLI_V4_UNIT_RUNTIME.o \
 	$(V4_OWN_DIR)/COLI_V4_UNIT_CONFIG.o \
 	$(V4_OWN_DIR)/COLI_V4_UNIT_ST.o \
-	$(V4_OWN_DIR)/COLI_V4_UNIT_NATIVE_QUANT.o
+	$(V4_OWN_DIR)/COLI_V4_UNIT_NATIVE_QUANT.o \
+	$(V4_OWN_DIR)/COLI_V4_UNIT_BLOCK_PROFILE.o
 
 $(V4_OWN_DIR):
 	mkdir -p $(V4_OWN_DIR)
@@ -1021,6 +1025,9 @@ $(V4_OWN_DIR)/COLI_V4_UNIT_ST.o: deepseek_v4.c deepseek_v4.h deepseek_v4_interna
 
 $(V4_OWN_DIR)/COLI_V4_UNIT_NATIVE_QUANT.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h quant.h | $(V4_OWN_DIR)
 	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT -c deepseek_v4.c -o $@
+
+$(V4_OWN_DIR)/COLI_V4_UNIT_BLOCK_PROFILE.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h quant.h | $(V4_OWN_DIR)
+	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_BLOCK_PROFILE -c deepseek_v4.c -o $@
 
 tests/test_v4_ownership$(EXE): tests/test_v4_ownership.c $(V4_OWNERSHIP_OBJS)
 	$(CC) $(V4_OWN_CFLAGS) $< $(V4_OWNERSHIP_OBJS) -o $@ -pthread $(LDFLAGS)
