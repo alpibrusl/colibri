@@ -4099,10 +4099,17 @@ static int v4_moe_batch_union(
         for (int item = 0; !result && item < batch; item++)
             for (int rank = 0; !result && rank < topk; rank++) {
                 if (indices[(size_t)item * topk + rank] != expert) continue;
+                /* The prefill batch runs the SAME expert kernel as the token
+                 * path but was not counted by it: expert_matmul was only
+                 * wrapped around moe_token_pipeline's call, so a prompt-heavy
+                 * run reported ~74% of its MoE span unattributed and the
+                 * remainder looked mysterious rather than named. */
+                double mm0 = v4_now_mono();
                 result = coli_v4_expert_forward_ref(
                     expert_output, &view, inputs + (size_t)item * d,
                     route_weights[(size_t)item * topk + rank],
                     config->swiglu_limit);
+                coli_v4_expert_store_add_matmul(store, v4_now_mono() - mm0);
                 if (!result)
                     for (int column = 0; column < d; column++)
                         outputs[(size_t)item * d + column] +=
@@ -4126,10 +4133,17 @@ static int v4_moe_batch_union(
         for (int item = 0; !result && item < batch; item++)
             for (int rank = 0; !result && rank < topk; rank++) {
                 if (indices[(size_t)item * topk + rank] != expert) continue;
+                /* The prefill batch runs the SAME expert kernel as the token
+                 * path but was not counted by it: expert_matmul was only
+                 * wrapped around moe_token_pipeline's call, so a prompt-heavy
+                 * run reported ~74% of its MoE span unattributed and the
+                 * remainder looked mysterious rather than named. */
+                double mm0 = v4_now_mono();
                 result = coli_v4_expert_forward_ref(
                     expert_output, &view, inputs + (size_t)item * d,
                     route_weights[(size_t)item * topk + rank],
                     config->swiglu_limit);
+                coli_v4_expert_store_add_matmul(store, v4_now_mono() - mm0);
                 if (!result)
                     for (int column = 0; column < d; column++)
                         outputs[(size_t)item * d + column] +=
