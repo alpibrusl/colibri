@@ -18,6 +18,32 @@ LINUX  := $(findstring linux,$(TRIPLET))
 IS_WIN := $(MINGW)$(CYGWIN)
 
 # Appended to every platform's flags, so a caller can add to the build without
+# Floating-point contraction is PINNED, not left to the compiler (#76).
+#
+# deepseek_v4.c's rows16 kernel documents that its NEON, AVX2, AVX-512 and
+# scalar arms hold one operation sequence "so all three produce bit-identical
+# rows. No fused multiply-add." The hand-written vector arms honour that with
+# separate multiply and add. The scalar side did not: `s += a[i]*b[i]` becomes a
+# single fmadd, and the default differs per compiler -- clang contracts within a
+# statement, gcc contracts ACROSS statements, MSVC not at all. The invariant was
+# a property of whichever toolchain happened to build it.
+#
+# Measured before pinning: a NEON variant matched the scalar loop exactly with a
+# fused op and differed on 1547 of 2048 rows without one; with -ffp-contract=off
+# the comparison inverts. Half the rows move either way.
+#
+# `off` rather than `fast` because it is the setting the code already claims.
+#
+# This DOES change generated text on some prompts, and that is the argument for
+# it rather than against. Measured on the real 284B checkpoint: three prompts
+# were byte-identical either way -- bf16 rounding after each projection usually
+# absorbs a single-rounding difference -- but a fourth (the Spanish one) is
+# stable across three runs of each build and differs BETWEEN them. So the output
+# already depended on a flag nobody set, and a gcc build (contract=fast) and a
+# clang build (contract=on) could disagree on such a prompt today. Pinning makes
+# the result a property of the source instead. Wall clock is within run-to-run
+# noise. The oracles need re-blessing once, which is the one-time cost of making
+# this deterministic across toolchains.
 # replacing it. Overriding CFLAGS= on the command line would drop that
 # platform's OpenMP and -march flags, which is how a sanitizer run ends up
 # silently unsanitized. Used by test-asan; also the supported way to pass
@@ -62,7 +88,7 @@ $(warning libomp not found: building single-threaded. For multithreading: brew i
 OMPC    =
 OMPL    =
 endif
-CFLAGS  = -O3 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
+CFLAGS  = -O3 -ffp-contract=off $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
 # Opt-in: ARCH=native appends -mcpu=native (arm64 clang uses -mcpu, not -march),
 # which unlocks the i8mm SMMLA int8/int4 dot kernels in colibri.c. ARCH unset ->
 # no -mcpu, default build byte-identical. Apple clang knows apple-m4 / native.
@@ -87,7 +113,7 @@ else ifneq ($(IS_WIN),)
 # a v3 build simply compiles out the VNNI path - safe on any x86-64.
 CC      = gcc
 ARCH   ?= x86-64-v3
-CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
+CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -ffp-contract=off -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
 # -lpsapi: compat.h calls GetProcessMemoryInfo (rss_gb). It's linked via
 # #pragma comment(lib,"psapi.lib") for MSVC, but MinGW gcc ignores that pragma
 # (warns), so link psapi explicitly or the build fails undefined-reference on
@@ -102,7 +128,7 @@ ifneq (,$(PPC64))
 # (validated token-exact vs the transformers oracle on a POWER8 S824).
 CC      = gcc
 ARCH   ?= native
-CFLAGS  = -O3 -mcpu=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
+CFLAGS  = -O3 -ffp-contract=off -mcpu=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
 LDFLAGS = -lm -fopenmp -pthread $(EXTRA_LDFLAGS)
 EXE     =
 else ifneq (,$(AARCH64))
@@ -136,7 +162,7 @@ ARCHFLAG := -march=$(ARCH)
 else
 ARCHFLAG := -mcpu=$(ARCH)
 endif
-CFLAGS  = -O3 $(ARCHFLAG) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
+CFLAGS  = -O3 -ffp-contract=off $(ARCHFLAG) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
 LDFLAGS = -lm -fopenmp -pthread $(EXTRA_LDFLAGS)
 EXE     =
 else
@@ -147,7 +173,7 @@ CC      = gcc
 # ARCH=x86-64 -> massima compatibilita' (niente AVX2: usa il path scalare di fallback).
 # -pthread: Linux lo tira dentro via -fopenmp, i *BSD no e le pthread_* non risolvono (#219).
 ARCH   ?= native
-CFLAGS  = -O3 -march=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
+CFLAGS  = -O3 -ffp-contract=off -march=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
 LDFLAGS = -lm -fopenmp -pthread $(EXTRA_LDFLAGS)
 EXE     =
 endif
