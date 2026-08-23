@@ -186,6 +186,21 @@ void coli_v4_rt_route(int layer, int row, const int *ids, const float *gates,
 void coli_v4_rt_call_end(void);
 void coli_v4_rt_token(int token);
 
+/* The selection-history half of route_trace.h, reached the same way as the
+ * tracing half above: COLI_V4_UNIT_ROUTE_TRACE is the ONE unit that includes
+ * route_trace.h, so rt_c/rt_fp/rt_call exist once. The expert-store unit feeds
+ * and persists the same counters through these wrappers -- including it there
+ * too would give that unit a private copy, and the counters it saved would not
+ * be the ones the trace recorded. */
+void    coli_v4_rt_history_init(const char *engine, int n_layers, int n_experts);
+int     coli_v4_rt_history_tracing(void);
+void    coli_v4_rt_history_count(int layer, const int *ids, int k);
+int     coli_v4_rt_history_acc(int layer, int expert, uint32_t count, void *ud);
+int64_t coli_v4_rt_history_read(const char *path,
+                                int (*cb)(int layer, int expert, uint32_t count, void *ud),
+                                void *ud);
+int     coli_v4_rt_history_save(const char *path, int quiet);
+
 /* Phase attribution (#62 gate 2). The V4 baseline measured device time at ~2.5%
  * of a run and the expert cache within 0.14 pp of its ceiling, leaving ~97% of
  * wall clock unaccounted for. These counters name where it goes.

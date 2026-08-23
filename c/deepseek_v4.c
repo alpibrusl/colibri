@@ -6975,15 +6975,14 @@ failed:
 #include <string.h>
 
 /* The .coli_usage expert history lives in route_trace.h (#700) — one format,
- * one reader, one writer for every engine. Included inside THIS unit only:
- * the amalgam builds one object per COLI_V4_UNIT_*, and the shared header's
- * statics must have a single owner, which is the unit that loads, counts
- * (lookup_hot) and saves the history. The router runs in other units, so V4
- * does not emit per-row ROUTE_TRACE lines; if the stream is enabled the
- * banner says so below at store creation. */
-#include "route_trace.h"
-
-
+ * one reader, one writer for every engine. This unit loads, counts
+ * (lookup_hot) and saves that history, but does NOT include the header: the
+ * amalgam builds one object per COLI_V4_UNIT_*, so a second inclusion would
+ * give this unit a private rt_c/rt_fp/rt_call and the counters saved here
+ * would not be the ones the trace recorded. COLI_V4_UNIT_ROUTE_TRACE is the
+ * single owner (#62/#64, enforced by tests/test_v4_route_trace_wiring.py);
+ * the history reaches it through the coli_v4_rt_history_* wrappers declared
+ * in deepseek_v4_internal.h. */
 #ifdef COLI_V4_EXPERIMENTAL_PREFETCH_BATCH
 int coli_st_prefetch_many(
     const ColiSafetensorsIndex *index, const int *shards,
@@ -7495,7 +7494,7 @@ static int hot_usage_cb(int layer, int expert, uint32_t count, void *ud) {
         (size_t)layer * acc->state->experts_per_layer + expert];
     if (UINT64_MAX - *slot < count) *slot = UINT64_MAX;
     else *slot += count;
-    rt_acc_cb(layer, expert, count, NULL);
+    coli_v4_rt_history_acc(layer, expert, count, NULL);
     return 1;
 }
 
@@ -7506,7 +7505,7 @@ static uint64_t hot_usage_load(V4HotPolicy *policy,
     char *path = hot_history_path(model_dir);
     if (!path) return 0;
     V4UsageAcc acc = { policy, state };
-    int64_t total = rt_read(path, hot_usage_cb, &acc);
+    int64_t total = coli_v4_rt_history_read(path, hot_usage_cb, &acc);
     if (total < 0) total = 0;
     if (total)
         fprintf(stderr, "v4_autopin history=%s selections=%llu\n", path,
@@ -7523,7 +7522,7 @@ static void hot_usage_save(const V4HotPolicy *policy,
     /* rt_save persists the shared counters fed at each store lookup, with the
      * standard [STATS] summary line and the COLI_USAGE_DECAY knob every other
      * engine already honours. */
-    if (!rt_save(policy->history_path, 0))
+    if (!coli_v4_rt_history_save(policy->history_path, 0))
         fprintf(stderr, "v4_autopin warning=cannot-save-history path=%s\n",
                 policy->history_path);
 }
@@ -7894,7 +7893,7 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
         if (state->eheat && state->eheat[expert_index] < 63)
             state->eheat[expert_index]++;
     }
-    rt_count(key.layer, &key.expert, 1);   /* selection history, shared format (#700) */
+    coli_v4_rt_history_count(key.layer, &key.expert, 1);   /* selection history, shared format (#700) */
     uint64_t layer_requests = ++policy->layer_requests[key.layer];
     if (policy->repin_interval &&
         layer_requests % policy->repin_interval == 0)
@@ -8122,8 +8121,8 @@ int COLI_V4_ROWS16_STORE_OPEN(
         ? options->repin_interval : (uint64_t)minimum_slots;
     if (!policy->repin_interval) policy->repin_interval = 1;
     const char *autopin = getenv("COLI_V4_AUTOPIN");
-    rt_init("deepseek_v4", state->layers, state->experts_per_layer);
-    if (rt_tracing())
+    coli_v4_rt_history_init("deepseek_v4", state->layers, state->experts_per_layer);
+    if (coli_v4_rt_history_tracing())
         fprintf(stderr, "[ROUTE_TRACE] note: deepseek_v4 keeps the expert "
                 "history here, but per-row routing traces are not wired in "
                 "this engine — the stream will hold no rows\n");
@@ -8514,11 +8513,44 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
  * enforces that single inclusion.
  */
 
+/* rt_init is NOT idempotent: it recallocs rt_c and zeroes every counter, and
+ * reopens the stream. Two units now reach this one owner (the tracing side via
+ * coli_v4_rt_begin, the expert store's selection history via
+ * coli_v4_rt_history_init), so the second caller must not wipe the first
+ * caller's counts. Whoever arrives first sizes the table. */
+static void v4_rt_init_once(const char *engine, int n_layers, int n_experts) {
+    static int inited;
+    if (inited) return;
+    inited = 1;
+    rt_init(engine, n_layers, n_experts);
+}
+
+/* --- selection-history wrappers: see deepseek_v4_internal.h for why the
+ * expert-store unit reaches route_trace.h only through these. --- */
+void coli_v4_rt_history_init(const char *engine, int n_layers, int n_experts) {
+    v4_rt_init_once(engine, n_layers, n_experts);
+}
+int coli_v4_rt_history_tracing(void) { return rt_tracing(); }
+void coli_v4_rt_history_count(int layer, const int *ids, int k) {
+    rt_count(layer, ids, k);
+}
+int coli_v4_rt_history_acc(int layer, int expert, uint32_t count, void *ud) {
+    return rt_acc_cb(layer, expert, count, ud);
+}
+int64_t coli_v4_rt_history_read(const char *path,
+                                int (*cb)(int layer, int expert, uint32_t count, void *ud),
+                                void *ud) {
+    return rt_read(path, cb, ud);
+}
+int coli_v4_rt_history_save(const char *path, int quiet) {
+    return rt_save(path, quiet);
+}
+
 void coli_v4_rt_begin(int n_layers, int n_experts) {
     static int begun;
     if (begun) return;                      /* one run, one header */
     begun = 1;
-    rt_init("deepseek_v4", n_layers, n_experts);
+    v4_rt_init_once("deepseek_v4", n_layers, n_experts);
     /* V4's sampler is greedy: --temp and --top-p are parsed and then reported
      * as ignored (the "[V4] temperature ... ignored; target engine is greedy"
      * notices in GENERATE_STATS). The record states what the run actually did,
