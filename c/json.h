@@ -133,7 +133,9 @@ static jval *j_parse_val(jparser *p) {
         int cap = 8;
         v->keys = (char **)malloc(cap * sizeof(char*));
         v->kids = (jval **)malloc(cap * sizeof(jval*));
-        if (!v->keys || !v->kids) { json_free(v); p->depth--; return NULL; }
+        /* Fail closed (#798): a dropped allocation here would parse on with a
+         * short table. json_free first so the refusal does not also leak. */
+        if (!v->keys || !v->kids) { json_free(v); fprintf(stderr, "OOM parsing JSON object\n"); exit(1); }
         j_ws(p);
         if (*p->s == '}') { p->s++; p->depth--; return v; }
         for (;;) {
@@ -153,7 +155,8 @@ static jval *j_parse_val(jparser *p) {
                 if (nk) v->keys = nk;
                 jval **nv = (jval **)realloc(v->kids, cap*sizeof(jval*));
                 if (nv) v->kids = nv;
-                if (!nk || !nv) { free(key); json_free(val); goto obj_fail; }
+                if (!nk || !nv) { free(key); json_free(val); json_free(v);
+                                  fprintf(stderr, "OOM parsing JSON object\n"); exit(1); }
             }
             v->keys[v->len] = key; v->kids[v->len] = val; v->len++;
             j_ws(p);
@@ -171,7 +174,7 @@ obj_fail:
         p->s++; jval *v = j_new(J_ARR);
         if (!v) { p->depth--; return NULL; }
         int cap = 8; v->kids = (jval **)malloc(cap * sizeof(jval*));
-        if (!v->kids) { json_free(v); p->depth--; return NULL; }
+        if (!v->kids) { json_free(v); fprintf(stderr, "OOM parsing JSON array\n"); exit(1); }
         j_ws(p);
         if (*p->s == ']') { p->s++; p->depth--; return v; }
         for (;;) {
@@ -180,7 +183,8 @@ obj_fail:
             if (v->len == cap) {
                 cap *= 2;
                 jval **nv = (jval **)realloc(v->kids, cap*sizeof(jval*));
-                if (!nv) { json_free(val); goto arr_fail; }
+                if (!nv) { json_free(val); json_free(v);
+                           fprintf(stderr, "OOM parsing JSON array\n"); exit(1); }
                 v->kids = nv;
             }
             v->kids[v->len++] = val;
