@@ -90,9 +90,19 @@ static int eslot_lru_victim(ESlot *slots,int n,int ecap){
     int lru=-1, empty=-1, live=0;
     for(int i=0;i<n;i++){
         ESlot *s=&slots[i]; int e=sl_eid(s);
-        if(s->slab || e<-1) live++;
-        if(eslot_busy(s) || e<-1) continue;
-        if(!s->slab){ if(e==-1 && empty<0) empty=i; continue; }
+        /* Una prenotazione conta come viva SENZA leggere s->slab: il loader
+         * scrive quel campo fuori dal lock del pilot, quindi leggerlo qui e'
+         * una corsa vera (TSan, tests/test_tier_cache_tsan.c). Per gli slot
+         * non prenotati lo slab e' stabile: viene scritto prima che l'eid sia
+         * pubblicato sotto lock.
+         * EN: an in-flight reservation counts as live without reading s->slab
+         * -- the loader writes it outside the pilot lock. For every other slot
+         * the slab is already stable when its eid became visible. */
+        if(e<-1){ live++; continue; }         /* mai vittima, ma sta per possedere uno slab */
+        int has_slab = s->slab != NULL;
+        if(has_slab) live++;
+        if(eslot_busy(s)) continue;
+        if(!has_slab){ if(e==-1 && empty<0) empty=i; continue; }
         if(e==-1) return i;                   /* slot libero che possiede ancora lo slab */
         if(lru<0 || sl_used(s)<sl_used(&slots[lru])) lru=i;
     }
