@@ -80,9 +80,23 @@ static inline void     sl_origin_set(ESlot *s,int v){ __atomic_store_n(&s->origi
 static inline uint32_t u32_ld(const uint32_t *p){ return __atomic_load_n(p,__ATOMIC_RELAXED); }
 static inline void     u32_st(uint32_t *p,uint32_t v){ __atomic_store_n(p,v,__ATOMIC_RELAXED); }
 
-static int eslot_lru_victim(ESlot *slots,int n){
-    int lru=-1;
-    for(int i=0;i<n;i++) if(!eslot_busy(&slots[i])&&(lru<0||sl_used(&slots[i])<sl_used(&slots[lru]))) lru=i;
+/* Victim per una riga piena (#1034): uno slot svuotato da rss_guard (eid=-1,
+ * slab=NULL) e' riusabile SOLO finche' gli slab vivi della riga stanno sotto
+ * ecap -- riusarlo rialloca uno slab, quindi e' crescita, non eviction. Le
+ * prenotazioni in volo (eid<-1) contano come vive: stanno per possederne uno.
+ * EN: reusing a slab-less slot re-allocates, so it only counts as eviction
+ * EN: while the row's live-slab count is under ecap; else pick a slab owner. */
+static int eslot_lru_victim(ESlot *slots,int n,int ecap){
+    int lru=-1, empty=-1, live=0;
+    for(int i=0;i<n;i++){
+        ESlot *s=&slots[i]; int e=sl_eid(s);
+        if(s->slab || e<-1) live++;
+        if(eslot_busy(s) || e<-1) continue;
+        if(!s->slab){ if(e==-1 && empty<0) empty=i; continue; }
+        if(e==-1) return i;                   /* slot libero che possiede ancora lo slab */
+        if(lru<0 || sl_used(s)<sl_used(&slots[lru])) lru=i;
+    }
+    if(empty>=0 && live<ecap) return empty;   /* sotto il tetto: meglio il vuoto che sfrattare */
     return lru;
 }
 
@@ -145,14 +159,10 @@ static int expert_resident_or_reserved(TierCache *tc,int layer,int eid){
  * flag PILOT_EVICT_GUARD del chiamante (0 = LRU pura, per gli A/B). Il
  * chiamante tiene g_pilot_mx. */
 static int pilot_pick_slot(TierCache *tc,int layer,int eid,ESlot *Sl,int nn,int evict_guard){
-    int slot=-1;
-    for(int z=0;z<nn;z++){
-        if(eslot_busy(&Sl[z])) continue;                 /* borrowed by an async GPU read */
-        int e=sl_eid(&Sl[z]);
-        if(e==-1){ slot=z; break; }                      /* riusa uno slot libero/fallito */
-        if(e<-1) continue;                               /* prenotazione di un altro worker */
-        if(slot<0 || sl_used(&Sl[z])<sl_used(&Sl[slot])) slot=z;
-    }
+    /* riusa libero-con-slab, poi LRU; gli slot svuotati da rss_guard si riusano
+     * solo sotto ecap (#1034) -- altrimenti la cache ricresce oltre il cap
+     * abbassato e il guard rispara all'infinito. */
+    int slot=eslot_lru_victim(Sl,nn,tc->ecap);
     if(slot<0) return -1;
     /* proteggi la vittima solo se davvero CALDA (>=2 accessi demand) e chiaramente
      * piu' calda della speculazione, con l'isteresi 25%+4-freq di tier_pick_lfru */
@@ -256,9 +266,9 @@ static void tier_promote(TierCache *tc,int layer,ESlot *ws,int nmiss){
     int promo = nmiss<tc->ecap ? nmiss : tc->ecap;
     for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
         if(nn<tc->ecap){ dst=&Sl[nn]; __atomic_store_n(&tc->ecn[layer],nn+1,__ATOMIC_RELAXED); nn++; }
-        else { int lru=eslot_lru_victim(Sl,nn);
+        else { int lru=eslot_lru_victim(Sl,nn,tc->ecap);
                if(lru<0){ static int warned;
-                   if(!warned){ warned=1; fprintf(stderr,"[CUDA] all LRU expert slots are in flight; skipping cache promotion\n"); }
+                   if(!warned){ warned=1; fprintf(stderr,"[CUDA] no reusable LRU expert slot (in flight or cap reached); skipping cache promotion\n"); }
                    continue; }
                dst=&Sl[lru]; }
         ESlot tmp=*dst; *dst=ws[q]; ws[q]=tmp;

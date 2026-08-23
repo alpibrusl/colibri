@@ -41,6 +41,7 @@ typedef struct { int opaque; } QT;   /* engine weight views: opaque to the modul
 #define ITERS    20000
 
 static TierCache tc;
+static uint8_t slab_bytes[4];                   /* stand-in for real expert weights */
 static ESlot cache_slots[CAP];
 static ESlot *cache_layers[1] = { cache_slots };
 static int ecn_arr[1];
@@ -84,6 +85,7 @@ static void *pilot(void *arg) {
         pthread_mutex_unlock(&mx);
 
         /* the pread would happen here, outside the lock */
+        dst->slab = slab_bytes;                 /* a resident owns a slab (#1034) */
 
         pthread_mutex_lock(&mx);
         sl_eid_set(dst, eid);                   /* publish */
@@ -150,6 +152,7 @@ int main(void) {
     ESlot staged[2]; memset(staged, 0, sizeof staged);
     staged[0].eid = NEXPERT;        /* ids outside the run's range: countable */
     staged[1].eid = NEXPERT + 1;
+    staged[0].slab = staged[1].slab = slab_bytes;   /* loaded experts own slabs */
     tier_promote(&tc, 0, staged, 2);
     nn = tc.ecn[0];
     int found0 = 0, found1 = 0;

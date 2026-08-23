@@ -32,6 +32,23 @@ import numpy as np
 _positioned_write_lock = threading.Lock()
 
 
+def _save_file_atomic(save_file, tensors, destination, **kwargs):
+    destination = os.fspath(destination)
+    temporary = destination + ".tmp"
+    try:
+        os.remove(temporary)
+    except FileNotFoundError:
+        pass
+    try:
+        save_file(tensors, temporary, **kwargs)
+        os.replace(temporary, destination)
+    finally:
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+
+
 def _positioned_write(fd, data, offset):
     remaining = memoryview(data)
     pwrite = getattr(os, "pwrite", None)
@@ -361,7 +378,9 @@ def save_with_stamps(out, path, stamps):
     from safetensors.numpy import save_file      # imported here, as its callers do:
                                                 # the module is optional at import time
     meta = {"colibri.fmt": json.dumps(stamps, separators=(",", ":"), sort_keys=True)} if stamps else None
-    save_file(out, path, metadata=meta)
+    # Atomic (temp + os.replace) so an interrupted conversion never leaves a
+    # short shard that later reads as a valid-but-truncated safetensors file.
+    _save_file_atomic(save_file, out, path, metadata=meta)
 
 
 def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
