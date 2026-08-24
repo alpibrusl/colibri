@@ -23,7 +23,7 @@ int main(void){
     for(size_t i=0;i<(size_t)O*ng;i++){ e8[i]=(uint8_t)(120+rand()%12); sc[i]=mx4_scale(e8[i]); }
     for(int i=0;i<S*I;i++) x[i]=(float)(rand()%2001-1000)/500.f;
 
-    matmul_mxfp4(yc,x,q4,e8,S,I,O);
+    matmul_mxfp4_dispatch(yc,x,q4,e8,S,I,O);
 
     ColiVkTensor *t=NULL;
     if(!coli_vk_matmul(&t,yg,x,q4,sc,7,S,I,O,32)){

@@ -8,5 +8,5 @@
 
 void mxfp4_ref(float *y, const float *x, const unsigned char *q4,
                const unsigned char *e8s, int S, int I, int O) {
-    matmul_mxfp4(y, x, q4, e8s, S, I, O);
+    matmul_mxfp4_dispatch(y, x, q4, e8s, S, I, O);
 }

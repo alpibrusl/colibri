@@ -76,6 +76,19 @@ class KernelDispatchTest(unittest.TestCase):
     SOURCES = ("quant.h", "deepseek_v4.c", "kimi_k3.c", "colibri.c",
                "olmoe.c", "inkling.c")
 
+    # ...and the tests, which are sources too. Two callers in tests/ sat on the
+    # retired name from #71 until #88: they are gated behind VK=1/CUDA targets
+    # that default CI never builds, so the compile error the rename was designed
+    # to force never fired anywhere. A guard that only reads the engine cannot
+    # see a caller the engine does not include -- glob rather than list, so a new
+    # test file is covered the day it lands rather than the day someone
+    # remembers this tuple.
+    @property
+    def all_sources(self):
+        return [str(p.relative_to(ROOT))
+                for p in sorted(list(ROOT.glob("*.[ch]")) +
+                                list((ROOT / "tests").glob("*.[ch]")))]
+
     def test_no_dispatcher_calls_itself(self):
         for src in self.SOURCES:
             text = strip_comments(
@@ -113,7 +126,7 @@ class KernelDispatchTest(unittest.TestCase):
         walks straight past it. That is exactly how this caller survived the
         rename and broke four CI builds.
         """
-        for src in self.SOURCES:
+        for src in self.all_sources:
             text = strip_comments(
                 (ROOT / src).read_text(encoding="utf-8", errors="replace"))
             for m in re.finditer(r"(?<![\w])matmul_mxfp4(?![\w])", text):
