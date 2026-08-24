@@ -13380,6 +13380,13 @@ int main(int argc, char **argv) {
     if (!v4_omp_reserve_loader_cpus())
         fprintf(stderr, "[OMP] deepseek-v4: effective team size %d\n",
                 omp_get_max_threads());
+#else
+    /* V4 sizes its own team and so never reaches omp_tune.h's announce path;
+     * without this the single-threaded build says nothing at all (#66). */
+    fprintf(stderr, "[OMP] deepseek-v4: 1 thread -- built WITHOUT OpenMP, so "
+                    "this run is SINGLE-THREADED (measured 7.5x slower at 128 "
+                    "tokens on a 16-core host, #66). Install libomp and "
+                    "rebuild for multithreading.\n");
 #endif
     if (getenv("SERVE") && getenv("SERVE")[0] == '1')
         return v4_serve_main();
@@ -13669,14 +13676,19 @@ int main(int argc, char **argv) {
             (path_packed + path_fallback)
                 ? 100.0 * (double)path_fallback / (double)(path_packed + path_fallback)
                 : 0.0);
+#ifdef _OPENMP
+    int phase_threads = omp_get_max_threads();
+#else
+    int phase_threads = 1;   /* no OpenMP: the run WAS single-threaded (#66) */
+#endif
     fprintf(stderr,
-            "v4_phase wall=%.3f moe=%.3f attention=%.3f other=%.3f\n"
+            "v4_phase wall=%.3f moe=%.3f attention=%.3f other=%.3f threads=%d\n"
             "v4_phase_moe_inner routed_matmul=%.3f shared_expert=%.3f "
             "router=%.3f loader_wait=%.3f loader_start=%.3f gate_decode=%.3f\n"
             "v4_phase_io expert_disk=%.3f (thread-seconds: summed across the "
             "loader lanes and overlapped with compute, NOT a wall-clock span)\n",
             phase_wall, phase_moe, phase_attn,
-            phase_wall - phase_moe - phase_attn,
+            phase_wall - phase_moe - phase_attn, phase_threads,
             engine->experts ? coli_v4_expert_store_matmul_sec(engine->experts) : 0.0,
             coli_v4_block_profile_seconds(COLI_V4_BLOCK_PROFILE_SHARED_EXPERT),
             coli_v4_block_profile_seconds(COLI_V4_BLOCK_PROFILE_ROUTER),

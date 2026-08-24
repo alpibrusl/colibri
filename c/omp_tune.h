@@ -145,22 +145,38 @@ static int coli_physical_cores(void)
 static void coli_omp_tune_threads(const char *engine)
 {
 #ifdef _OPENMP
-    const char *off = getenv("COLI_NO_OMP_TUNE");
-    if (off) return;                       /* stesso kill-switch degli altri motori */
-    if (getenv("OMP_NUM_THREADS")) return; /* l'utente comanda */
-
+    /* Always announce the effective team, including when nothing was changed.
+     * Every early return here used to be silent, so a pasted benchmark carried
+     * no record of the thread count that produced it -- and a build that fell
+     * back to single-threaded was indistinguishable after the fact from a
+     * properly-built one (#66). The reason string is the useful half: it says
+     * WHY this count, so a surprising number is self-diagnosing. */
+    const char *why;
     int phys = coli_physical_cores();
-    if (phys <= 0) return;                 /* sconosciuto -> default di OpenMP */
     int logical = omp_get_max_threads();
-    if (phys >= logical) return;           /* niente SMT da evitare: silenzio */
-
-    omp_set_num_threads(phys);
-    fprintf(stderr, "[OMP] %s: %d physical-core threads instead of %d logical CPUs; "
-                    "SMT can halve decode throughput on some CPUs (#718); "
-                    "set OMP_NUM_THREADS=<n> to override\n",
-            engine, phys, logical);
+    if (getenv("COLI_NO_OMP_TUNE"))  why = "COLI_NO_OMP_TUNE set";
+    else if (getenv("OMP_NUM_THREADS")) why = "OMP_NUM_THREADS set";
+    else if (phys <= 0)              why = "core topology unknown";
+    else if (phys >= logical)        why = "no SMT to avoid";
+    else {
+        omp_set_num_threads(phys);
+        /* On an SMT x86 host the surplus is hyperthread siblings sharing a
+         * vector unit; on Apple Silicon it is efficiency cores, which gate
+         * every schedule(static) barrier (#89). Same cap, two reasons, so the
+         * wording must not claim one of them. */
+        why = "performance/physical cores (#718)";
+    }
+    fprintf(stderr, "[OMP] %s: %d threads (%s); OMP_NUM_THREADS=<n> overrides, "
+                    "COLI_NO_OMP_TUNE=1 disables tuning\n",
+            engine, omp_get_max_threads(), why);
 #else
-    (void)engine;
+    /* The build-time warning scrolls past in a wall of clang lines. Measured
+     * 5-7x on a 16-core host, with byte-identical output and counters, so
+     * nothing else in the run reveals it (#66). */
+    fprintf(stderr, "[OMP] %s: 1 thread -- built WITHOUT OpenMP, so this run is "
+                    "SINGLE-THREADED (measured 5-7x slower on a 16-core host, "
+                    "#66). Install libomp and rebuild for multithreading.\n",
+            engine);
 #endif
 }
 

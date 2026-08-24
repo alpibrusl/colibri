@@ -7,6 +7,7 @@
  * two override paths and correctly leave the OpenMP default unchanged. */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -60,8 +61,36 @@ static void env_unset(const char *name)
 int main(void)
 {
 #ifndef _OPENMP
-    puts("test_omp_tune: ok (OpenMP unavailable; helper is a no-op)");
-    return 0;
+    /* The single-threaded build is the case #66 is actually about, so it is the
+     * one that must be asserted rather than skipped: a run that is silently 5-7x
+     * slow is indistinguishable from a good one afterwards, because the output
+     * text and every counter are byte-identical. This branch used to print
+     * "helper is a no-op" and return -- which is exactly the hole. */
+    {
+        const char *path = "test_omp_tune_stderr.tmp";
+        char buffer[512] = {0};
+        if (!freopen(path, "w+", stderr)) {
+            puts("test_omp_tune: FAIL (could not capture stderr)");
+            return 1;
+        }
+        coli_omp_tune_threads("test");
+        fflush(stderr);
+        FILE *read_back = fopen(path, "r");
+        if (read_back) {
+            size_t got = fread(buffer, 1, sizeof buffer - 1, read_back);
+            buffer[got] = '\0';
+            fclose(read_back);
+        }
+        remove(path);
+        /* stderr is the captured file now; say the verdict on stdout. */
+        if (!strstr(buffer, "SINGLE-THREADED")) {
+            printf("test_omp_tune: FAIL — a build without OpenMP must SAY so; "
+                   "got: %s\n", buffer[0] ? buffer : "(nothing)");
+            return 1;
+        }
+        puts("test_omp_tune: ok (no OpenMP; single-threaded build announces itself)");
+        return 0;
+    }
 #else
     int fail = 0;
     int logical = omp_get_num_procs();
