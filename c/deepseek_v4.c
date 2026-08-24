@@ -13320,6 +13320,7 @@ static int v4_serve_main(void) {
 
 #ifndef COLI_V4_SKIP_GENERATE_MAIN
 #ifdef _OPENMP
+#include "omp_tune.h"
 /* Size the OpenMP team so the block pipeline's persistent expert-loader
  * workers keep whole CPUs. The OpenMP default team spans every logical CPU,
  * which schedules compute threads onto the CPUs the loaders need -- and on a
@@ -13327,17 +13328,49 @@ static int v4_serve_main(void) {
  * rationale omp_tune.h records for the spin-wait half of the GLM tuning: a
  * busy team steals cores from the I/O pool). An explicit OMP_NUM_THREADS or
  * COLI_NO_OMP_TUNE=1 wins, exactly like the other engines' tuning. */
+/* Every routed-expert and attention matmul is a `schedule(static)` region, so
+ * the region ends when its SLOWEST thread ends. Put one thread on an efficiency
+ * core and every barrier in the run waits for it -- a cliff, not a slope.
+ * Measured on an M4 Max (12 P + 4 E, 16 logical), 128-token decode:
+ *
+ *     threads   9  ->  87.9s      (under-provisioned)
+ *     threads  12  ->  78.7s      (== P-core count)
+ *     threads  13  -> 121.6s      (logical - loaders: ONE E-core thread)
+ *     threads  16  -> 125.7s
+ *
+ * 13 costs 1.55x over 12. See colibri#89.
+ *
+ * coli_physical_cores() is omp_tune.h's existing probe -- the one the GLM,
+ * Kimi and OLMoE engines already tune with (#718). It returns performance
+ * cores on Apple Silicon (hw.perflevel0.logicalcpu), physical cores elsewhere,
+ * which is the right cap for both reasons: E-cores gate the barrier, and SMT
+ * siblings share one vector unit. V4 had its own sizing and neither. */
 static int v4_omp_reserve_loader_cpus(void) {
     if (getenv("COLI_NO_OMP_TUNE")) return 0; /* family-wide kill-switch */
     if (getenv("OMP_NUM_THREADS")) return 0;  /* the user already chose */
     int logical = omp_get_max_threads();
     int team = logical - COLI_V4_EXPERT_LOADER_COUNT;
+    /* Cap at the performance cores. Deliberately NOT (perf - loaders): the
+     * loaders block in pread and hold no core, so subtracting them here
+     * under-provisions the team (9 threads measured at 87.9s above). The
+     * loader subtraction stays keyed to the LOGICAL count, which is what it
+     * was always about -- not scheduling compute onto the loaders' CPUs. */
+    int perf = coli_physical_cores();
+    int capped = perf > 0 && team > perf;
+    if (capped) team = perf;
     if (team < 2) return 0; /* tiny machine: leave the OpenMP default alone */
     omp_set_num_threads(team);
-    fprintf(stderr, "[OMP] deepseek-v4: %d compute threads (%d logical CPUs "
-                    "minus %d expert-loader workers); OMP_NUM_THREADS=<n> "
-                    "overrides, COLI_NO_OMP_TUNE=1 disables\n",
-            team, logical, COLI_V4_EXPERT_LOADER_COUNT);
+    if (capped)
+        fprintf(stderr, "[OMP] deepseek-v4: %d compute threads (capped at the "
+                        "performance cores; %d logical, %d expert-loader "
+                        "workers); OMP_NUM_THREADS=<n> overrides, "
+                        "COLI_NO_OMP_TUNE=1 disables\n",
+                team, logical, COLI_V4_EXPERT_LOADER_COUNT);
+    else
+        fprintf(stderr, "[OMP] deepseek-v4: %d compute threads (%d logical CPUs "
+                        "minus %d expert-loader workers); OMP_NUM_THREADS=<n> "
+                        "overrides, COLI_NO_OMP_TUNE=1 disables\n",
+                team, logical, COLI_V4_EXPERT_LOADER_COUNT);
     return 1;
 }
 #endif
