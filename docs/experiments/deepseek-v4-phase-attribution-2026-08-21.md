@@ -1,5 +1,15 @@
 # Where V4's time actually goes — and the 7.5× that was sitting on the floor (#62 gate 2)
 
+> **Superseded for timings, 2026-08-24.** Every timing in this document predates
+> the upstream merge (#86). See
+> `deepseek-v4-post-merge-baseline-2026-08-24.md` for the current numbers.
+> Two things there change how this one should be read: the merge shipped an
+> OpenMP thread-count regression (#89) that cost 1.55x until #91, and
+> `routed_matmul` is no longer comparable across the merge — upstream moved most
+> expert matmul time out of the field it samples, so the pre/post delta in that
+> row is an accounting change, not a speedup.
+>
+> Hit rates, byte counts and the sequence-length finding are unaffected.
 **Date** 2026-08-21 · **Issues** [#62](https://github.com/alpibrusl/colibri/issues/62) ·
 **Follows** `deepseek-v4-baseline-2026-08-21.md` (#63) ·
 **Model** DeepSeek V4 Flash, 284B MoE, 167 GB on disk
