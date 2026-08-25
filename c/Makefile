@@ -1482,6 +1482,12 @@ bench-omp-grain: tests/bench_omp_grain.c
 	$(CC) $(CFLAGS) $< -o tests/bench_omp_grain $(LDFLAGS)
 	./tests/bench_omp_grain
 
+# Does batching amortize the fp8 dequantization? (#37) Real kernel, V4's dense
+# shape, swept over batch and reported per token.
+bench-batch-scaling: tools/bench_batch_scaling.c quant.h
+	$(CC) $(CFLAGS) $< -o tools/bench_batch_scaling $(LDFLAGS)
+	./tools/bench_batch_scaling
+
 # --- sanitizers ---------------------------------------------------------
 # The whole C test suite under AddressSanitizer + UndefinedBehaviorSanitizer.
 # Until this target the only sanitized code in the tree was fuzz-rans, which
