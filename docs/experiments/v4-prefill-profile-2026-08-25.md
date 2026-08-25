@@ -76,12 +76,58 @@ validate `batch > 128`). Lifting it to 512 would put experts at S=12 and engage 
 **~11%**, for a change that touches six validators plus every batch-scaled buffer, and grows
 prefill activation memory 4x. Real, bounded, and not obviously worth it first.
 
+## Inside attention: the largest stage is single-threaded
+
+`DSV4_ATTN_PROF=1` already instruments every stage; nothing needed adding. Totals across the
+whole 595-token prefill (107.7 s, matching `v4_phase`'s 108.0 s):
+
+| stage | time | % of attention | % of prefill |
+|---|---|---|---|
+| **attn** | 49.74 s | **46.2%** | **19.8%** |
+| **wo** | 30.67 s | 28.5% | 12.2% |
+| qb | 12.21 s | 11.3% | 4.9% |
+| idx | 6.13 s | 5.7% | 2.4% |
+| comp | 5.75 s | 5.3% | 2.3% |
+| qa | 2.21 s | 2.1% | 0.9% |
+| kv | 0.82 s | 0.8% | 0.3% |
+| rope | 0.13 s | 0.1% | — |
+
+`wo` and `qb` are fp8 batch matmuls at chunk width 128, so they already take the #98 hoist —
+30.7 + 12.2 s at 1.35x accounts almost exactly for the ~13 s the hoist saved on prefill,
+which is a useful independent check that it engaged.
+
+**`attn` is 49.7 s — 20% of the entire prefill — and it runs single-threaded.**
+`coli_v4_sparse_attention_ref` (`deepseek_v4.c:4131`) contains no OpenMP pragma, and its
+caller is a plain `for (item = 0; item < batch; item++)` loop. Eleven of twelve threads are
+idle for a fifth of prefill.
+
+It is not free money, and the two reasons are worth stating because they shape the fix:
+
+1. **Shared scratch.** `v4_attn_scratch` hands out slots from a `static void *arena[24]` —
+   process-global, not per-thread. The item loop takes slots 21 and 22, so threading it as-is
+   would race.
+2. **A sequential KV ring.** Each item memcpys its own kv into `state->kv` at
+   `position % window_size` and then attends over that ring, so item *i+1* reads what item *i*
+   just wrote. Causal, within the batch.
+
+The second is the real one, and it has a standard answer: write every item's kv into the ring
+first, then attend in parallel with per-item masking. The masking already exists — the loop
+builds `indices[i] = i <= position ? i : -1` — so the information needed is present; it is the
+ordering that has to change, not the arithmetic. Each item's own accumulation order would be
+untouched, so bit-identity is a reasonable target rather than a hope.
+
+Ceiling: even at a conservative 8x from 12 threads, 49.7 s -> ~6 s saves ~44 s of 250 s, about
+**1.2x on prefill** — and it composes with the chunk cap's 1.11x.
+
 ## What is worth doing instead
 
-**Attention is 43% of prefill and untouched by any of the above.** It is the largest single
-term, it grows with sequence length, and nobody has profiled inside it. That is where the
-next look belongs — the chunk cap is a known 11% with known cost, and attention is an
-unknown fraction of a larger number.
+**Parallelize the `attn` stage.** It is 20% of prefill running on one core, the ceiling is
+~1.2x, and the blockers are per-thread scratch plus a KV-write/attend split — both ordinary
+work, neither requiring new numerics. That beats the chunk cap's 1.11x, which costs six
+validator changes and 4x the activation memory.
+
+The two compose: attn parallelized *and* the cap lifted would put prefill near
+250 s -> ~185 s. Neither touches decode, where a single session is S=1 by construction.
 
 Reproduce:
 
