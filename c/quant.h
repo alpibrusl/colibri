@@ -512,6 +512,11 @@ static const float E4M3_LUT[256] = {
 static inline float e4m3_decode(uint8_t b){ return E4M3_LUT[b]; }
 
 #define FP8_BLOCK 128
+/* Batch tile for matmul_fp8's hoisted-dequant path: bounds the accumulator
+ * array so it needs no VLA (MSVC), and keeps the decode buffers L1-resident. */
+enum { FP8_S_TILE = 16 };
+/* Below this batch the hoist costs more than it saves -- measured, see matmul_fp8. */
+enum { FP8_HOIST_MIN = 4 };
 static inline int64_t fp8_nblk(int n){ return ((int64_t)n + FP8_BLOCK - 1) / FP8_BLOCK; }
 
 /* y[S,O] = x[S,I] @ W^T, W raw e4m3 bytes (byte-identical layout to fmt=1) +
@@ -551,7 +556,14 @@ static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float 
     for(int o=0;o<Oq;o+=4){
         const uint8_t *w0 = q8 + (int64_t)o*I, *w1 = w0+I, *w2 = w1+I, *w3 = w2+I;
         const float *scl = bscale + ((int64_t)o / FP8_BLOCK)*nblkI;
-        for(int s=0;s<S;s++){
+        if(S<FP8_HOIST_MIN){
+            /* Narrow-batch path, left exactly as it was. The hoist below writes
+             * 4*FP8_BLOCK floats per block before any dot product, and that only
+             * repays itself once enough rows consume it. Measured per token on
+             * I=4096 O=2048 (spin policy, 12 threads), hoisted vs this path:
+             *   S=1 1.00x   S=2 0.85x   S=4 1.10x   S=8 1.25x   S=16+ 1.35x
+             * so the crossover is at 4, not 2. */
+            for(int s=0;s<S;s++){
             const float *xs = x + (int64_t)s*I;
             double a0=0,a1=0,a2=0,a3=0;
             for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
@@ -569,6 +581,54 @@ static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float 
             }
             y[(int64_t)s*O+o  ]=(float)a0; y[(int64_t)s*O+o+1]=(float)a1;
             y[(int64_t)s*O+o+2]=(float)a2; y[(int64_t)s*O+o+3]=(float)a3;
+            }
+            continue;
+        }
+        /* S>1: hoist the dequantization out of the batch loop (#37).
+         *
+         * The batch loop used to sit INSIDE the decode, so e4m3_decode ran once
+         * per (output row, batch row, element) -- S matvecs sharing a loop nest,
+         * not a matmul. The weight rows are L1-resident across s, so this was
+         * never bandwidth; it was S times the decode work. Measured 1.02x from
+         * batching before this, with time exactly linear in S.
+         *
+         * Decode one 128-element block of the four rows once, then run the batch
+         * against it. Each output's accumulation order over blocks, and over i
+         * within a block, is untouched -- the only change is WHEN the identical
+         * LUT lookup happens -- so this is bit-identical, and tests/test_fp8_*
+         * check that rather than trusting it.
+         *
+         * Tiled by FP8_S_TILE so the accumulators are a fixed-size array: S is a
+         * runtime value and MSVC has no VLAs. */
+        for(int s0=0; s0<S; s0+=FP8_S_TILE){
+            int st = S-s0 < FP8_S_TILE ? S-s0 : FP8_S_TILE;
+            double a[FP8_S_TILE][4];
+            for(int t=0;t<st;t++){ a[t][0]=a[t][1]=a[t][2]=a[t][3]=0; }
+            for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
+                int base=(int)(bi*FP8_BLOCK); int blen=FP8_BLOCK; if(base+blen>I) blen=I-base;
+                float sc=scl[bi];
+                float d0[FP8_BLOCK], d1[FP8_BLOCK], d2[FP8_BLOCK], d3[FP8_BLOCK];
+                for(int k=0;k<blen;k++){
+                    d0[k]=e4m3_decode(w0[base+k]); d1[k]=e4m3_decode(w1[base+k]);
+                    d2[k]=e4m3_decode(w2[base+k]); d3[k]=e4m3_decode(w3[base+k]);
+                }
+                for(int t=0;t<st;t++){
+                    const float *xs = x + (int64_t)(s0+t)*I;
+                    float c0=0,c1=0,c2=0,c3=0;
+                    for(int k=0;k<blen;k++){
+                        float xi = xs[base+k];
+                        c0 += d0[k]*xi; c1 += d1[k]*xi;
+                        c2 += d2[k]*xi; c3 += d3[k]*xi;
+                    }
+                    a[t][0] += (double)c0*sc; a[t][1] += (double)c1*sc;
+                    a[t][2] += (double)c2*sc; a[t][3] += (double)c3*sc;
+                }
+            }
+            for(int t=0;t<st;t++){
+                int64_t row=(int64_t)(s0+t)*O;
+                y[row+o  ]=(float)a[t][0]; y[row+o+1]=(float)a[t][1];
+                y[row+o+2]=(float)a[t][2]; y[row+o+3]=(float)a[t][3];
+            }
         }
     }
     for(int o=Oq;o<O;o++){                     /* O is 2048/4096 in practice */
