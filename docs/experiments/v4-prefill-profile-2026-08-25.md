@@ -36,12 +36,19 @@ the defect, and that with the hoist in place a wider chunk should now pay.
 
 Measured post-hoist, same host and prompt:
 
-| `V4_PREFILL_CHUNK` | TTFT | routed_matmul |
-|---|---|---|
-| 128 | 250.5 s | 95.4 |
-| 64 | 258.3 s | 96.7 |
+| `V4_PREFILL_CHUNK` | TTFT | attention | routed_matmul |
+|---|---|---|---|
+| 128 | 250.5 s | 108.2 | 95.4 |
+| 64 | 258.3 s | 109.6 | 96.7 |
+| 32 | 269.6 s | 110.9 | 96.9 |
 
-**3.1% — the same as before the hoist.** The curve did not steepen.
+**64 -> 128 is 3.1% — the same as before the hoist.** The curve did not steepen.
+
+And the full sweep says something sharper: **`routed_matmul` is flat**, 96.9 -> 96.7 -> 95.4
+across a 4x change in chunk width. The expert matmuls do not batch at *any* width the cap
+permits. What little TTFT does improve (269.6 -> 250.5, 7.6%) comes from attention moving
+slightly and from per-chunk fixed overhead being amortized over fewer chunks -- not from the
+expert path at all.
 
 The reason is a result from the batching gate that should have been applied *before* running
 this: with top-6 of 256, tokens per activated expert is
