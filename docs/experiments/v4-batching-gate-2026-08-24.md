@@ -94,7 +94,93 @@ scheduler to feed them.
 **So batching is still worth pursuing — for the compute reason, not the bytes reason.**
 #37 as written targets the smaller term.
 
-## Method
+## Result 4: the batch kernel does not batch
+
+`c/tools/bench_batch_scaling` runs the real `matmul_fp8` on V4's dense shape
+(I=4096, O=2048) and sweeps the batch, reporting time **per token**.
+
+The first reading looked like a win — 2.49x by S=16. It was an artifact, and the artifact is
+instructive. With the default OpenMP wait policy this host pays ~65 us of fork/join per
+parallel region (see `bench_omp_grain`), which at S=1 is a quarter of the whole call.
+Batching spread that fixed cost over more tokens, and that is all the "speedup" was.
+
+Pinning `OMP_WAIT_POLICY=active` (fork/join ~2 us) removes it:
+
+| S | ms/token, default policy | ms/token, spin | vs S=1 (spin) |
+|---|---|---|---|
+| 1 | 0.271 | 0.156 | 1.00x |
+| 2 | 0.226 | 0.154 | 1.02x |
+| 8 | 0.168 | 0.153 | 1.02x |
+| 16 | 0.155 | 0.153 | 1.02x |
+| 64 | 0.154 | 0.153 | 1.02x |
+
+**1.02x. Batching the kernel is worth nothing**, and total time scales exactly linearly with
+S (0.16, 0.31, 0.61, 1.22, 2.45, 4.89, 9.78 ms).
+
+The reason is in the loop nest:
+
+```c
+for (o …)                       /* output rows, 4 at a time, parallel */
+    for (s = 0; s < S; s++)     /* batch INSIDE */
+        for (i …)
+            c0 += e4m3_decode(w0[i]) * xi;
+```
+
+`e4m3_decode` is evaluated once per *(output row, batch row, input element)*. The weight rows
+stay in L1 across the `s` loop, so this is not a bandwidth problem — the **decode work is
+simply repeated S times**. The kernel is S matvecs sharing a loop nest, not a matmul.
+
+So the amortization is available and unclaimed. Hoisting the decode out of the `s` loop —
+decode a 128-element block of 4 weight rows once, then run S dot products against it — keeps
+each row's accumulation order over blocks intact and should therefore stay bit-identical.
+Given that speed on this kernel tracks instruction count, and decode is the dominant
+instruction, the headroom is large. **This is the finding of the experiment.**
+
+It also plausibly explains a separate anomaly: prefill measured ~2.3 tok/s on a 595-token
+prompt, roughly 8x off its own roofline. Prefill is exactly where S is large, and exactly
+where this kernel re-decodes every weight for every row.
+
+## Result 5: even so, the routed experts never reach a useful batch
+
+Batching splits into two paths that behave in opposite ways. Tokens served per *activated*
+expert, measured from the traces and extrapolated (top-6 of 256, independent routing):
+
+| S | tokens per activated expert |
+|---|---|
+| 2 | 1.04 (measured) |
+| 5 | 1.17 (measured) |
+| 16 | 1.19 |
+| 64 | 1.92 |
+| 128 | 3.15 |
+| **256** | **6.01** |
+
+At S=16 concurrent sessions a given expert still serves ~1.2 tokens. Reaching a batch of 6
+needs roughly **256 concurrent sessions**.
+
+So a decode-side fix helps:
+
+- **dense / attention** (~37% of decode time): sees the full batch S — but only in prefill,
+  since decode is inherently S=1 per session
+- **routed experts** (~35% of decode time, and all of the I/O): effectively batch 1 until S
+  reaches the hundreds
+
+**The sparsity that makes streaming possible is the same property that defeats batching.**
+Top-6 of 256 is what keeps per-token traffic at 3.45 GB instead of 167 GB — and it is exactly
+why S independent tokens scatter across nearly S x 6 distinct experts. The two properties are
+in tension by construction.
+
+## What this means for the roadmap
+
+1. **Fix the kernel** (Result 4). It is a real, bounded, probably bit-identical optimization,
+   and its main beneficiary is **prefill**, which is 8x off roofline and which nobody has
+   looked at. This does not need a scheduler.
+2. **Do not build the #37 scheduler for the bytes** (Results 1-3): expert-major ordering is
+   worth 1.00x, and at our memory budget concurrency makes misses *worse*.
+3. **For single-stream decode, batching is not the lever at all** (Result 5). Bytes and
+   instructions per byte are: int4 dense is -33% traffic *and* fewer decode operations, and
+   it hits the dominant term twice.
+
+## Method## Method
 
     ROUTE_TRACE=trace.txt ./deepseek_v4 <model> --prompt-file <p> --max-tokens 24
     python3 c/tools/batch_expert_major.py trace1.txt trace2.txt ...
