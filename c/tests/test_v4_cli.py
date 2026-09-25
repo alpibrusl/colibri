@@ -102,10 +102,11 @@ class V4CliTest(unittest.TestCase):
                     self.cli.cmd_run(args)
             self.assertEqual(stopped.exception.code, 0)
             self.assertEqual(captured["command"], ["/engines/olmoe", "16", "8"])
-            self.assertEqual(captured["input"], "hello world\n")
-            self.assertTrue(captured["text"])
+            self.assertEqual(captured["input"], b"hello world\n")
+            self.assertNotIn("text", captured)
             self.assertEqual(captured["env"]["CHAT"], "1")
             self.assertEqual(captured["env"]["MAX_NEW"], "32")
+            self.assertEqual(captured["env"]["SNAP"], os.path.abspath(str(root)))
         finally:
             directory.cleanup()
 
@@ -114,6 +115,31 @@ class V4CliTest(unittest.TestCase):
         env = self.cli.env_for_engine(args, "deepseek_v4")
         self.assertEqual(env["NGEN"], "8")
         self.assertEqual(env["RAM_GB"], "64")
+        self.assertEqual(env["CTX"], "4096")
+
+    def test_sister_engines_get_snap_from_the_model_flag(self):
+        """#1501 / #1600: `coli run` handed olmoe (and every non-GLM engine) an
+        environment without SNAP, so the engine exited with "started without
+        a model" while chat and serve, which set it elsewhere, worked.
+        SNAP is the model directory, same as env_for() for glm: --model wins
+        over a leftover SNAP in the parent environment."""
+        from family_registry import family_ids
+        for arch in [f for f in family_ids() if f != "glm"]:
+            args = argparse.Namespace(ngen=8, temp=None, ram=0, ctx=None, model="models/demo")
+            env = self.cli.env_for_engine(args, arch)
+            self.assertEqual(env.get("SNAP"), os.path.abspath(args.model), arch)
+        with mock.patch.dict(os.environ, {"SNAP": "/elsewhere"}):
+            args = argparse.Namespace(ngen=8, temp=None, ram=0, ctx=None, model="models/demo")
+            self.assertEqual(
+                self.cli.env_for_engine(args, "olmoe")["SNAP"],
+                os.path.abspath(args.model),
+            )
+
+    def test_v41_ram_flag_overrides_inherited_budget(self):
+        args = argparse.Namespace(ngen=8, temp=None, ram=96, ctx=4096)
+        with mock.patch.dict(os.environ, {"RAM_GB": "32"}):
+            env = self.cli.env_for_engine(args, "deepseek_v41")
+        self.assertEqual(env["RAM_GB"], "96")
         self.assertEqual(env["CTX"], "4096")
 
     def test_kimi_engine_environment_forwards_ram(self):
@@ -132,6 +158,78 @@ class V4CliTest(unittest.TestCase):
         args = argparse.Namespace(ngen=8, temp=0.0, ram=0, ctx=0)
         env = self.cli.env_for_engine(args, "kimi")
         self.assertNotIn("RAM_GB", env)
+
+    def test_auto_tier_applies_saved_profile_to_sibling_engine(self):
+        """#1196 saved sibling profiles, but only GLM's env_for() loaded them.
+        A measured V4 lane winner must reach the real chat/serve child, while
+        an explicit environment override remains authoritative."""
+        directory, root = self.make_model()
+        args = argparse.Namespace(
+            model=str(root), ngen=8, temp=0.0, ram=0, ctx=0,
+            gpu=None, vram=0, auto_tier=True, no_tune_profile=False,
+            policy="quality", kv_slots=1,
+        )
+        measured = {
+            "gain": 0.20,
+            "winner": {"env": {"V4_LOADER_LANES": "3", "RAM_GB": "32.000"}},
+        }
+        planned = {"sentinel": "same plan used by tune and launch"}
+        def passthrough(_plan, env, cuda_enabled):
+            result = dict(env)
+            result.setdefault("OMP_NUM_THREADS", "16")
+            return result
+        try:
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch("resource_plan.environment_for_plan",
+                            side_effect=passthrough), \
+                 mock.patch("autotune.load_profile", return_value=measured), \
+                 mock.patch.object(self.cli, "engine_for",
+                                   return_value="/engines/deepseek_v4"):
+                env = self.cli.env_for_engine(args, "deepseek_v4", plan=planned)
+            self.assertEqual(env["V4_LOADER_LANES"], "3")
+            self.assertEqual(env["RAM_GB"], "32.000")
+            self.assertNotIn("OMP_NUM_THREADS", env)
+
+            with mock.patch.dict(os.environ, {"V4_LOADER_LANES": "12"}, clear=True), \
+                 mock.patch("resource_plan.environment_for_plan",
+                            side_effect=passthrough), \
+                 mock.patch("autotune.load_profile", return_value=measured), \
+                 mock.patch.object(self.cli, "engine_for",
+                                   return_value="/engines/deepseek_v4"):
+                env = self.cli.env_for_engine(args, "deepseek_v4", plan=planned)
+            self.assertEqual(env["V4_LOADER_LANES"], "12")
+
+            args.ram = 64
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch("resource_plan.environment_for_plan",
+                            side_effect=passthrough), \
+                 mock.patch("autotune.load_profile", return_value=measured), \
+                 mock.patch.object(self.cli, "engine_for",
+                                   return_value="/engines/deepseek_v4"):
+                env = self.cli.env_for_engine(args, "deepseek_v4", plan=planned)
+            self.assertEqual(env["RAM_GB"], "64")
+        finally:
+            directory.cleanup()
+
+    def test_measured_cap_is_private_and_never_overrides_cli_cap(self):
+        measured = {"winner": {"env": {"OMP_NUM_THREADS": "4"}, "cap": 12}}
+        env = self.cli.apply_measured_profile({}, measured, set(), None)
+        self.assertEqual(env["COLI_PROFILE_CAP"], "12")
+        self.assertEqual(env["OMP_NUM_THREADS"], "4")
+        explicit = self.cli.apply_measured_profile({}, measured, set(), 7)
+        self.assertNotIn("COLI_PROFILE_CAP", explicit)
+        self.assertEqual(self.cli.cap_for_launch(None, env, 8), 12)
+        self.assertEqual(self.cli.cap_for_launch(7, env, 8), 7)
+        self.assertEqual(self.cli.cap_for_launch(
+            None, {"COLI_PROFILE_CAP": "12", "COLI_PLAN_CAP": "20"}, 8), 12)
+        self.assertEqual(self.cli.cap_for_launch(
+            None, {"COLI_PLAN_CAP": "20"}, 8), 20)
+        with mock.patch.dict(os.environ, {"CAP": "9"}, clear=True):
+            args = argparse.Namespace(cap=None)
+            self.assertEqual(self.cli.operator_cap(args, "glm"), 9)
+            explicit_env = self.cli.apply_measured_profile(
+                {}, measured, set(), self.cli.operator_cap(args, "glm"))
+            self.assertNotIn("COLI_PROFILE_CAP", explicit_env)
 
     def test_ngen_default_differs_for_interactive_commands(self):
         """#889: `coli web` passed --max-tokens 1024, and openai_server clamps a
@@ -153,12 +251,11 @@ class V4CliTest(unittest.TestCase):
         env = self.cli.env_for_engine(args, "deepseek_v4")
         self.assertEqual(env["NGEN"], "1024")
 
-    def test_kimi_does_not_get_v4_only_settings(self):
-        """The widening is RAM_GB alone; CTX and the V4 speculation defaults stay
-        where they were."""
+    def test_kimi_context_uses_its_registered_environment_channel(self):
         args = argparse.Namespace(ngen=8, temp=0.0, ram=242, ctx=4096)
         env = self.cli.env_for_engine(args, "kimi")
         self.assertNotIn("CTX", env)
+        self.assertEqual(env["K3_MAXT"], "4096")
         self.assertNotIn("V4_MTP", env)
 
     def test_windows_v4_run_passes_chinese_prompt_as_utf8_file(self):
@@ -184,6 +281,7 @@ class V4CliTest(unittest.TestCase):
                                    return_value="deepseek_v4.exe"), \
                  mock.patch.object(self.cli, "need_model"), \
                  mock.patch.object(self.cli, "banner"), \
+                 mock.patch("resource_plan.physical_cpu_count", return_value=8), \
                  mock.patch.object(self.cli.subprocess, "call",
                                    side_effect=fake_call):
                 with self.assertRaises(SystemExit) as stopped:
@@ -192,6 +290,37 @@ class V4CliTest(unittest.TestCase):
             self.assertEqual(captured["bytes"], prompt.encode("utf-8"))
             self.assertNotIn(prompt, captured["command"])
             self.assertFalse(captured["path"].exists())
+        finally:
+            directory.cleanup()
+
+    def test_v4_one_shot_translates_profiled_ram_to_cli_memory_limit(self):
+        directory, root = self.make_model()
+        args = argparse.Namespace(
+            model=str(root), prompt=["hello"], ngen=4, ram=0,
+            temp=None, ctx=0,
+        )
+        captured = {}
+
+        def fake_call(command, env):
+            captured["command"] = command
+            captured["env"] = env
+            return 0
+
+        try:
+            with mock.patch.object(self.cli.sys, "platform", "linux"), \
+                 mock.patch.object(self.cli, "engine_for",
+                                   return_value="/engines/deepseek_v4"), \
+                 mock.patch.object(self.cli, "need_model"), \
+                 mock.patch.object(self.cli, "banner"), \
+                 mock.patch.object(self.cli, "env_for_engine",
+                                   return_value={"RAM_GB": "32.000"}), \
+                 mock.patch.object(self.cli.subprocess, "call",
+                                   side_effect=fake_call):
+                with self.assertRaises(SystemExit) as stopped:
+                    self.cli.cmd_run(args)
+            self.assertEqual(stopped.exception.code, 0)
+            at = captured["command"].index("--memory-gb")
+            self.assertEqual(captured["command"][at + 1], "32.000")
         finally:
             directory.cleanup()
 

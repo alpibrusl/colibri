@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import time
 import subprocess
 import sys
 import tempfile
@@ -205,9 +206,33 @@ def check_serve(binary: Path, model: Path, case: dict[str, object]) -> None:
                 )
             if stats["prompt_tokens"] != len(case["prompt_ids"]):
                 raise AssertionError(f"serve round {ordinal}: bad prompt stats {stats}")
+            # #1491: the PROF line carries the phases beyond the expert store.
+            # Before, attention_s / lm_head_s / forwards were literal zeros and a
+            # warm turn read as 98% "other" in /profile.
+            # PROF follows DONE on the engine's stdout; generate() returns at
+            # DONE, so give the reader thread a moment to parse the next line.
+            deadline = time.time() + 5.0
+            while len(engine.profile) <= ordinal and time.time() < deadline:
+                time.sleep(0.02)
+            if len(engine.profile) <= ordinal:
+                raise AssertionError(f"serve round {ordinal}: no PROF line")
+            prof = engine.profile[-1]
+            if prof["completion_tokens"] != stats["completion_tokens"]:
+                raise AssertionError(f"serve round {ordinal}: PROF/DONE disagree: {prof} {stats}")
+            if prof["forwards"] < prof["completion_tokens"]:
+                raise AssertionError(f"serve round {ordinal}: forwards {prof['forwards']} below "
+                                     f"the {prof['completion_tokens']} tokens generated")
+            # the tiny head is microseconds and prints as 0.000; the blocks are not
+            if prof["attention_s"] <= 0.0 or prof["lm_head_s"] < 0.0:
+                raise AssertionError(f"serve round {ordinal}: block/head phases not timed: {prof}")
+            # disk seconds are summed across loader lanes and may exceed the wall
+            # on their own; the compute phases must not
+            accounted = prof["expert_matmul_s"] + prof["attention_s"] + prof["lm_head_s"]
+            if accounted > prof["wall_s"] * 1.05 + 0.05:
+                raise AssertionError(f"serve round {ordinal}: phases exceed wall: {prof}")
     finally:
         engine.close()
-    print("PASS target serve: persistent SUBMIT/DATA/DONE protocol is token-exact")
+    print("PASS target serve: persistent SUBMIT/DATA/DONE protocol is token-exact, PROF phases filled")
 
 
 def check_cli_uses_engine_context(binary: Path, model: Path, temporary: Path) -> None:
@@ -249,6 +274,70 @@ def check_cli_uses_engine_context(binary: Path, model: Path, temporary: Path) ->
     print("PASS target CLI: prompt beyond the old 512-token cap")
 
 
+def check_mtp_draft(
+    binary: Path,
+    model: Path,
+    case: dict[str, object],
+    temporary: Path,
+    gpu: bool,
+) -> None:
+    record = temporary / f"mtp-draft-gpu{gpu}.json"
+    prompt = token_prompt(case["prompt_ids"])
+    env = dict(
+        os.environ,
+        V4_MTP="1",
+        V4_DRAFT="3",
+        V4_NGRAM="0",
+        V4_MTP_CONF="0",
+    )
+    if gpu:
+        env.update(V4_MTP_GPU="1", V4_MTP_GPU_MIRRORS="8")
+    result = run(
+        f"mtp draft gpu={gpu}",
+        [
+            binary.as_posix(),
+            model.as_posix(),
+            prompt,
+            "--raw-prompt",
+            "--max-tokens",
+            str(case["max_new_tokens"]),
+            "--record-oracle",
+            record.as_posix(),
+        ],
+        env=env,
+    )
+    expected_full = case["greedy_full_ids"]
+    actual = json.loads(record.read_text(encoding="utf-8"))
+    if actual.get("full_ids") != expected_full:
+        raise AssertionError(
+            f"mtp draft gpu={gpu}: drafting changed greedy output: "
+            f"expected {expected_full}, got {actual.get('full_ids')}"
+        )
+    if "v4_dspark warning=unsupported-checkpoint" in result.stderr:
+        # The generated fixture has a single MTP layer; the DSpark drafter
+        # needs the full 3-stage profile and runs target-only. Greedy identity
+        # above is still checked; the draft/acceptance path needs a real
+        # checkpoint (see docs/deepseek-v4.md, Validation).
+        print(f"SKIP mtp draft gpu={gpu}: fixture has no 3-stage MTP profile")
+        return
+    if "v4_dspark attempts=" not in result.stderr:
+        raise AssertionError(
+            f"mtp draft gpu={gpu}: no speculative attempt was made: {result.stderr}"
+        )
+    attempts = re.search(r"v4_dspark attempts=(\d+)", result.stderr)
+    if not attempts or int(attempts.group(1)) < 1:
+        raise AssertionError(
+            f"mtp draft gpu={gpu}: expected at least one draft attempt"
+        )
+    if "[MTP] rounds=" not in result.stderr:
+        raise AssertionError(f"mtp draft gpu={gpu}: no MTP round was reported")
+    if gpu and "v4_gpu dspark-mirrors" not in result.stderr:
+        raise AssertionError(
+            f"mtp draft gpu={gpu}: GPU mirror cache was not attached"
+        )
+    print(f"PASS mtp draft gpu={gpu}: token-exact and {attempts.group(1)} attempt(s)")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
@@ -282,6 +371,8 @@ def main() -> int:
         # The 72-token case crosses the 64-token target prefill chunk boundary.
         check_session(binary, fixture, "long", cases["long"], temporary)
         check_cli_uses_engine_context(binary, fixture, temporary)
+        check_mtp_draft(binary, fixture, cases["short"], temporary, gpu=False)
+        check_mtp_draft(binary, fixture, cases["short"], temporary, gpu=True)
         check_serve(binary, fixture, cases["short"])
 
     print("PASS tiny DeepSeek V4 target oracle: all checks completed")

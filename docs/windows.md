@@ -3,13 +3,35 @@
 A start-to-finish, reproducible path from a fresh Windows 11 machine to GLM-5.2 generating tokens, with the GPU tier. Every step and every failure mode below was hit and verified on real hardware: Core Ultra 9 285K (AVX-VNNI) / RTX 5080 (sm_120) / 128 GB RAM / Windows 11 24H2 (issue #306). Steps are ordered so the long downloads run while you build.
 
 ---
+
+## If you downloaded a release archive, start here
+
+The archive contains **`coli.cmd`**: that is the program to run. Double-click it
+for the quick start, or from cmd/PowerShell:
+
+```
+coli.cmd chat   --model D:\models\glm52_i4
+coli.cmd serve  --model D:\models\glm52_i4
+coli.cmd doctor --model D:\models\glm52_i4
+```
+
+`colibri.exe`, `kimi_k3.exe` and the other `.exe` files are the **engines**.
+They are selected by the launcher from the model's `config.json`; started on
+their own they have no model to load, print how to launch and exit, which from
+Explorer looks like a window that flashes and disappears (#1241). The launcher
+needs Python 3 from https://www.python.org/downloads/ with "Add python.exe to
+PATH" ticked; the engines themselves need nothing.
+
+The rest of this page is for building from source.
+
+---
 > **2026-08-11: Additional validation with detailed steps for laptop setup** \
 Lenovo Thinkpad P16v (Intel Core i7 ultra (155H 1.4GHz), 64GB RAM, 2Tb NVME drive, Nvidia RTX 2000 Ada generation 8GB (AD107, 2023)).
 Windows 11 pro english.\
 **Software installs:**\
 `- nvidia drivers` from https://www.nvidia.com/en-us/drivers/\
 `- nvidia cuda toolkit` from https://developer.nvidia.com/cuda-downloads?target_os=Windows&target_arch=x86_64&target_version=11&target_type=exe_local\
-`- msys2` from https://github.com/msys2/msys2-installer/releases/download/2026-06-11/msys2-x86_64-20260611.exe\
+`- msys2` from <https://github.com/msys2/msys2-installer/releases/download/2026-06-11/msys2-x86_64-20260611.exe> (the angle brackets keep the trailing line-break marker out of the link; the old form 404ed, #1405)\
 `- Microsoft Visual Studio 2022 built tools` installer from https://aka.ms/vs/17/release/vs_buildtools.exe then install Desktop Development with C++\
 `- winget install git.git python.python.3.14`\
 \
@@ -27,6 +49,8 @@ To see which code optimizations are active in gcc compiler with the native flag 
 For guidance about gcc optimizations, a good source cab be: `https://wiki.gentoo.org/wiki/GCC_optimization`\
 \
 **colibri.exe and coli_cuda.*** build from MS Visual Studio and Nvidia CUDA Toolkit:\
+\
+> **Build from a git clone, inside `c/`.** The release zip ships the engines and the Python only, no `Makefile` and no `backend_cuda.cu`: `make cuda-dll` in the unzipped release folder answers `No rule to make target 'cuda-dll'` (#1405). `git clone https://github.com/JustVugg/colibri`, then every `make` below runs in `colibri\c`.\
 Microsoft Visual Studio tools includes a `vcvars64.bat` batch file that appropriately sets all the paths. \
 It is in `"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"`\
 \
@@ -37,7 +61,7 @@ Open a command prompt shell (`cmd`, not powershell), cd to subfolder `c\` of the
 `%comspec% /k "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"`
 `set PATH=%PATH%;C:\msys64\usr\bin`\
 `cd C:\Users\YOUR_USER\COLIBRI_REPO_FOLDER\c`\
-`make cuda-dll CUDA-ARCH=sm_89`\
+`make cuda-dll CUDA_ARCH=sm_89`\
 `make colibri.exe CUDA_DLL=1 ARCH=native`\
 `make iobench.exe`\
 \
@@ -117,7 +141,7 @@ This is not Defender and not Mark-of-the-Web — SAC blocks *all* unsigned, unkn
 
 ## 3. Build the CUDA DLL (GPU tier)
 
-nvcc needs MSVC as host compiler, so this one step must run from a shell with the MSVC environment: open **"x64 Native Tools Command Prompt for VS 2022"** from the Start menu (plain PowerShell will fail the `cl` check). Then:
+nvcc needs MSVC as host compiler, so this one step must run from a shell with the MSVC environment: open **"x64 Native Tools Command Prompt for VS 2022"** from the Start menu (plain PowerShell will fail the `cl` check). Not the generic "Developer Command Prompt": that one is the 32-bit compiler, and nvcc then fails inside `cuda_fp16.hpp` with `asm operand type size(8) does not match ... constraint 'r'` (#1405). `cl` alone prints which one you have: `for x64` is the right banner. Then:
 
 > **The VS prompt has no `sh.exe` (#478):** that prompt is a `cmd.exe` shell, and the `cuda-dll` recipe uses POSIX idioms (`command -v`, `{ ...; }`) that need `/bin/sh`. Run this once in the VS prompt before building:
 > ```cmd
@@ -388,6 +412,90 @@ not been validated on hardware here.
 
 **CUDA is unaffected.** A `CUDA_DLL=1` host ignores `COLI_HIP_RUNTIME_DIR`
 entirely and keeps its existing `coli_cuda.dll` search behaviour unchanged.
+
+### How `coli plan` and `coli doctor` see an AMD GPU here
+
+`rocm-smi` is a Linux tool. Neither the Windows HIP SDK installer nor a source
+build ships it, so the ROCm discovery path used everywhere else finds nothing on
+Windows and every AMD host planned as if it had no GPU at all.
+
+**Windows AMD discovery therefore goes through `hipInfo.exe`**, which both
+shipped SDKs do provide, in the same directory as `amdhip64_7.dll`. It comes
+from the HIP environment you already installed to build the backend — no extra
+Python package, no third-party dependency.
+
+Colibri looks for it in this order, and stops at the first hit:
+
+1. **`COLI_HIP_RUNTIME_DIR`** — the directory you already point at the HIP
+   runtime. `hipInfo.exe` sits beside `amdhip64_7.dll` there, so its answer
+   describes *the runtime the engine will actually bind*.
+2. **`%HIP_PATH%\bin`** — the SDK root the HIP SDK installer sets, and the same
+   variable the Makefile derives `HIP_SDK_ROOT` from.
+3. **`PATH`**.
+
+The order matters if you have more than one HIP install, which is common: a
+stale machine-wide `HIP_PATH` should not describe your hardware through a
+runtime the engine is not going to load. No install location is hardcoded.
+
+If `hipInfo.exe` cannot be found, or fails, or prints a device block missing a
+name or a memory total, discovery reports **no device**. It never invents one,
+and never completes a partial block with zeros — a zero would read as a
+measurement.
+
+#### Reported, but not planned against — and why
+
+`hipInfo` reports the device name, `gcnArchName`, `isIntegrated`, and **both**
+`memInfo.total` and `memInfo.free`. Colibri records the identity, marks
+`isIntegrated: 1` as unified memory, and takes the total.
+
+It deliberately does **not** use `memInfo.free` as a placement budget, because
+on this hardware that figure has not been qualified as one.
+
+The Armoury Crate firmware setting on the validated host exposes a
+*shared-memory allocation* limit. Four controlled observations, each in its own
+rebooted session with everything else held constant, gave:
+
+| Armoury shared-memory limit | `memInfo.total` | `memInfo.free` | Windows visible |
+|---|---|---|---|
+| ~6 GB (UI minimum) | 76.79 GiB | 76.63 GiB | 127.15 GiB |
+| ~32 GB | 76.79 GiB | 76.63 GiB | 127.15 GiB |
+| ~64 GB | 76.79 GiB | 76.63 GiB | 127.15 GiB |
+| ~123 GB (UI maximum) | 93.00 GiB | 92.84 GiB | 127.15 GiB |
+
+Three settings spanning a twentyfold range produced the same reading; only the
+maximum differed. At the ~6 GB minimum the reported total was roughly **12.8×
+the configured limit**. Windows-visible physical memory was unchanged in all
+four runs, as was the 0.50 GiB dedicated frame buffer the driver reports.
+
+So the reported figure is not a simple function of the setting, and no
+slider-to-HIP-memory mapping is assumed here. Nor is it dedicated VRAM: on an
+integrated part the GPU and the host draw on one physical pool, and how much of
+what HIP advertises can actually be spent — and at what cost to the host — has
+not been measured. Sizing an expert tier from it would be a guess.
+
+Such a device is therefore carried as **identity only**: free memory is
+*unknown for planning*, which is not the same claim as "zero bytes are free".
+`coli plan`
+shows it, marked `(identity only)`, with a warning naming it, and:
+
+- the VRAM tier stays at 0
+- no `CUDA_EXPERT_GB`, `PIN_GB`, `COLI_GPU` or `COLI_CUDA` is recommended
+- `COLI_CUDA_PIPE` is not switched on
+- the bottleneck is classified exactly as it would be on a CPU-only host
+
+No system-RAM figure is substituted for the missing value either; nothing is
+fabricated in place of a measurement.
+
+None of this prevents you from running on the GPU. Every environment variable
+in this document still works exactly as documented — this governs only what
+Colibri will turn on *by itself*. Qualifying a safe automatic budget on shared
+memory needs allocation measurements on real hardware, and that is deliberately
+left to a later change rather than guessed at here.
+
+A discrete Windows AMD card is marked `unified_memory: false` from
+`isIntegrated: 0`, but is also carried as identity-only for now: there is no
+discrete Windows AMD host in this validation set, and the same guess would be
+just as unqualified there.
 
 ### Putting model tensors on the GPU — and checking that it happened
 

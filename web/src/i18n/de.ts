@@ -47,6 +47,11 @@ const de: Record<string, string> = {
   "sidebar.temperature": "Temperatur",
   "sidebar.maxTokens": "Maximale Ausgabetokens",
   "sidebar.reasoning": "Reasoning",
+  "sidebar.reasoning.off": "Aus",
+  "sidebar.reasoning.low": "Niedrig",
+  "sidebar.reasoning.medium": "Mittel",
+  "sidebar.reasoning.high": "Hoch",
+  "sidebar.reasoning.max": "Max",
   "sidebar.transport": "OpenAI-kompatibler Transport",
 
   // Kopfzeile
@@ -72,6 +77,8 @@ const de: Record<string, string> = {
   "chat.colibri": "colibrì",
   "chat.placeholder": "Nachricht an colibrì…",
   "chat.inputHint": "Eingabetaste zum Senden · Umschalt+Eingabetaste für Zeilenumbruch",
+  "chat.attachImage": "Bild anhängen",
+  "chat.removeImage": "Bild entfernen",
   "chat.stop": "Generierung stoppen",
   "chat.send": "Nachricht senden",
 

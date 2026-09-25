@@ -8,6 +8,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from family_registry import (FamilyConfigError, PlannerUnsupportedError, UnknownFamilyError,
+                             public_metadata, resolve_model)
 from resource_plan import (GB, SSD_PROBE_PENDING, build_plan, discover_gpus, format_plan,
                            memory_available)
 
@@ -20,12 +22,109 @@ SAFETENSORS_DTYPES = {
     "F32": 4,
     "U8": 1,
     "I8": 1,
+    # dtypes st.h's st_dtype_code accepts beyond the classic set (DeepSeek V4 /
+    # Kimi-style checkpoints); sizes mirror st_dtype_esz exactly.
+    "I64": 8,
+    "U64": 8,
+    "F8_E4M3": 1,
+    "F8_E4M3FN": 1,
+    "float8_e4m3fn": 1,
+    "F8_E8M0": 1,
+    "F8_E8M0FNU": 1,
 }
-REQUIRED_CORE_TENSORS = (
-    "model.embed_tokens.weight",
-    "model.norm.weight",
-    "lm_head.weight",
+def _core_component(name, spellings):
+    """Does the component immediately before `.weight` name this role?
+
+    Not `endswith`: `"pos_embed.weight".endswith("embed.weight")` is True, and
+    so is the vision tower's `patch_embed.weight`. Either would stand in for a
+    token embedding that is not there, which is this bug with the sign flipped
+    -- a checkpoint genuinely missing its embedding would pass. The component
+    has to BE the role, so the match is on the name between the last two dots.
+
+    `.layers.` is excluded for the reason _is_final_norm excludes it: a head or
+    an embedding inside the layer stack is the block's, not the model's.
+    """
+    parts = name.split(".")
+    return (len(parts) >= 2 and parts[-1] == "weight"
+            and parts[-2] in spellings and ".layers." not in name)
+
+
+def _is_embedding(name):
+    return _core_component(name, {"embed_tokens", "embed"})
+
+
+def _is_final_norm(name):
+    # Every block has norms too. The final one is the norm that sits OUTSIDE
+    # the layer stack, which _core_component's `.layers.` exclusion covers, and
+    # the component test covers the rest: GLM-5.3-Flash's vision tower has
+    # `model.visual.post_layernorm.weight`, whose component is
+    # `post_layernorm`, not `norm`, so it cannot stand in for a final norm that
+    # is not there.
+    #
+    # The component form also accepts a bare `norm.weight` at the root, which
+    # the old `.norm.weight` tail required a prefix for. A container that names
+    # its roles flat, which is exactly what DeepSeek V4 does with `embed.weight`
+    # and `head.weight`, would otherwise fail this third role for the same
+    # reason it failed the other two.
+    return _core_component(name, {"norm"})
+
+
+def _is_output_head(name):
+    # `hc_head_base`, `hc_head_fn` and `hc_head_scale` sit next to the real head
+    # in a DeepSeek V4 container and must not stand in for it. They fall out
+    # here without an exclusion of their own: none of them ends in `.weight`.
+    return _core_component(name, {"lm_head", "head"})
+
+
+#: What a checkpoint must contain to be a language model at all, stated as
+#: ROLES rather than names.
+#:
+#: #1365: the previous form was three literal names taken from GLM-5.2, and it
+#: reported "2 required core tensor(s) are missing" for every GLM-5.3-Flash
+#: download, converted or pre-converted. Nothing was missing. Flash's root is
+#: the vision wrapper, so the language model is nested and the tensors are
+#: `model.language_model.embed_tokens.weight` and
+#: `model.language_model.norm.weight`. Two of three names did not match, and
+#: the doctor called a healthy model broken.
+#:
+#: #1593: the same defect again, one family later. That fix made the predicates
+#: prefix-agnostic but not NAME-agnostic, and DeepSeek V4 spells the roles
+#: `embed.weight` and `head.weight` (deepseek_v4.c looks up exactly those, at
+#: four call sites). Both roles were reported missing for a container the engine
+#: loads and generates from, while `model.index`, scanning the same tensors,
+#: was green. `_is_final_norm` survived only because `.norm.weight` is a
+#: spelling V4 happens to share.
+#:
+#: Matching on the tail rather than the whole name is what makes this hold for
+#: families nobody has written yet: it is prefix-agnostic, which is exactly
+#: what the engines already are. `qwen38.c` probes
+#: `model.language_model.embed_tokens.weight` and falls back to
+#: `model.embed_tokens.weight`; every engine discovers its prefix at load time.
+#: The doctor was the one place that assumed the prefix was a constant.
+CORE_TENSOR_ROLES = (
+    ("token embedding", _is_embedding),
+    ("final norm", _is_final_norm),
+    ("output head", _is_output_head),
 )
+
+
+def missing_core_roles(tensor_names, config=None):
+    """Which core roles no tensor fills. Empty means the model is complete.
+
+    `tie_word_embeddings` makes the output head legitimately absent: the
+    embedding matrix is reused as the head, and there is no `lm_head.weight`
+    to find. Requiring one anyway would trade this bug for the same bug on a
+    different checkpoint.
+    """
+    tied = bool((config or {}).get("tie_word_embeddings"))
+    missing = []
+    for role, matches in CORE_TENSOR_ROLES:
+        if any(matches(name) for name in tensor_names):
+            continue
+        if role == "output head" and tied:
+            continue
+        missing.append(role)
+    return missing
 
 
 def _check(identifier, status, summary, **details):
@@ -270,16 +369,28 @@ def deep_container_report(model, mirror_dir=None):
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             index = {"status": "fail", "summary": f"model index is invalid: {error}"}
 
-    missing_core = [name for name in REQUIRED_CORE_TENSORS if name not in tensor_sources]
+    # Read here rather than take it as an argument: the signature is used by
+    # callers and tests, and the only thing needed is one optional flag.
+    core_config = {}
+    try:
+        with (model / "config.json").open("rb") as stream:
+            loaded = json.loads(stream.read(MODEL_INDEX_MAX_BYTES))
+        if isinstance(loaded, dict):
+            core_config = loaded
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        pass                      # no config is already its own failed check
+    missing_core = missing_core_roles(tensor_sources, core_config)
     required = {
         "status": "fail" if missing_core else "pass",
         "summary": (
-            f"{len(missing_core)} required core tensor(s) are missing"
+            # Name the roles, not a count. "2 required core tensor(s) are
+            # missing" sent someone to re-download 195 GB twice before asking.
+            "no tensor fills these core roles: " + ", ".join(missing_core)
             if missing_core else "required core tensors are present"
         ),
         "details": {
-            "required_tensors": len(REQUIRED_CORE_TENSORS),
-            "missing_tensors": missing_core,
+            "required_roles": [role for role, _ in CORE_TENSOR_ROLES],
+            "missing_roles": missing_core,
         },
     }
 
@@ -346,12 +457,38 @@ def deep_container_report(model, mirror_dir=None):
     }
 
 
+def windows_backend_dll(image):
+    """Which GPU backend DLL a Windows host compiled in, or None if CPU-only.
+
+    backend_loader.c bakes exactly one basename: coli_hip.dll under COLI_HIP_DLL
+    and coli_cuda.dll otherwise. That string is the build marker. The GLM/Qwen
+    banner "[CUDA] mode: routed experts" is only printed by those two engines;
+    a Kimi K3 CUDA_DLL host links the same loader and prints [K3-CUDA] instead.
+    DeepSeek V4 has its own pair and is not this function's job.
+    """
+    if not image or b"[DSV4 CUDA]" in image:
+        return None
+    if b"coli_hip.dll" in image:
+        return "coli_hip.dll"
+    if b"coli_cuda.dll" in image:
+        return "coli_cuda.dll"
+    if b"[CUDA] mode: routed experts" in image or b"[K3-CUDA]" in image:
+        return "coli_cuda.dll"
+    return None
+
+
 def cuda_linkage(engine_path):
     """Return CUDA linkage state without loading the executable or CUDA runtime."""
     engine = Path(engine_path)
     if not engine.is_file():
         return {"linked": False, "missing": False}
-    if os.name == "posix":
+    # `sys.platform` alone selects the branch, so a test can exercise the
+    # Windows probe on a POSIX host by faking it. Faking `os.name` instead
+    # would repoint pathlib at Windows semantics and turn the POSIX fixture
+    # path into a WindowsPath that no longer resolves, so `is_file()` above
+    # would return early. On every real host the two agree and this reads
+    # exactly as `os.name == "posix"` did.
+    if os.name == "posix" and sys.platform != "win32":
         try:
             result = subprocess.run(["ldd", str(engine)], capture_output=True, text=True,
                                     timeout=3, check=False)
@@ -365,18 +502,28 @@ def cuda_linkage(engine_path):
         return {"linked": any("not found" not in line for line in lines),
                 "missing": any("not found" in line for line in lines)}
     if sys.platform == "win32":
-        # Windows CUDA_DLL=1 builds never link libcudart directly: glm.exe loads
-        # coli_cuda.dll at runtime via LoadLibrary (backend_loader.c), so there's no
-        # import-table entry for ldd/dumpbin to see. Detect the COLI_CUDA build via a
-        # marker string baked into glm.c's #ifdef COLI_CUDA block instead, and require
-        # coli_cuda.dll to actually sit next to glm.exe (else CUDA init fails at startup).
+        # Windows DLL-split builds never link the GPU runtime directly: the host
+        # LoadLibrary's its backend at runtime (backend_loader.c), so there's no
+        # import-table entry for ldd/dumpbin to see. Detect the GPU build from
+        # the backend basename compiled into the host, then require that file
+        # next to the executable. Asking for coli_cuda.dll unconditionally
+        # failed a working HIP host (a hard error, not a warning), and requiring
+        # the GLM routed-experts banner missed every Kimi K3 CUDA_DLL build.
         try:
-            built = b"[CUDA] mode: routed experts" in engine.read_bytes()
+            image = engine.read_bytes()
         except OSError:
             return {"linked": False, "missing": False}
-        if not built:
+        # The DeepSeek V4 engine has its own loader (backend_loader_dsv4.c):
+        # it tries coli_cuda_dsv4_dg.dll then coli_cuda_dsv4.dll, so either
+        # next to the engine means the tier can start.
+        if b"[DSV4 CUDA]" in image:
+            present = any((engine.parent / name).is_file()
+                          for name in ("coli_cuda_dsv4_dg.dll", "coli_cuda_dsv4.dll"))
+            return {"linked": present, "missing": not present}
+        expected = windows_backend_dll(image)
+        if expected is None:
             return {"linked": False, "missing": False}
-        dll_present = (engine.parent / "coli_cuda.dll").is_file()
+        dll_present = (engine.parent / expected).is_file()
         return {"linked": dll_present, "missing": not dll_present}
     return {"linked": False, "missing": False}
 
@@ -405,11 +552,13 @@ def missing_shared_libraries(engine_path):
 
 def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
                engine_path, available_memory=None, available_disk=None, gpus=None,
-               linkage=None, deep=False, mirror_dir=None):
+               linkage=None, deep=False, mirror_dir=None, kv_slots=1,
+               engine_error=None):
     """Collect a complete report. No model payload, engine, or CUDA context is loaded."""
     model = Path(model).expanduser().resolve()
     checks = []
     plan = None
+    resolved = None
 
     if model.is_dir() and os.access(model, os.R_OK):
         checks.append(_check("model.path", "pass", "model directory is readable", path=str(model)))
@@ -425,6 +574,18 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         valid_config = False
     checks.append(_check("model.config", "pass" if valid_config else "fail",
                          "config.json is valid" if valid_config else "config.json is missing or invalid"))
+    if valid_config:
+        try:
+            resolved = resolve_model(model)
+            checks.append(_check("model.family", "pass",
+                                 f"{resolved.descriptor.display_name} family is registered",
+                                 family_id=resolved.descriptor.id,
+                                 model_type=resolved.model_type,
+                                 descriptor=public_metadata(resolved.descriptor)))
+        except (FamilyConfigError, UnknownFamilyError) as error:
+            checks.append(_check("model.family", "fail", str(error)))
+    else:
+        checks.append(_check("model.family", "skip", "family detection requires a valid config"))
     tokenizer = model / "tokenizer.json"
     checks.append(_check("model.tokenizer", "pass" if tokenizer.is_file() else "fail",
                          "tokenizer.json found" if tokenizer.is_file() else "tokenizer.json is missing"))
@@ -445,7 +606,9 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         engine_ok = engine.is_file()
     else:
         engine_ok = engine.is_file() and os.access(engine, os.X_OK)
-    if engine_ok:
+    if engine_error:
+        checks.append(_check("engine.binary", "fail", str(engine_error), path=str(engine)))
+    elif engine_ok:
         unresolved = missing_shared_libraries(engine)
         if unresolved:
             checks.append(_check("engine.binary", "fail",
@@ -486,9 +649,19 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         checks.append(_check("accelerator.gpu", "skip", "no supported GPU detected; CPU path is available"))
 
     try:
-        plan = build_plan(model, ram_gb, context, gpu_indices, vram_gb,
+        if resolved is None:
+            raise ValueError("placement requires a registered model family")
+        # The placement report describes this installed engine, not merely the
+        # hardware visible on the host. A CPU-only binary cannot spend VRAM;
+        # passing discovered GPUs through here made doctor contradict its own
+        # accelerator check and emit CUDA-only tuning advice. Keep inventory
+        # details in accelerator.gpu above, but build an executable plan below.
+        plan_gpus = detected_gpus if linkage.get("linked") else []
+        plan_gpu_indices = gpu_indices if linkage.get("linked") else []
+        plan_vram_gb = vram_gb if linkage.get("linked") else 0
+        plan = build_plan(model, ram_gb, context, plan_gpu_indices, plan_vram_gb,
                           available_memory=available_memory, available_disk=available_disk,
-                          gpus=detected_gpus)
+                          gpus=plan_gpus, kv_slots=kv_slots)
         model_info = plan["model"]
         checks.append(_check("model.shards", "pass", "safetensors headers are valid",
                              shards=model_info["shards"], model_bytes=model_info["model_bytes"]))
@@ -529,6 +702,16 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         else:
             checks.append(_check("storage.ssd_probe", "skip",
                                  "no cached probe yet; measured on the first Metal+darwin engine start"))
+    except PlannerUnsupportedError as error:
+        checks.append(_check("model.shards", "pass", "safetensors headers are readable",
+                             shards=len(list(model.glob("*.safetensors")))))
+        checks.append(_check("storage.disk", "skip",
+                             "storage projection requires a family planner"))
+        checks.append(_check("memory.ram", "skip",
+                             "RAM projection requires a family planner"))
+        checks.append(_check("placement.plan", "skip", str(error)))
+        checks.append(_check("storage.ssd_probe", "skip",
+                             "probe surfacing requires a family planner"))
     except (OSError, ValueError, KeyError, TypeError) as error:
         checks.append(_check("model.shards", "fail", str(error)))
         checks.append(_check("storage.disk", "skip", "storage check requires a valid model"))

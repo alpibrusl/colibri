@@ -18,6 +18,11 @@
  *   PILOT_EVICT_GUARD=0/1 : 1=enable LFRU prefetch eviction guard (default), 0=disable
  *   EXPERT_DROP=0/1: 1=fadvise(DONTNEED) after each expert read (old behaviour,
  *                    for RAM-tight boxes); 0=keep pages cached (default)
+ *   ROUTE_TRACE=<path>: log every routing decision (one line per moe call,
+ *                    position and layer: "<call> <row> <layer> <id>:<gate> ...")
+ *                    for offline analysis — tools/route_pairs.py,
+ *                    tools/route_coupling_report.py, tools/residency_sim.py.
+ *                    Measurement only: it cannot change which experts run.
  *   (expert queue is sorted by eid for SSD read locality)
  */
 #define _GNU_SOURCE
@@ -31,12 +36,28 @@
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
+#include "cli_args.h"
 #include "st.h"
 #ifdef _OPENMP
 #include <omp.h>   /* omp_set_num_threads/omp_get_max_threads per omp_tune.h */
 #endif
 #include "omp_tune.h"
 #include "route_trace.h"                    /* shared routing telemetry (#700) */
+#include "kv_prefix.h"
+#include "pin_pool.h"                       /* piu scatti annidati */   /* riuso del prefisso tra turni (shared) */
+#include "serve_codec.h"
+#include "serve_budget.h"
+#ifdef COLI_SEGMENT_ADAPTER
+#include "segment_runtime.h"
+#include "segment_adapters.h"
+#include "segment_adapter_internal.h"
+#endif
+#ifdef COLI_EDGE_ADAPTER
+#include "edge_runtime.h"
+#include "edge_adapters.h"
+#include "tok.h"
+#include "edge_tok_internal.h"
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -70,7 +91,11 @@ typedef struct {
  * not be evicted during normal LRU eviction, but may be displaced under extreme
  * cache pressure when all slots are pinned or in-flight. */
 typedef struct { int eid; int pinned; int8_t *g, *u, *d; float *gs, *us, *ds; uint64_t used; } Slot;
-typedef struct { Slot *slots; int n, cap; } LCache;
+typedef struct {
+    Slot *slots;
+    int *slot_by_expert;                  /* expert id -> resident slot, -1 if absent */
+    int n, cap;
+} LCache;
 
 typedef struct {
     Cfg c;
@@ -80,10 +105,19 @@ typedef struct {
     Layer *L;
     LCache *cache;          /* [n_layers] */
     uint64_t clock, hits, miss;
+    /* Nanoseconds spent inside expert reads, summed across threads. The reads
+     * run unlocked and in parallel, so this is an atomic counter rather than a
+     * plain double: a per-turn delta of it is what the PROF line reports. */
+    uint64_t disk_ns;
     float **K, **V; int kv_len, max_t;
+    /* What the cached keys and values were built from, so a serve turn that
+     * resends the transcript prefills only the new tail. Recorded where the
+     * tokens are fed (see kv_prefix.h), never derived from a counter. */
+    kv_prefix kvp;
     double dense_load_s;
     /* IMPROVEMENT 2: expert frequency heatmap */
     uint32_t **freq;                   /* per-layer expert counts, owned by route_trace.h */
+    uint8_t **ehit;                    /* experts routed this turn, for HITS (dashboard Brain) */
     int freq_token_count, hot_pinned, hot_n, warmup_tokens;
     int token_count;
     /* PREDICTION IMPROVEMENT A: per-layer EMA of gate logits across tokens.
@@ -99,6 +133,7 @@ typedef struct {
 } Model;
 
 static pthread_mutex_t g_pilot_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_pilot_cv = PTHREAD_COND_INITIALIZER; /* broadcast on every publish */
 static struct { int l, e; } pilot_q[4096];
 static volatile unsigned pilot_r = 0, pilot_w = 0;
 static Model *pilot_m = NULL;
@@ -106,6 +141,10 @@ static int g_pilot = 0;
 static int g_wide  = 1;  /* IMPROVEMENT 4: top-K * g_wide candidates prefetched */
 static int g_pilot_evict_guard = 1; /* PILOT_EVICT_GUARD=0 to disable LFRU prefetch eviction guard */
 static int g_expert_drop = 0;       /* EXPERT_DROP=1 restores fadvise(DONTNEED) after expert reads */
+static int g_fused3 = 0;            /* FUSED3=1: AVX2 activation quant + gate/up pair matmul
+                                     * (fused_simd.h: quant_x_q8_avx2, matmul_q_idot_v3,
+                                     * matmul_q_idot_pair_v3). Exact integer arithmetic only —
+                                     * bit-identical to the stock matmul_q path; OFF by default. */
 
 static uint64_t lfru_score(uint32_t heat, uint64_t last, uint64_t clock) {
     uint64_t age = (clock > last) ? (clock - last) : 0;
@@ -117,6 +156,68 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S);
 static void *pilot_worker(void *arg);
 static void ensure_pilot_worker_started(Model *m);
 static void slot_ensure_allocated(Model *m, Slot *s);
+
+#ifdef COLI_CACHE_INDEX_TEST
+static uint64_t g_slot_index_probes;
+#endif
+
+/* Runtime callers hold g_pilot_mx.  The defensive eid check is intentional:
+ * an index bug must degrade to a miss, never serve another expert's weights. */
+static Slot *slot_indexed(Model *m, int layer, int eid) {
+    if (layer < 0 || layer >= m->c.n_layers || eid < 0 ||
+        eid >= m->c.n_experts) return NULL;
+    LCache *lc = &m->cache[layer];
+    if (!lc->slot_by_expert) return NULL;
+#ifdef COLI_CACHE_INDEX_TEST
+    g_slot_index_probes++;
+#endif
+    int i = lc->slot_by_expert[eid];
+    if (i < 0 || i >= lc->n || lc->slots[i].eid != eid) return NULL;
+    return &lc->slots[i];
+}
+
+static void cache_unindex(Model *m, int layer, Slot *s) {
+    LCache *lc = &m->cache[layer];
+    int eid = s->eid, i = (int)(s - lc->slots);
+    if (lc->slot_by_expert && eid >= 0 && eid < m->c.n_experts &&
+        lc->slot_by_expert[eid] == i)
+        lc->slot_by_expert[eid] = -1;
+}
+
+static void cache_hide(Model *m, int layer, Slot *s) {
+    cache_unindex(m, layer, s);
+    s->eid = -1;
+}
+
+static void cache_publish(Model *m, int layer, Slot *s, int eid) {
+    LCache *lc = &m->cache[layer];
+    cache_unindex(m, layer, s);
+    s->eid = eid;
+    if (lc->slot_by_expert && eid >= 0 && eid < m->c.n_experts)
+        lc->slot_by_expert[eid] = (int)(s - lc->slots);
+}
+
+/* A slot being read keeps the index entry of the expert it is loading, marked
+ * -(eid+2) as in colibri.c's ecache_reserve: lookups still miss and eviction
+ * still skips it (eid < 0), but a second loader of the same expert can see the
+ * read in flight instead of starting another one into another slot. */
+static void cache_reserve(Model *m, int layer, Slot *s, int eid) {
+    LCache *lc = &m->cache[layer];
+    cache_hide(m, layer, s);
+    s->eid = -(eid + 2);
+    if (lc->slot_by_expert && eid >= 0 && eid < m->c.n_experts)
+        lc->slot_by_expert[eid] = (int)(s - lc->slots);
+}
+
+/* Caller holds g_pilot_mx. */
+static int slot_in_flight(Model *m, int layer, int eid) {
+    if (layer < 0 || layer >= m->c.n_layers || eid < 0 ||
+        eid >= m->c.n_experts) return 0;
+    LCache *lc = &m->cache[layer];
+    if (!lc->slot_by_expert) return 0;
+    int i = lc->slot_by_expert[eid];
+    return i >= 0 && i < lc->n && lc->slots[i].eid == -(eid + 2);
+}
 
 static void ensure_pilot_worker_started(Model *m) {
     if (!pilot_m) {
@@ -137,6 +238,41 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
 #else
 static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }        /* Linux: KB */
 #endif
+/* Quanta RAM il sistema offre ancora, in GB. Serve a dimensionare la cache
+ * degli esperti quando nessuno ha scelto un numero: senza questa, il default
+ * e' una costante che non sa nulla ne' del modello ne' della macchina.
+ *
+ * Fuori da Linux e dai sistemi con _SC_AVPHYS_PAGES ritorna 0, il che rende il
+ * budget automatico pari a cio' che il processo gia' tiene: la cache risulta
+ * minima invece che sbagliata, e --ram (o --cap) resta la via esplicita. */
+static double mem_available_gb(void) {
+    /* compat.h's probe knows Linux (MemAvailable), macOS (host_statistics64)
+     * and Windows (GlobalMemoryStatusEx). The Linux-only version that lived
+     * here returned 0 on the other two, and 0 sized the expert cache to one
+     * slot per layer: 2.5x slower without --ram, on every Windows and macOS
+     * benchmark taken since (#1500). */
+    double avail = compat_mem_available_gb();
+    if (avail > 0.0) return avail;
+    /* Not measurable here: say so once and fall back to half the physical RAM
+     * where that is known, else to a small fixed budget, rather than to a
+     * cache that streams every expert from disk on every token. */
+    static int noted = 0;
+    double total = 0.0;
+#ifdef _WIN32
+    double a2 = 0.0; compat_meminfo(&total, &a2);
+#elif defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
+    long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page > 0) total = (double)pages * (double)page / 1e9;
+#endif
+    double fallback = total > 0.0 ? total * 0.5 : 8.0;
+    if (!noted) {
+        noted = 1;
+        fprintf(stderr, "[olmoe] could not measure available RAM on this platform; assuming %.1f GB "
+                        "(%s). Pass --ram <GB> to set the budget explicitly.\n",
+                fallback, total > 0.0 ? "half the physical RAM" : "a fixed default");
+    }
+    return fallback;
+}
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
 
 /* chat mode only (main()'s CHAT=1 path): sampling temperature/top-p and the
@@ -166,7 +302,11 @@ static void matmul(float *y, const float *x, const float *W, int S, int I, int O
  * W[o,i] ~= q[o,i]*scale[o]  ->  y[o] = scale[o] * sum_i x[i]*q[o,i].
  * Su ARM: attivazione quantizzata Q8_0 (scala per blocco di 16) + dot int8
  * NEON (sdot dove c'e' dotprod) — stessa famiglia IDOT di glm.c, IDOT=0 per
- * la via scalare byte-esatta. Misurato 2.7x end-to-end su M5. */
+ * la via scalare byte-esatta. Misurato 2.7x end-to-end su M5.
+ *
+ * NB: la quantizzazione delle ATTIVAZIONI rende questo percorso non
+ * equivalente alla via scalare (issue #1044). Vale per NEON come per AVX2:
+ * IDOT e' opt-in (IDOT=1), non piu' attivo di default. */
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
@@ -187,8 +327,14 @@ static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
  * the only fast path was ARM, so x86 boxes silently used the scalar
  * fallback even when AVX2 was available).
  * Sign-extend both int8 vectors to int16 (exact, no precision loss) then
- * madd+horizontal-sum in int32: pure integer arithmetic, so this is
- * bit-for-bit identical to the scalar dot product, just vectorized. */
+ * madd+horizontal-sum in int32: pure integer arithmetic, so THIS DOT is
+ * bit-for-bit identical to a scalar int8 dot, just vectorized.
+ *
+ * That exactness does NOT extend to the branch that calls it. matmul_q's IDOT
+ * path quantizes the ACTIVATIONS to Q8_0 per 16-block before calling this,
+ * which the scalar fallback does not do -- so the two paths differ. This
+ * comment previously read as if it covered the whole path, which is how
+ * issue #1044 stayed invisible. See the note at the idot default below. */
 static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
     __m256i va16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)a));
     __m256i vb16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)b));
@@ -201,11 +347,64 @@ static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
     return _mm_cvtsi128_si32(sum32);
 }
 #define HAVE_FAST_DOT_I8 1
+#elif defined(__SSE4_1__)
+#include <immintrin.h>
+#include "sse41_kernels.h"
+/* Sandy Bridge-EP path: AVX 1.0 only, no FMA, no AVX-2.
+ * 16 int8 dot via two 8-wide SSE2 sign-extend + SSE4.1 madd pairs.
+ * Bit-for-bit identical to the AVX2 version above (just 2x 128-bit ops
+ * instead of 1x 256-bit op). NO FMA here -- this branch targets Sandy Bridge
+ * which has no FMA -- so use explicit mul+add for the inner accumulation. */
+static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
+    __m128i va_lo = _mm_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)a));        /* lower 8 int8 -> 8 int16 */
+    __m128i vb_lo = _mm_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)b));
+    __m128i va_hi = _mm_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)(a + 8)));   /* upper 8 int8 -> 8 int16 */
+    __m128i vb_hi = _mm_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)(b + 8)));
+    __m128i p_lo = _mm_madd_epi16(va_lo, vb_lo);   /* 4 x int32 from 8 int16 pairs */
+    __m128i p_hi = _mm_madd_epi16(va_hi, vb_hi);   /* 4 x int32 from 8 int16 pairs */
+    __m128i sum = _mm_add_epi32(p_lo, p_hi);
+    /* horizontal reduce 4 x int32 -> 1 x int32 */
+    __m128i hi64   = _mm_unpackhi_epi64(sum, sum);
+    __m128i sum64  = _mm_add_epi32(sum, hi64);
+    __m128i hi32   = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
+    return _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
+}
+#define HAVE_FAST_DOT_I8 1
 #endif
+/* Test-only hook, compiled out of the shipping binary.
+ *
+ * matmul_q reads IDOT once into a static, so a test cannot exercise both paths
+ * in one process without it. Guarded by OLMOE_TESTING so production builds have
+ * neither the global nor the branch: tests/test_olmoe_matmul_q.c defines it. */
+#ifdef OLMOE_TESTING
+int matmul_q_idot_force = -1;
+static inline void matmul_q_reset_for_test(void) { matmul_q_idot_force = -1; }
+#endif
+
+#if defined(__AVX2__)
+#include "fused_simd.h"   /* FUSED3=1: quant_x_q8_avx2 + matmul_q_idot{,_pair}_v3 (bit-exact) */
+#endif
+
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
 #if defined(HAVE_FAST_DOT_I8)
+    /* IDOT is OPT-IN. It quantizes the ACTIVATIONS to Q8_0 per 16-block (below),
+     * which the scalar fallback never does, so the two paths are not numerically
+     * equivalent: measured 5/12 vs 12/12 matching tokens against a reference
+     * (issue #1044). Before 2c4e9de x86 had no fast dot at all, so IDOT=1 fell
+     * through to the exact scalar path and x86 was token-exact by accident; that
+     * commit silently made every AVX2 box lossy by default. Defaulting to off
+     * restores the behaviour users actually had.
+     *
+     * Cost of turning it on: ~+5.8e-4 relative error per dot from the activation
+     * quantization (colibri.c:910-915 measures the same mechanism at ~+0.117
+     * nats/token on GLM, which is why GLM keeps q/k/v off IDOT). On AVX2-only
+     * hardware it is also not faster: 11.01 vs 10.67 tok/s measured on an
+     * i5-9600K, n=4 interleaved. Set IDOT=1 to opt in knowingly. */
     static int idot = -1;
-    if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
+    if (idot < 0) { const char *e = getenv("IDOT"); idot = (e && *e == '1'); }
+#ifdef OLMOE_TESTING
+    if (matmul_q_idot_force >= 0) idot = matmul_q_idot_force;
+#endif
     if (idot && I % 16 == 0 && I <= 4096) {
         int nb = I / 16; int8_t xi[4096]; float xs[256];
         for (int b = 0; b < nb; b++) {
@@ -294,19 +493,30 @@ static float *load_t(Model *m, const char *name) {
     return p;
 }
 
-static void model_init(Model *m, const char *snap, int cap, int bits) {
+static void model_init_range(Model *m, const char *snap, int cap, int bits,
+                             int layer_begin, int layer_end,
+                             int load_boundaries, int init_telemetry) {
     memset(m, 0, sizeof(*m));
     m->quant_bits = bits;
     load_cfg(&m->c, snap);
     st_init(&m->S, snap);
     Cfg *c = &m->c;
+    if (layer_end == 0) layer_end = c->n_layers;
+    if (layer_begin < 0 || layer_end > c->n_layers ||
+        layer_begin >= layer_end) {
+        fprintf(stderr, "invalid OLMoE layer range [%d,%d) for %d layers\n",
+                layer_begin, layer_end, c->n_layers);
+        exit(1);
+    }
     double t0 = now_s();
-    m->embed      = load_t(m, "model.embed_tokens.weight");
-    m->lm_head    = load_t(m, "lm_head.weight");
-    m->final_norm = load_t(m, "model.norm.weight");
+    if (load_boundaries) {
+        m->embed      = load_t(m, "model.embed_tokens.weight");
+        m->lm_head    = load_t(m, "lm_head.weight");
+        m->final_norm = load_t(m, "model.norm.weight");
+    }
     m->L = calloc(c->n_layers, sizeof(Layer));
     char nm[256];
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = layer_begin; i < layer_end; i++) {
         Layer *l = &m->L[i];
         #define LD(field, suffix) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm)
         LD(in_ln,  "input_layernorm.weight");
@@ -317,19 +527,80 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         LD(gate, "mlp.gate.weight");
         #undef LD
     }
+    /* cap <= 0 is "you decide", the sentinel the launcher sends when nobody
+     * asked for a number (glm53 already reads it that way; #1443 asked for the
+     * same here). Sized HERE rather than in main because the dense weights are
+     * resident by this line: rss_gb() is a measurement, not a projection, which
+     * is what made the same budget in kimi_k3 (#855) the simpler of the two.
+     *
+     * Until now "no explicit choice" arrived as a constant 8 slots per layer,
+     * which knows nothing about the model or the machine. On a 16 GB box whose
+     * entire expert set is 6.5 GB that constant costs a factor of five:
+     * measured on a 1204-token prefill, cap 8 gives 22.8% expert hit rate and
+     * 0.045 tok/s, cap 64 gives 99.4% and 0.215 tok/s. */
+    if (cap <= 0) {
+        double resident = rss_gb();
+        double avail = mem_available_gb();
+        const char *ram_env = getenv("RAM_GB");
+        double ram_arg = ram_env ? atof(ram_env) : 0.0;
+        /* An explicit --ram is a ceiling on the WHOLE process. Without it take
+         * 88% of what the OS still offers and add what we already hold, the
+         * same fraction and the same reason as the sibling engines: overshoot
+         * means an OOM kill mid-generation, which is worse than a small cache. */
+        double budget = ram_arg > 0.0 ? ram_arg : resident + avail * 0.88;
+        /* The KV cache is allocated later, at the first request, so project it:
+         * two tensors per layer of n_heads * max_t * head_dim floats. CTX caps
+         * at 4096 because attention()'s score buffer does. */
+        int max_t = getenv("CTX") ? atoi(getenv("CTX")) : 4096;
+        if (max_t < 1 || max_t > 4096) max_t = 4096;
+        double kv_gb = 2.0 * (double)c->n_layers * c->n_heads * max_t *
+                       c->head_dim * sizeof(float) / 1e9;
+        /* One slot holds one expert: three int8 matrices plus their row scales,
+         * the same arithmetic the Segment adapter uses to turn a memory limit
+         * into a cap. */
+        double slot_gb = ((double)c->hidden * c->inter * 3.0 +
+                          (double)(c->inter * 2 + c->hidden) * sizeof(float)) / 1e9;
+        int layers = layer_end - layer_begin;
+        if (layers < 1) layers = 1;
+        double room = budget - resident - kv_gb - 0.5;   /* 0.5 GB: activations */
+        int derived = room > 0.0 && slot_gb > 0.0
+                    ? (int)(room / slot_gb / (double)layers) : 0;
+        if (derived < 1) derived = 1;
+        if (derived > c->n_experts) derived = c->n_experts;
+        fprintf(stderr, "[cache] %d slots/layer of %d experts: %.1f GB budget "
+                        "(%s), %.1f GB dense resident, %.1f GB projected KV, "
+                        "%.0f MB per expert\n",
+                derived, c->n_experts, budget,
+                ram_arg > 0.0 ? "RAM_GB" : "88% of what the OS still offers",
+                resident, kv_gb, slot_gb * 1000.0);
+        cap = derived;
+    }
     m->cache = calloc(c->n_layers, sizeof(LCache));
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = layer_begin; i < layer_end; i++) {
         m->cache[i].cap = cap;
         m->cache[i].slots = calloc(cap, sizeof(Slot));
+        m->cache[i].slot_by_expert = malloc((size_t)c->n_experts * sizeof(int));
+        if (!m->cache[i].slot_by_expert) { fprintf(stderr,"OOM expert cache index\n"); exit(1); }
+        for (int e = 0; e < c->n_experts; e++) m->cache[i].slot_by_expert[e] = -1;
     }
     /* IMPROVEMENT 2: frequency heatmap for hot expert pinning */
-    rt_init("olmoe", c->n_layers, c->n_experts);
-    rt_drop_row(c->n_layers);                     /* every olmoe layer routes; no MTP row */
-    m->freq = rt_counts_all();                    /* alias: the read sites keep their shape */
-    { const char *up = getenv("COLI_USAGE");      /* optional history to seed from */
-      if (up && *up) { int64_t h = rt_load(up);
-        if (h > 0) fprintf(stderr, "[USAGE] expert history: %lld selections (%s)\n",
-                           (long long)h, up); } }
+    if (init_telemetry) {
+        rt_init("olmoe", c->n_layers, c->n_experts);
+        rt_drop_row(c->n_layers);                 /* every layer routes; no MTP row */
+        m->freq = rt_counts_all();                /* read sites keep their shape */
+        const char *up = getenv("COLI_USAGE");    /* optional history seed */
+        if (up && *up) {
+            int64_t h = rt_load(up);
+            if (h > 0)
+                fprintf(stderr,
+                        "[USAGE] expert history: %lld selections (%s)\n",
+                        (long long)h, up);
+        }
+    } else {
+        /* A process can host several ranges. Keep their optional counters
+         * detached from route_trace.h's process-global singleton. */
+        m->freq = calloc((size_t)c->n_layers, sizeof(*m->freq));
+    }
     m->hot_pinned = 0; m->freq_token_count = 0;
     m->hot_n         = getenv("HOT")    ? atoi(getenv("HOT"))    : 0;
     m->warmup_tokens = getenv("WARMUP") ? atoi(getenv("WARMUP")) : 5;
@@ -348,10 +619,11 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     m->pilot_conf_limit = cl;
     m->dense_load_s = now_s() - t0;
 
-    // Persistent Hot Pinning: try to load hot_pinned.bin
+    /* Persistent hot pinning belongs to the standalone runtime. A Segment
+     * range must never enqueue expert reads for layers it does not own. */
     char pinpath[512];
     snprintf(pinpath, sizeof(pinpath), "%s/hot_pinned.bin", snap);
-    FILE *pinf = fopen(pinpath, "rb");
+    FILE *pinf = init_telemetry ? fopen(pinpath, "rb") : NULL;
     if (pinf) {
         size_t expected_size = (size_t)c->n_layers * c->n_experts;
         if (fread(m->is_pinned, 1, expected_size, pinf) == expected_size) {
@@ -390,6 +662,10 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     }
 }
 
+static void model_init(Model *m, const char *snap, int cap, int bits) {
+    model_init_range(m, snap, cap, bits, 0, 0, 1, 1);
+}
+
 static void slot_ensure_allocated(Model *m, Slot *s) {
     if (s->g) return;
     Cfg *c = &m->c;
@@ -410,7 +686,16 @@ static void slot_ensure_allocated(Model *m, Slot *s) {
     s->pinned = 0;
 }
 
+#ifdef COLI_CACHE_INDEX_TEST
+/* Model-free tests stand in for the disk read, so they can hold a load open
+ * and count how many times each expert is read. */
+static void (*g_test_expert_load)(Model *m, int layer, int eid, Slot *s);
+#endif
+
 static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
+#ifdef COLI_CACHE_INDEX_TEST
+    if (g_test_expert_load) { g_test_expert_load(m, layer, eid, s); return; }
+#endif
     char nm[256], qsnm[256];
     snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.merged_weight", layer, eid);
     snprintf(qsnm, sizeof(qsnm), "model.layers.%d.mlp.experts.%d.qs", layer, eid);
@@ -433,16 +718,39 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     if (!ts || ts->numel != want_s) {
         fprintf(stderr, "%s: scale array is %lld elems — expected %lld, refusing (untrusted container)\n",
                 qsnm, (long long)(ts ? ts->numel : -1), (long long)want_s); exit(1); }
+    double started = now_s();
     st_read_raw(&m->S, nm, s->g, g_expert_drop);
     st_read_f32(&m->S, qsnm, s->gs, 0);  /* scales are F32; use typed reader for dtype safety */
+    __atomic_fetch_add(&m->disk_ns, (uint64_t)((now_s() - started) * 1e9), __ATOMIC_RELAXED);
 }
 
 /* ---------- cache expert: ritorna i pesi quantizzati (q+scale) da cache o disco ---------- */
+/* One byte per expert: routed in this turn or not. The dashboard's Brain tab
+ * reads it as the HITS bitmap after every turn (serve_hits), and it is cleared
+ * there. Outside OLMOE_NO_MAIN: expert_get is in the segment adapter object. */
+static void ehit_mark(Model *m, int layer, int eid) {
+    Cfg *c = &m->c;
+    if (!m->ehit) {
+        m->ehit = calloc((size_t)c->n_layers, sizeof(uint8_t *));
+        for (int i = 0; i < c->n_layers; i++) m->ehit[i] = calloc((size_t)c->n_experts, 1);
+    }
+    if (layer >= 0 && layer < c->n_layers && eid >= 0 && eid < c->n_experts) m->ehit[layer][eid] = 1;
+}
+
 static void expert_get(Model *m, int layer, int eid, Slot **out) {
     LCache *lc = &m->cache[layer];
     pthread_mutex_lock(&g_pilot_mx);
-    for (int i = 0; i < lc->n; i++) if (lc->slots[i].eid == eid) {
-        m->hits++; lc->slots[i].used = ++m->clock; *out = &lc->slots[i];
+    ehit_mark(m, layer, eid);          /* under the lock: the routing loop is parallel */
+    Slot *hit = slot_indexed(m, layer, eid);
+    /* The prefetcher usually reads the next layer's experts while this one
+     * computes, so a routed expert is often already on its way: wait for that
+     * read to publish rather than read the same bytes again into another slot. */
+    while (!hit && slot_in_flight(m, layer, eid)) {
+        pthread_cond_wait(&g_pilot_cv, &g_pilot_mx);
+        hit = slot_indexed(m, layer, eid);
+    }
+    if (hit) {
+        m->hits++; hit->used = ++m->clock; *out = hit;
         if (m->last_access) m->last_access[layer * m->c.n_experts + eid] = m->clock;
         pthread_mutex_unlock(&g_pilot_mx);
         return;
@@ -487,18 +795,19 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
         s = &lc->slots[lru];
         s->pinned = 0;
     }
-    s->eid = -1;
+    cache_reserve(m, layer, s, eid);
     s->used = ++m->clock;
     pthread_mutex_unlock(&g_pilot_mx);
 
     load_expert_merged(m, layer, eid, s);
 
     pthread_mutex_lock(&g_pilot_mx);
-    s->eid = eid;
+    cache_publish(m, layer, s, eid);
     s->pinned = m->is_pinned[layer * c->n_experts + eid];
     s->used = ++m->clock;
     if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
     *out = s;
+    pthread_cond_broadcast(&g_pilot_cv);
     pthread_mutex_unlock(&g_pilot_mx);
 }
 
@@ -545,12 +854,10 @@ static void pin_hot_experts(Model *m) {
             int eid = hot_eids[k];
             m->is_pinned[l * c->n_experts + eid] = 1;
 
-            LCache *lc = &m->cache[l];
             int found = 0;
             pthread_mutex_lock(&g_pilot_mx);
-            for (int i = 0; i < lc->n; i++) {
-                if (lc->slots[i].eid == eid) { lc->slots[i].pinned = 1; found = 1; break; }
-            }
+            Slot *resident = slot_indexed(m, l, eid);
+            if (resident) { resident->pinned = 1; found = 1; }
             pthread_mutex_unlock(&g_pilot_mx);
             if (!found && g_pilot > 0) {
                 /* Only enqueue when the prefetch worker is active (PILOT>0). */
@@ -679,24 +986,123 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             idx[kk] = best; val[kk] = pr[best];
         }
         if (c->norm_topk) { float sm=0; for(int kk=0;kk<K;kk++) sm+=val[kk]; for(int kk=0;kk<K;kk++) val[kk]/=sm; }
-        /* IMPROVEMENT 2: update activation heatmap (before pinning activates) */
-        if (!m->hot_pinned && m->freq) {
-            uint32_t *freq_l = m->freq[layer];
-            if (freq_l) for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) freq_l[idx[kk]]++;
-        }
+        /* IMPROVEMENT 2 activation heatmap AND the ROUTE_TRACE stream, in one
+         * call. The counters were the only thing this engine recorded, and it
+         * recorded them HERE, before pinning activates — rt_count keeps that
+         * placement exactly. The trace is the half olmoe never had: it emits a
+         * line per (moe call, position, layer), so tools/route_pairs.py,
+         * route_coupling_report.py and residency_sim.py can read this engine's
+         * routing the same way they read GLM's. Until now olmoe announced
+         * ROUTE_TRACE at startup and then wrote a zero-byte file, because
+         * rt_init() opens the stream but nothing here ever called rt_trace():
+         * every consumer silently saw "no data" instead of an error.
+         *
+         * Only rt_route() is unconditional: it is a no-op for the counts when
+         * this engine has no counter row (the !hot_pinned guard below is
+         * unchanged) and a no-op for the trace when ROUTE_TRACE is unset, so a
+         * run without the variable behaves exactly as before. Measurement only,
+         * never the computation: idx[] and val[] are the ids and the
+         * post-normalisation gates the layer is about to apply. */
+        if (!m->hot_pinned) rt_route(layer, s, idx, val, K);
         const float *xs = x + (int64_t)s*D;
         for (int kk = 0; kk < K; kk++) {
             Slot *e; expert_get(m, layer, idx[kk], &e);
+#if defined(__AVX2__)
+            /* FUSED3: same contract as matmul_q's IDOT fast branch (IDOT env,
+             * dims %16==0, <=4096) — outside it the stock calls below run
+             * unchanged. Exact integer arithmetic only: bit-identical output
+             * (verified by memcmp in tests/bench_fused3.c). OFF by default. */
+            static int idot_moe = -1;
+            if (idot_moe < 0) { const char *ie = getenv("IDOT"); idot_moe = !(ie && *ie == '0'); }
+            if (g_fused3 && idot_moe && D % 16 == 0 && D <= 4096 && I % 16 == 0 && I <= 4096) {
+                matmul_q_idot_pair_v3(g, u, xs, e->g, e->gs, e->u, e->us, D, I);   /* gate+up share one quant of xs */
+                for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
+                matmul_q_idot_v3(hh, g, e->d, e->ds, I, D);                        /* down_proj [D,I] */
+            } else
+#endif
+            {
             matmul_q(g, xs, e->g, e->gs, D, I);     /* gate_proj [I,D] */
             matmul_q(u, xs, e->u, e->us, D, I);     /* up_proj   [I,D] */
             for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
             matmul_q(hh, g, e->d, e->ds, I, D);     /* down_proj [D,I] */
+            }
             float w = val[kk];
             float *os = out + (int64_t)s*D;
             for (int d = 0; d < D; d++) os[d] += w * hh[d];
         }
     }
     free(logits); free(g); free(u); free(hh);
+    /* Advance the trace call counter: once per moe() invocation, after all of
+     * its rows are traced. rt_trace_end() is a no-op when no stream is open.
+     *
+     * Outside the row loop on purpose. A batch of S == 0 traces no rows and
+     * must still consume a call id, or the ids stop being consecutive and
+     * residency_sim.py rejects the trace outright ("trace lacks advancing GLM
+     * call ids") rather than merging two forwards into one position space. GLM
+     * and glm53 advance theirs the same way. */
+    rt_trace_end();
+}
+
+/* PROF phases (#1449): wall time in attention, in the MoE blocks (expert
+ * loads included) and in the head, plus positions forwarded. The serve loop
+ * reports per-turn deltas; expert_matmul_s is the MoE time minus the disk
+ * seconds measured inside it, clamped at zero; forwards counts step() calls,
+ * so tokens per forward reads 1.0 for this engine. Timing only. */
+static double g_prof_attn_s = 0.0, g_prof_moe_s = 0.0, g_prof_head_s = 0.0;
+static long long g_prof_forwards = 0;
+
+static void layers_forward_range(Model *m, float *x, int S, int pos_base,
+                                 int layer_begin, int layer_end,
+                                 int allow_prefetch) {
+    Cfg *c = &m->c;
+    int D = c->hidden;
+    float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
+    for (int i = layer_begin; i < layer_end; i++) {
+        Layer *l = &m->L[i];
+        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
+        double t_attn = now_s();
+        attention(m, l, i, nrm, S, pos_base, tmp);
+        g_prof_attn_s += now_s() - t_attn;
+        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        /* IMPROVEMENT 1: PILOT=1 -> 1-layer lookahead */
+        if (allow_prefetch && g_pilot >= 1 && S <= 8 && i + 1 < c->n_layers)
+            pilot_prefetch(m, i + 1, x, S);
+        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
+        double t_moe = now_s();
+        moe(m, l, i, nrm, S, tmp);
+        g_prof_moe_s += now_s() - t_moe;
+        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+
+        /* PREDICTION IMPROVEMENT C (Residual gate trick):
+         * PILOT=2 -> prefetch layer i+2 using completed state x (containing MoE residual). */
+        if (allow_prefetch && g_pilot >= 2 && S <= 8 && i + 2 < c->n_layers)
+            pilot_prefetch(m, i + 2, x, S);
+        if (allow_prefetch && g_pilot >= 3 && S <= 8 && i + 3 < c->n_layers)
+            pilot_prefetch(m, i + 3, x, S);
+        
+    }
+    free(nrm); free(tmp);
+}
+
+/* Canale logprobs: coda numerica per token, lettura del prefill, fotografia
+ * dello stato. Questo motore e ad attenzione pura, quindi riavvolgere vuol
+ * dire solo dichiarare che il prefisso tenuto e quello fotografato: le righe
+ * KV di quelle posizioni non le ha toccate nessuno. Si salvano gli id e il
+ * vettore di logit finale, che e il predittore del primo token fresco. */
+static int    g_echo_k = 0;
+static const char *g_echo_id = NULL;
+static ColiPinPool g_pins;             /* piu scatti annidati, vedi pin_pool.h */
+static const float *g_pin_logit = NULL; /* logit dello scatto rimesso, se c'e */
+static int    g_pin_use_logit = 0;
+static Tok   *g_echo_tok = NULL;
+
+static void olmoe_echo(const char *id, int pos, int token, const float *lo, int V, int k){
+    char tail[1024]; coli_logprob_tail(tail, sizeof tail, lo, V, token, k);
+    char piece[512]; int n = g_echo_tok ? tok_decode(g_echo_tok, &token, 1, piece, (int)sizeof piece) : 0;
+    if (n < 0) n = 0;
+    printf("ECHO %s %d %d%s\n", id, n, pos, tail);
+    if (n > 0) fwrite(piece, 1, (size_t)n, stdout);
+    fputc('\n', stdout); fflush(stdout);
 }
 
 static float *step(Model *m, const int *ids, int S, int pos_base) {
@@ -715,37 +1121,39 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     }
     float *x = falloc((int64_t)S*D);
     for (int s = 0; s < S; s++) memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
-    float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
-    for (int i = 0; i < c->n_layers; i++) {
-        Layer *l = &m->L[i];
-        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
-        attention(m, l, i, nrm, S, pos_base, tmp);
-        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
-        /* IMPROVEMENT 1: PILOT=1 -> 1-layer lookahead */
-        if (g_pilot >= 1 && S <= 8 && i + 1 < c->n_layers)
-            pilot_prefetch(m, i + 1, x, S);
-        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
-        moe(m, l, i, nrm, S, tmp);
-        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
-
-        /* PREDICTION IMPROVEMENT C (Residual gate trick):
-         * PILOT=2 -> prefetch layer i+2 using completed state x (containing MoE residual). */
-        if (g_pilot >= 2 && S <= 8 && i + 2 < c->n_layers)
-            pilot_prefetch(m, i + 2, x, S);
-        if (g_pilot >= 3 && S <= 8 && i + 3 < c->n_layers)
-            pilot_prefetch(m, i + 3, x, S);
-        
-    }
+    layers_forward_range(m, x, S, pos_base, 0, c->n_layers, 1);
     /* count actual tokens processed (S>1 during prefill) */
     m->token_count += S; m->freq_token_count += S;
     if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens)
         pin_hot_experts(m);
     m->kv_len = pos_base + S;
+    /* Recorded HERE, where the tokens entered the cache: fed[0..len-1] are
+     * the ids those positions were built from, and that invariant is the
+     * whole safety argument for reusing them next turn. */
+    kv_prefix_record(&m->kvp, ids, pos_base, S);
+    /* Lettura del prefill: un passaggio di lm_head per posizione, pagato solo
+     * da chi ha chiesto il canale. La posizione p predice il token p+1; il
+     * primo token fresco e predetto dalla fotografia. Cosi ogni token di
+     * un'opzione ha il suo logprob, anche fuori dai primi k. */
+    if (g_echo_k > 0 && g_echo_id && S > 0) {
+        float *erow = falloc(D), *elog = falloc(c->vocab);
+        if (g_pin_use_logit && g_pin_logit)
+            olmoe_echo(g_echo_id, pos_base, ids[0], g_pin_logit, c->vocab, g_echo_k);
+        for (int p = 0; p + 1 < S; p++) {
+            rmsnorm_row(erow, x + (int64_t)p*D, m->final_norm, D, c->eps);
+            matmul(elog, erow, m->lm_head, 1, D, c->vocab);
+            olmoe_echo(g_echo_id, pos_base + p + 1, ids[p+1], elog, c->vocab, g_echo_k);
+        }
+        free(erow); free(elog);
+    }
     float *last = falloc(D);
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     float *logit = falloc(c->vocab);
+    double t_head = now_s();
     matmul(logit, last, m->lm_head, 1, D, c->vocab);
-    free(x); free(nrm); free(tmp); free(last);
+    g_prof_head_s += now_s() - t_head;
+    g_prof_forwards += 1;   /* forward passes, not positions: a prefill of S rows is one */
+    free(x); free(last);
     return logit;
 }
 
@@ -759,12 +1167,10 @@ static void pilot_realload(Model *m, int layer, int eid) {
         pthread_mutex_unlock(&g_pilot_mx);
         return;
     }
-    for (int i = 0; i < lc->n; i++) {
-        if (lc->slots[i].eid == eid) {
-            m->is_queued[layer * c->n_experts + eid] = 0;
-            pthread_mutex_unlock(&g_pilot_mx);
-            return;
-        }
+    if (slot_indexed(m, layer, eid) || slot_in_flight(m, layer, eid)) {
+        m->is_queued[layer * c->n_experts + eid] = 0;
+        pthread_mutex_unlock(&g_pilot_mx);
+        return;
     }
     Slot *s;
     if (lc->n < lc->cap) {
@@ -798,17 +1204,18 @@ static void pilot_realload(Model *m, int layer, int eid) {
 
         s = &lc->slots[lru]; s->pinned = 0;
     }
-    s->eid = -1; s->used = ++m->clock;
+    cache_reserve(m, layer, s, eid); s->used = ++m->clock;
     pthread_mutex_unlock(&g_pilot_mx);
 
     load_expert_merged(m, layer, eid, s);
 
     pthread_mutex_lock(&g_pilot_mx);
-    s->eid = eid;
+    cache_publish(m, layer, s, eid);
     s->pinned = m->is_pinned[layer * c->n_experts + eid];
     s->used = ++m->clock;
     if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
     m->is_queued[layer * c->n_experts + eid] = 0;
+    pthread_cond_broadcast(&g_pilot_cv);
     pthread_mutex_unlock(&g_pilot_mx);
 }
 
@@ -916,10 +1323,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
             if (eid < 0) continue;
             int found = 0;
             pthread_mutex_lock(&g_pilot_mx);
-            LCache *lc = &m->cache[lnext];
-            for (int z = 0; z < lc->n; z++) {
-                if (lc->slots[z].eid == eid) { found = 1; break; }
-            }
+            found = slot_indexed(m, lnext, eid) != NULL;
             pthread_mutex_unlock(&g_pilot_mx);
             if (!found) {
                 int gidx = lnext * E + eid;
@@ -1129,66 +1533,182 @@ static void run_chat(Model *m, Tok *T, int ctx_cap) {
  * never touched, the same invariant CHAT mode's /reset already relies on
  * (it clears hist_len, not the K/V buffers themselves). */
 
-typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen; } SReq;
+typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen;
+                 int logprobs, pin; } SReq;   /* SUBMIT logprobs=k / pin=1 */
 #define SRV_QMAX 16
 static SReq g_q[SRV_QMAX]; static int g_qn = 0;
+static const ColiServeWireProfile olmoe_wire = {
+    .max_header_bytes = 511,
+    .max_payload_bytes = 1u << 22,
+    .max_tokens = 1 << 20,
+    .require_exact_lf = 1,
+    .require_finite_sampling = 0,
+};
 
 /* read one control line (+ payload for SUBMIT). cur_id: request in flight;
- * returns 1 if that request was cancelled, 0 otherwise, -1 on stdin EOF. */
-static int serve_read_cmd(const char *cur_id) {
-    char ln[512];
-    if (!fgets(ln, sizeof(ln), stdin)) return -1;
-    char cmd[16], id[64];
-    if (sscanf(ln, "%15s %63s", cmd, id) < 2) return 0;
-    if (!strcmp(cmd, "CANCEL")) return cur_id && !strcmp(id, cur_id);
-    if (!strcmp(cmd, "SUBMIT")) {
-        int slot, plen, max_tok; float temp, top_p;
-        int nf = sscanf(ln, "%*s %*s %d %d %d %f %f", &slot, &plen, &max_tok, &temp, &top_p);
-        if (nf < 5 || plen < 0 || plen > (1<<22) || max_tok < 1 || max_tok > (1<<20)) {
-            printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
-        (void)slot;
-        char *pl = malloc((size_t)plen + 1);
-        if (fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) { free(pl); return -1; }
-        pl[plen] = 0;
-        int nl = fgetc(stdin); (void)nl;
+ * returns 1 if that request was cancelled, 0 otherwise, -1 on input EOF. */
+static int serve_read_cmd(FILE *in, FILE *out, const char *cur_id) {
+    ColiServeCommand command;
+    ColiServeReadResult result = coli_serve_read_command(in, &olmoe_wire, &command);
+    if (result == COLI_SERVE_READ_EOF || result == COLI_SERVE_READ_BAD_FRAME) return -1;
+    if (result == COLI_SERVE_READ_NOMEM) {
+        coli_serve_write_error(out, command.id, "out of memory");
+        return -1;
+    }
+    if (result == COLI_SERVE_READ_BAD_REQUEST &&
+        command.kind == COLI_SERVE_COMMAND_SUBMIT) {
+        coli_serve_write_error(out, command.id, "bad submit header");
+        return -1;
+    }
+    if (result != COLI_SERVE_READ_OK) return 0;
+    if (command.kind == COLI_SERVE_COMMAND_CANCEL) {
+        int cancelled = cur_id && !strcmp(command.id, cur_id);
+        coli_serve_command_dispose(&command);
+        return cancelled;
+    }
+    if (command.kind == COLI_SERVE_COMMAND_SUBMIT) {
         if (g_qn < SRV_QMAX) {
             SReq *q = &g_q[g_qn++];
-            snprintf(q->id, sizeof(q->id), "%s", id);
-            q->max_tok = max_tok; q->temp = temp; q->top_p = top_p;
-            q->payload = pl; q->plen = plen;
-        } else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); }
+            snprintf(q->id, sizeof(q->id), "%s", command.id);
+            q->max_tok = command.max_tokens;
+            q->logprobs = command.logprobs;
+            q->pin = command.pin;
+            q->temp = command.temperature;
+            q->top_p = command.top_p;
+            q->payload = (char *)coli_serve_command_take_payload(&command);
+            q->plen = (int)command.payload_bytes;
+        } else {
+            coli_serve_write_error(out, command.id, "queue full");
+        }
     }
+    coli_serve_command_dispose(&command);
     return 0;
 }
 
-static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
+/* HITS rows cols hex: which experts this turn routed, one bit each, every
+ * layer (all are MoE here, same rows and columns as EMAP), packed 8 per hex
+ * pair. Same line colibri.c emits; the Brain tab lights up from it. */
+static void serve_hits(Model *m) {
+    Cfg *c = &m->c; int E = c->n_experts, rows = c->n_layers;
+    if (!m->ehit) ehit_mark(m, -1, -1);
+    int nb = (rows * E + 7) / 8;
+    uint8_t *bm = calloc((size_t)nb, 1); int bit = 0;
+    for (int i = 0; i < rows; i++)
+        for (int e = 0; e < E; e++, bit++)
+            if (m->ehit[i][e]) { bm[bit >> 3] |= (uint8_t)(1 << (bit & 7)); m->ehit[i][e] = 0; }
+    char *hex = malloc((size_t)nb * 2 + 1); int w = 0;
+    for (int b = 0; b < nb; b++) { hex[w++] = "0123456789abcdef"[bm[b] >> 4]; hex[w++] = "0123456789abcdef"[bm[b] & 15]; }
+    hex[w] = 0;
+    printf("HITS %d %d %s\n", rows, E, hex);
+    fflush(stdout); free(hex); free(bm);
+}
+
+/* COLI_KV_PREFIX=0: never reuse a previous turn's cache. The escape hatch,
+ * and the B arm of the A/B that shows reuse changes nothing but the time. */
+static int kv_prefix_off(void){ const char *e = getenv("COLI_KV_PREFIX"); return e && *e == '0'; }
+
+static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     Cfg *c = &m->c;
     int cap = q->plen + 16;
     int *ids = malloc((size_t)cap * sizeof(int));
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
-    if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
-    if (np + q->max_tok > ctx_cap) {
-        printf("ERROR %s context exceeds CTX (%d + %d > %d)\n", q->id, np, q->max_tok, ctx_cap);
-        fflush(stdout); free(ids); return;
+    if (np <= 0) { coli_serve_write_error(stdout, q->id, "empty prompt"); free(ids); return 0; }
+    int budget = coli_serve_budget(np, q->max_tok, ctx_cap, q->logprobs > 0);
+    if (budget < 0) {
+        char message[128];
+        /* The frame the gateway turns into a 400 context_length_exceeded
+         * (#506, #1381). Free text here reached the client as a 500. */
+        snprintf(message, sizeof(message),
+                 "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
+                 np, q->max_tok, ctx_cap);
+        coli_serve_write_error(stdout, q->id, message); free(ids); return 0;
+    }
+    if (budget < q->max_tok) {
+        fprintf(stderr, "[serve] max_tokens %d clamped to %d (context %d - prompt %d); "
+                        "raise CTX for longer answers\n",
+                q->max_tok, budget, ctx_cap, np);
+        q->max_tok = budget;
     }
     g_temp = q->temp; g_nuc = q->top_p;
+    /* A chat client resends the whole transcript every turn. If this prompt
+     * begins with the ids the cache was built from, those keys and values ARE
+     * the state at those positions -- attention is causal, so a row depends on
+     * its prefix and nothing later. Prefill only the tail. Reuse is all or
+     * nothing: nothing here can rewind a cache. COLI_KV_PREFIX=0 turns it off,
+     * COLI_PREFIX_LOG=1 reports the decision and its reason, because "it did
+     * not get faster" is otherwise indistinguishable from "it is not wired up".
+     *
+     * On a miss the record must be CLEARED and not merely overwritten: a
+     * shorter prompt writes fewer positions than the last one recorded, and
+     * kv_prefix_record only ever grows the length, so the stale tail would
+     * claim coverage the cache no longer has. */
+    int reuse = kv_prefix_off() ? 0 : kv_prefix_reuse(&m->kvp, ids, np);
+    /* La fotografia si prova sempre, non solo quando il riuso vivo fallisce:
+     * altrimenti la prima opzione trova ancora lo stato del prompt, passa dal
+     * riuso normale e il suo primo token resta senza predittore. */
+    g_pin_use_logit = 0; g_pin_logit = NULL;
+    {
+        /* Il piu profondo degli scatti che sia un prefisso di questo prompt.
+         * Con due livelli (istruzioni, istruzioni+domanda) e il secondo a
+         * decidere; se e' morto si ripiega sul primo invece di rifare tutto. */
+        int s = coli_pin_best(&g_pins, ids, np);
+        while (s >= 0) {
+            ColiPin *k = &g_pins.slot[s];
+            if (kv_prefix_holds(&m->kvp, k->ids, k->len)) {
+                kv_prefix_clear(&m->kvp);
+                kv_prefix_record(&m->kvp, k->ids, 0, k->len);
+                m->kv_len = k->len;
+                reuse = k->len;
+                g_pin_logit = k->logit; g_pin_use_logit = k->logit != NULL;
+                coli_pin_touch(&g_pins, s);
+                break;
+            }
+            k->len = 0;                    /* le righe non ci sono piu: scatto orfano */
+            s = coli_pin_best(&g_pins, ids, np);
+        }
+    }
+    g_echo_k = q->logprobs; g_echo_id = q->id; g_echo_tok = T;
+    if (!reuse) kv_prefix_clear(&m->kvp);
+    if (getenv("COLI_PREFIX_LOG")) {
+        if (reuse)
+            fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
+                    reuse, np, 100.0 * reuse / np);
+        else
+            fprintf(stderr, "[PREFIX] no reuse: held=%d cap=%d prompt=%d\n",
+                    m->kvp.len, m->kvp.cap, np);
+        fflush(stderr);
+    }
     double t0 = now_s();
     uint64_t h0 = m->hits, m0 = m->miss;
-    float *logit = step(m, ids, np, 0);
+    uint64_t disk0 = __atomic_load_n(&m->disk_ns, __ATOMIC_RELAXED);
+    double attn0 = g_prof_attn_s, moe0 = g_prof_moe_s, head0 = g_prof_head_s;
+    long long fwd0 = g_prof_forwards;
+    /* `reuse` is the ABSOLUTE position of the first fresh token: attention
+     * and the KV rows are position-indexed, so this has to be the real
+     * offset, not a count of what is left to do. */
+    float *logit = step(m, ids + reuse, np - reuse, reuse);
     int hist_len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
+    if (q->pin && logit) {
+        coli_pin_pool_init(&g_pins, c->vocab);
+        if (coli_pin_store(&g_pins, ids, np, logit)) {
+            fprintf(stderr, "[PIN] scatto a %d token\n", np); fflush(stderr);
+        }
+    }
+    g_echo_k = 0; g_echo_id = NULL;   /* la lettura riguarda il prefill, non la decodifica */
     for (int s = 0; s < q->max_tok && !cancelled; s++) {
         int nt = pick_tok(logit, c->vocab, -1);
+        char lptail[1024]; lptail[0] = 0;
+        if (q->logprobs > 0) coli_logprob_tail(lptail, sizeof lptail, logit, c->vocab, nt, q->logprobs);
         free(logit); logit = NULL;
         if (is_stop(nt)) { limited = 0; break; }
         int nb = tok_decode(T, &nt, 1, buf, sizeof(buf)-1);
-        printf("DATA %s %d\n", q->id, nb);
-        fwrite(buf, 1, (size_t)nb, stdout);
-        fputc('\n', stdout); fflush(stdout);
+        if (q->logprobs > 0) coli_serve_write_data_lp(stdout, q->id, buf, (size_t)nb, lptail);
+        else coli_serve_write_data(stdout, q->id, buf, (size_t)nb);
         gen++; hist_len++;
         while (coli_stdin_readable()) {
-            int r = serve_read_cmd(q->id);
-            if (r < 0) { free(ids); return; }
+            int r = serve_read_cmd(stdin, stdout, q->id);
+            if (r < 0) { free(ids); return -1; }
             if (r > 0) { cancelled = 1; limited = 0; }
         }
         /* Unlike run_chat(), we do not step() the final token just to populate
@@ -1200,15 +1720,31 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     free(logit);
     double dt = now_s() - t0;
     double tot = (double)(m->hits - h0 + m->miss - m0);
-    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen,
-           dt > 0 ? gen/dt : 0.0, tot ? 100.0*(m->hits-h0)/tot : 0.0, rss_gb(), np, limited);
-    /* PROF: per-turn phase timings for the dashboard. olmoe.c does not split
-     * its wall time into fill/expert/shared/attn phases the way glm.c and
-     * inkling.c do, so this reports total time only; a real phase breakdown
-     * is future work, not a protocol requirement. */
-    printf("PROF %.3f %d %d 0.0 0.0 0.0 0.0 0.0 %d\n", dt, np, gen, gen + 1);
+    ColiServeDone done = {
+        .completion_tokens = gen,
+        .tokens_per_second = dt > 0 ? gen/dt : 0.0,
+        .cache_hit_percent = tot ? 100.0*(m->hits-h0)/tot : 0.0,
+        .rss_gb = rss_gb(),
+        .prompt_tokens = np,
+        .length_limited = limited,
+    };
+    coli_serve_write_done(stdout, q->id, &done);
+    /* PROF: per-turn phase timings for the dashboard, field order the protocol's:
+     * disk, wait, matmul, attention, lm_head, forwards. disk is what the expert
+     * loads took (#1449 first half); matmul is the MoE block time minus that
+     * disk time, clamped at zero (the PILOT worker's reads are counted in disk
+     * but happen off the block's clock); attention and lm_head are measured
+     * around their calls; forwards counts positions through step(). wait stays
+     * zero: this engine has no separate wait phase. */
+    double disk_s = (double)(__atomic_load_n(&m->disk_ns, __ATOMIC_RELAXED) - disk0) / 1e9;
+    double matmul_s = (g_prof_moe_s - moe0) - disk_s; if (matmul_s < 0.0) matmul_s = 0.0;
+    /* microsecond resolution: see qwen36.c, same reason (a sub-millisecond tiny turn read as unmeasured) */
+    printf("PROF %.6f %d %d %.6f 0.0 %.6f %.6f %.6f %lld\n", dt, np, gen, disk_s, matmul_s,
+           g_prof_attn_s - attn0, g_prof_head_s - head0, g_prof_forwards - fwd0);
     fflush(stdout);
+    serve_hits(m);
     free(ids);
+    return 0;
 }
 
 /* dashboard HWINFO/TIERS/EMAP: same lines the other serve-capable engines
@@ -1235,6 +1771,12 @@ static void serve_hwinfo(Model *m) {
             if (sscanf(ln, "MemTotal: %lf", &v) == 1) rt = v/1e6;
             if (sscanf(ln, "MemAvailable: %lf", &v) == 1) ra = v/1e6;
         } fclose(mi); }
+    if (ra <= 0.0) ra = compat_mem_available_gb();   /* macOS, Windows: no /proc (#1500) */
+#ifdef _WIN32
+    if (rt <= 0.0) { double a2 = 0.0; compat_meminfo(&rt, &a2); }
+#elif defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
+    if (rt <= 0.0) { long pg = sysconf(_SC_PHYS_PAGES), ps = sysconf(_SC_PAGESIZE); if (pg > 0 && ps > 0) rt = (double)pg * ps / 1e9; }
+#endif
     printf("HWINFO %d %.1f %.1f 0 0.0 %s|\n", cores, rt, ra, cpu[0] ? cpu : "unknown");
     fflush(stdout);
 }
@@ -1267,21 +1809,27 @@ static void serve_tiers_emap(Model *m) {
 }
 
 static void serve_loop(Model *m, Tok *T, int ctx_cap) {
-    coli_serve_binary_mode();
-    setvbuf(stdin, NULL, _IONBF, 0);
+    coli_serve_stdio_init();
     int tok_eos = tok_id_of(T, "|||IP_ADDRESS|||");
     stops_arm_tok(&m->c, tok_eos, T);
-    fputs("\x01\x01READY\x01\x01\n", stdout);
-    printf("STAT 0 0.0 0.0 %.2f 0 0\n", rss_gb());
-    fflush(stdout);
+    coli_serve_write_ready(stdout, rss_gb());
     serve_hwinfo(m);
     serve_tiers_emap(m);
     for (;;) {
-        while (!g_qn) if (serve_read_cmd(NULL) < 0) return;
+        while (!g_qn) if (serve_read_cmd(stdin, stdout, NULL) < 0) return;
         SReq q = g_q[0];
         memmove(g_q, g_q + 1, (size_t)(--g_qn) * sizeof(SReq));
-        serve_one(m, T, &q, ctx_cap);
+        int fatal = serve_one(m, T, &q, ctx_cap);
         free(q.payload);
+        if (fatal < 0) return;
+        /* Resend the grid after EVERY turn, not only after READY: at boot the
+         * expert cache is empty by definition, and that cold snapshot stayed
+         * the only one the dashboard ever saw -- all grey, RAM 0, everything
+         * on disk, forever. HITS was already per turn, which is why the white
+         * "routed now" flash worked while the residency colour never moved.
+         * inkling.c, kimi_k3.c, qwen38.c, deepseek_v41.c and colibri.c
+         * already do this. */
+        serve_tiers_emap(m);
     }
 }
 
@@ -1293,19 +1841,21 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
     *n_out = a->len; return r;
 }
 
+#ifndef OLMOE_NO_MAIN
 int main(int argc, char **argv) {
     coli_omp_tune_threads("olmoe");   /* squadra sui core fisici, niente spin-wait: vedi omp_tune.h */
     const char *snap = getenv("SNAP");
-    if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
+    if (!snap) { coli_print_launcher_help("OLMoE"); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
     g_wide  = getenv("WIDE")  ? atoi(getenv("WIDE"))  : 1;
     g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD") ? atoi(getenv("PILOT_EVICT_GUARD")) : 1;
     g_expert_drop = getenv("EXPERT_DROP") ? atoi(getenv("EXPERT_DROP")) : 0;
+    g_fused3     = getenv("FUSED3") ? atoi(getenv("FUSED3")) : 0;
     if (g_wide < 1) g_wide = 1;
     if (g_wide > 4) g_wide = 4;
     int hot_n  = getenv("HOT")   ? atoi(getenv("HOT"))   : 0;
-    int cap    = argc > 1 ? atoi(argv[1]) : 16;
-    int bits   = argc > 2 ? atoi(argv[2]) : 8;
+    int cap    = argc > 1 ? coli_arg_int(argv[1], "cache/layer") : 16;
+    int bits   = argc > 2 ? coli_arg_int(argv[2], "expert bits") : 8;
     if (bits < 2 || bits > 8) {
         fprintf(stderr, "quant_bits must be 2..8 (got %d)\n", bits);
         return 1;
@@ -1321,16 +1871,29 @@ int main(int argc, char **argv) {
             fprintf(stderr, "CTX must be 1..4096 (got %d)\n", ctx_cap);
             return 1;
         }
-        Model m; model_init(&m, snap, cap, bits);
+    /* static, not a stack local: the PILOT prefetch worker is detached and
+     * loops forever, and it keeps this address in the global pilot_m. A stack
+     * Model dies when main returns while that thread is still dereferencing
+     * it -- ASan: stack-use-after-return, READ of size 8, in a worker thread,
+     * with the run's tokens already correct (#1262). Static storage outlives
+     * every thread, so the pointer the worker holds stays valid. */
+        static Model m; model_init(&m, snap, cap, bits);
         m.max_t = ctx_cap;
         m.K = calloc(m.c.n_layers, sizeof(float*)); m.V = calloc(m.c.n_layers, sizeof(float*));
         for (int i = 0; i < m.c.n_layers; i++) {
             m.K[i] = falloc((int64_t)m.c.n_heads * m.max_t * m.c.head_dim);
             m.V[i] = falloc((int64_t)m.c.n_heads * m.max_t * m.c.head_dim);
         }
+        /* Serve mode only: the record is sized with the cache it describes, and
+         * the cache here is allocated once for ctx_cap and never reallocated,
+         * so a recorded position stays valid for the life of the process. The
+         * CLI paths (generate/run_chat/PPL) leave it unallocated, which makes
+         * every kv_prefix call there a no-op. */
+        kv_prefix_alloc(&m.kvp, m.max_t);
         Tok T;
         char tokpath[2048]; snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", snap);
         tok_load(&T, tokpath);
+        coli_rt_term_arm();   /* SIGTERM must reach the save below (#1629) */
         serve_loop(&m, &T, ctx_cap);
         { const char *up = getenv("COLI_USAGE");
           if (up && *up) rt_save(up, 0); }
@@ -1353,7 +1916,13 @@ int main(int argc, char **argv) {
             fprintf(stderr, "CTX must be 1..4096 (got %d)\n", ctx_cap);
             return 1;
         }
-        Model m; model_init(&m, snap, cap, bits);
+    /* static, not a stack local: the PILOT prefetch worker is detached and
+     * loops forever, and it keeps this address in the global pilot_m. A stack
+     * Model dies when main returns while that thread is still dereferencing
+     * it -- ASan: stack-use-after-return, READ of size 8, in a worker thread,
+     * with the run's tokens already correct (#1262). Static storage outlives
+     * every thread, so the pointer the worker holds stays valid. */
+        static Model m; model_init(&m, snap, cap, bits);
         printf("resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
         Tok T;
         char tokpath[2048]; snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", snap);
@@ -1369,8 +1938,8 @@ int main(int argc, char **argv) {
     float smooth = getenv("SMOOTH") ? (float)atof(getenv("SMOOTH")) : 0.3f;
     float conf   = getenv("CONF_LIMIT") ? (float)atof(getenv("CONF_LIMIT")) : 0.92f;
 
-    printf("== Streaming C engine v2.2 | cache=%d/layer bits=%d pilot=%d wide=%d guard=%d hot=%d smooth=%.2f conf=%.2f ==\n",
-           cap, bits, g_pilot, g_wide, g_pilot_evict_guard, hot_n, smooth, conf);
+    printf("== Streaming C engine v2.2 | cache=%d/layer bits=%d pilot=%d wide=%d guard=%d hot=%d smooth=%.2f conf=%.2f fused3=%d ==\n",
+           cap, bits, g_pilot, g_wide, g_pilot_evict_guard, hot_n, smooth, conf, g_fused3);
 
     FILE *f = fopen(refpath, "rb"); if (!f) { perror(refpath); return 1; }
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
@@ -1379,7 +1948,13 @@ int main(int argc, char **argv) {
     int np, nfull; int *prompt = read_int_array(ref,"prompt_ids",&np); int *full = read_int_array(ref,"full_ids",&nfull);
     int n_new = nfull - np;
 
-    Model m; model_init(&m, snap, cap, bits);
+    /* static, not a stack local: the PILOT prefetch worker is detached and
+     * loops forever, and it keeps this address in the global pilot_m. A stack
+     * Model dies when main returns while that thread is still dereferencing
+     * it -- ASan: stack-use-after-return, READ of size 8, in a worker thread,
+     * with the run's tokens already correct (#1262). Static storage outlives
+     * every thread, so the pointer the worker holds stays valid. */
+    static Model m; model_init(&m, snap, cap, bits);
     printf("resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
 
     if (getenv("PPL") && atoi(getenv("PPL")) == 1) {   /* loss-meter mode: teacher-forced NLL */
@@ -1444,3 +2019,523 @@ int main(int argc, char **argv) {
     free(buf); free(arena);
     return 0;
 }
+#endif /* OLMOE_NO_MAIN */
+
+#ifdef COLI_SEGMENT_ADAPTER
+/* ---------- engine-owned Segment adapter ------------------------------ */
+
+typedef struct {
+    Model model;
+    uint32_t layer_begin, layer_end, context_tokens;
+    pthread_mutex_t run_lock;
+} OlmoeSegmentEngine;
+
+typedef struct {
+    OlmoeSegmentEngine *engine;
+    float **K, **V;
+    uint32_t context_tokens, position;
+} OlmoeSegmentSession;
+
+static void olmoe_segment_model_destroy(OlmoeSegmentEngine *engine) {
+    if (!engine) return;
+    Model *model = &engine->model;
+    for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+         layer++) {
+        Layer *weights = &model->L[layer];
+        free(weights->in_ln); free(weights->post_ln);
+        free(weights->q); free(weights->k); free(weights->v); free(weights->o);
+        free(weights->qn); free(weights->kn); free(weights->gate);
+        LCache *cache = &model->cache[layer];
+        for (int slot = 0; slot < cache->n; slot++) {
+            free(cache->slots[slot].g);
+            free(cache->slots[slot].gs);
+        }
+        free(cache->slot_by_expert);
+        free(cache->slots);
+    }
+    free(model->last_access); free(model->is_queued); free(model->is_pinned);
+    free(model->freq);
+    free(model->momentum_logits);
+    free(model->cache); free(model->L);
+    st_destroy(&model->S);
+}
+
+static int olmoe_segment_engine_open(
+    void **engine_impl, ColiSegmentCapabilities *capabilities,
+    const ColiSegmentEngineOptions *options, char *error, size_t error_size) {
+    if (!engine_impl || !capabilities || !options)
+        return coli_segment_adapter_error(error, error_size,
+                                           "invalid OLMoE Segment open");
+    *engine_impl = NULL;
+    if (options->backend_mask &&
+        (options->backend_mask & ~COLI_SEGMENT_CAP_CPU))
+        return coli_segment_adapter_error(error, error_size,
+                                           "OLMoE Segment supports CPU only");
+    if (options->context_tokens > 4096)
+        return coli_segment_adapter_error(error, error_size,
+                                           "OLMoE Segment context exceeds 4096");
+
+    Cfg config;
+    memset(&config, 0, sizeof(config));
+    load_cfg(&config, options->model_dir);
+    if (options->layer_end > (uint32_t)config.n_layers)
+        return coli_segment_adapter_error(error, error_size,
+                                           "OLMoE Segment range exceeds model");
+    int range_layers = (int)(options->layer_end - options->layer_begin);
+    int cap = 16;
+    if (options->memory_limit_bytes) {
+        uint64_t weights = (uint64_t)config.hidden * config.inter * 3u;
+        uint64_t scales = (uint64_t)(config.inter * 2 + config.hidden) *
+                          sizeof(float);
+        uint64_t per_slot = weights + scales;
+        uint64_t slots = per_slot && range_layers > 0
+            ? options->memory_limit_bytes / per_slot / (uint64_t)range_layers
+            : 0;
+        cap = slots > (uint64_t)config.n_experts ? config.n_experts : (int)slots;
+        if (cap < 1) cap = 1;
+    }
+
+    OlmoeSegmentEngine *engine = calloc(1, sizeof(*engine));
+    if (!engine)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory opening OLMoE Segment");
+    engine->layer_begin = options->layer_begin;
+    engine->layer_end = options->layer_end;
+    engine->context_tokens = options->context_tokens;
+    if (pthread_mutex_init(&engine->run_lock, NULL)) {
+        free(engine);
+        return coli_segment_adapter_error(error, error_size,
+                                           "cannot initialize OLMoE Segment lock");
+    }
+    model_init_range(&engine->model, options->model_dir, cap, 8,
+                     (int)options->layer_begin, (int)options->layer_end, 0, 0);
+
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->struct_size = sizeof(*capabilities);
+    capabilities->abi_version = COLI_SEGMENT_ABI_VERSION;
+    capabilities->flags = COLI_SEGMENT_CAP_SNAPSHOT |
+                          COLI_SEGMENT_CAP_RANGE_NATIVE |
+                          COLI_SEGMENT_CAP_MULTI_SESSION |
+                          COLI_SEGMENT_CAP_CPU;
+    coli_segment_capability_string(capabilities->engine_id,
+                                   sizeof(capabilities->engine_id), "olmoe");
+    coli_segment_capability_string(capabilities->state_schema,
+                                   sizeof(capabilities->state_schema),
+                                   "olmoe/kv-f32-v1");
+    coli_segment_capability_string(capabilities->numeric_class,
+                                   sizeof(capabilities->numeric_class),
+                                   "olmoe/f32-int8/cpu-v1");
+    capabilities->state_dtype = COLI_SEGMENT_DTYPE_F32;
+    capabilities->state_width = (uint32_t)config.hidden;
+    capabilities->max_batch_rows = 128;
+    capabilities->max_context_tokens = 4096;
+    capabilities->num_layers = (uint32_t)config.n_layers;
+    *engine_impl = engine;
+    return 0;
+}
+
+static void olmoe_segment_engine_destroy(void *engine_impl) {
+    OlmoeSegmentEngine *engine = (OlmoeSegmentEngine *)engine_impl;
+    if (!engine) return;
+    olmoe_segment_model_destroy(engine);
+    pthread_mutex_destroy(&engine->run_lock);
+    free(engine);
+}
+
+static int olmoe_segment_session_create(
+    void *engine_impl, void **session_impl,
+    const ColiSegmentSessionOptions *options, char *error, size_t error_size) {
+    OlmoeSegmentEngine *engine = (OlmoeSegmentEngine *)engine_impl;
+    if (!engine || !session_impl || !options)
+        return coli_segment_adapter_error(error, error_size,
+                                           "invalid OLMoE Segment session");
+    *session_impl = NULL;
+    OlmoeSegmentSession *session = calloc(1, sizeof(*session));
+    if (!session)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory creating OLMoE session");
+    session->engine = engine;
+    session->context_tokens = options->context_tokens;
+    int layers = engine->model.c.n_layers;
+    session->K = calloc((size_t)layers, sizeof(*session->K));
+    session->V = calloc((size_t)layers, sizeof(*session->V));
+    if (!session->K || !session->V) goto oom;
+    size_t cells;
+    if (coli_segment_size_mul((size_t)engine->model.c.n_heads,
+                              options->context_tokens, &cells) ||
+        coli_segment_size_mul(cells, (size_t)engine->model.c.head_dim,
+                              &cells)) goto oom;
+    for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+         layer++) {
+        session->K[layer] = calloc(cells, sizeof(float));
+        session->V[layer] = calloc(cells, sizeof(float));
+        if (!session->K[layer] || !session->V[layer]) goto oom;
+    }
+    *session_impl = session;
+    return 0;
+
+oom:
+    if (session->K && session->V)
+        for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+             layer++) {
+            free(session->K[layer]); free(session->V[layer]);
+        }
+    free(session->K); free(session->V); free(session);
+    return coli_segment_adapter_error(error, error_size,
+                                       "out of memory allocating OLMoE KV");
+}
+
+static void olmoe_segment_session_destroy(void *session_impl) {
+    OlmoeSegmentSession *session = (OlmoeSegmentSession *)session_impl;
+    if (!session) return;
+    for (uint32_t layer = session->engine->layer_begin;
+         layer < session->engine->layer_end; layer++) {
+        free(session->K[layer]); free(session->V[layer]);
+    }
+    free(session->K); free(session->V); free(session);
+}
+
+static int olmoe_segment_session_run(void *session_impl,
+                                     const ColiSegmentRunRequest *request,
+                                     char *error, size_t error_size) {
+    OlmoeSegmentSession *session = (OlmoeSegmentSession *)session_impl;
+    if (!session || !request || request->position != session->position)
+        return coli_segment_adapter_error(
+            error, error_size, "OLMoE Segment requires contiguous positions");
+    if (request->should_cancel &&
+        request->should_cancel(request->cancel_user_data))
+        return coli_segment_adapter_error(error, error_size,
+                                           "OLMoE Segment run cancelled");
+    OlmoeSegmentEngine *engine = session->engine;
+    if (request->output != request->input)
+        memcpy(request->output, request->input, request->input_bytes);
+    pthread_mutex_lock(&engine->run_lock);
+    Model *model = &engine->model;
+    model->K = session->K; model->V = session->V;
+    model->max_t = (int)session->context_tokens;
+    model->kv_len = (int)session->position;
+    layers_forward_range(model, (float *)request->output, (int)request->rows,
+                         (int)request->position, (int)engine->layer_begin,
+                         (int)engine->layer_end, 0);
+    model->K = NULL; model->V = NULL; model->max_t = 0; model->kv_len = 0;
+    pthread_mutex_unlock(&engine->run_lock);
+    session->position += request->rows;
+    return 0;
+}
+
+static int olmoe_segment_payload_size(const OlmoeSegmentSession *session,
+                                      uint32_t position, size_t *bytes) {
+    size_t cells = (size_t)(session->engine->layer_end -
+                            session->engine->layer_begin);
+    if (coli_segment_size_mul(cells, 2, &cells) ||
+        coli_segment_size_mul(cells,
+                              (size_t)session->engine->model.c.n_heads,
+                              &cells) ||
+        coli_segment_size_mul(cells, position, &cells) ||
+        coli_segment_size_mul(cells,
+                              (size_t)session->engine->model.c.head_dim,
+                              &cells) ||
+        coli_segment_size_mul(cells, sizeof(float), bytes)) return -1;
+    return 0;
+}
+
+static uint64_t olmoe_segment_state_hash(const OlmoeSegmentSession *session) {
+    uint64_t hash = COLI_SEGMENT_HASH_INIT;
+    size_t row_bytes = (size_t)session->position *
+                       session->engine->model.c.head_dim * sizeof(float);
+    int heads = session->engine->model.c.n_heads;
+    size_t stride = (size_t)session->context_tokens *
+                    session->engine->model.c.head_dim;
+    for (uint32_t layer = session->engine->layer_begin;
+         layer < session->engine->layer_end; layer++)
+        for (int kv = 0; kv < 2; kv++) {
+            float *state = kv ? session->V[layer] : session->K[layer];
+            for (int head = 0; head < heads; head++)
+                hash = coli_segment_hash_update(hash, state + head * stride,
+                                                row_bytes);
+        }
+    return hash;
+}
+
+static int olmoe_segment_session_snapshot(
+    void *session_impl, ColiSegmentWriteFn write_fn, void *write_user_data,
+    char *error, size_t error_size) {
+    OlmoeSegmentSession *session = (OlmoeSegmentSession *)session_impl;
+    size_t payload_bytes;
+    if (!session || olmoe_segment_payload_size(session, session->position,
+                                               &payload_bytes))
+        return coli_segment_adapter_error(error, error_size,
+                                           "OLMoE snapshot size overflow");
+    ColiSegmentSnapshotHeader header;
+    coli_segment_snapshot_header_init(
+        &header, "olmoe", session->engine->layer_begin,
+        session->engine->layer_end, session->context_tokens, session->position,
+        payload_bytes, olmoe_segment_state_hash(session));
+    if (coli_segment_stream_write(write_fn, write_user_data, &header,
+                                  sizeof(header), error, error_size)) return -1;
+    size_t row_bytes = (size_t)session->position *
+                       session->engine->model.c.head_dim * sizeof(float);
+    int heads = session->engine->model.c.n_heads;
+    size_t stride = (size_t)session->context_tokens *
+                    session->engine->model.c.head_dim;
+    for (uint32_t layer = session->engine->layer_begin;
+         layer < session->engine->layer_end; layer++)
+        for (int kv = 0; kv < 2; kv++) {
+            float *state = kv ? session->V[layer] : session->K[layer];
+            for (int head = 0; head < heads; head++)
+                if (coli_segment_stream_write(
+                        write_fn, write_user_data, state + head * stride,
+                        row_bytes, error, error_size)) return -1;
+        }
+    return 0;
+}
+
+static int olmoe_segment_session_restore(
+    void *session_impl, ColiSegmentReadFn read_fn, void *read_user_data,
+    char *error, size_t error_size) {
+    OlmoeSegmentSession *session = (OlmoeSegmentSession *)session_impl;
+    ColiSegmentSnapshotHeader header;
+    if (!session || coli_segment_stream_read(read_fn, read_user_data, &header,
+                                             sizeof(header), error, error_size))
+        return -1;
+    size_t payload_bytes;
+    if (olmoe_segment_payload_size(session, header.position, &payload_bytes) ||
+        coli_segment_snapshot_header_valid(
+            &header, "olmoe", session->engine->layer_begin,
+            session->engine->layer_end, session->context_tokens, payload_bytes,
+            error, error_size)) return -1;
+    unsigned char *payload = payload_bytes ? malloc(payload_bytes) : NULL;
+    if (payload_bytes && !payload)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory restoring OLMoE KV");
+    if (coli_segment_stream_read(read_fn, read_user_data, payload, payload_bytes,
+                                 error, error_size)) {
+        free(payload);
+        return -1;
+    }
+    if (coli_segment_hash_update(COLI_SEGMENT_HASH_INIT, payload,
+                                 payload_bytes) != header.payload_hash) {
+        free(payload);
+        return coli_segment_adapter_error(error, error_size,
+                                           "OLMoE snapshot checksum mismatch");
+    }
+    size_t row_bytes = (size_t)header.position *
+                       session->engine->model.c.head_dim * sizeof(float);
+    int heads = session->engine->model.c.n_heads;
+    size_t stride = (size_t)session->context_tokens *
+                    session->engine->model.c.head_dim;
+    unsigned char *cursor = payload;
+    for (uint32_t layer = session->engine->layer_begin;
+         layer < session->engine->layer_end; layer++)
+        for (int kv = 0; kv < 2; kv++) {
+            float *state = kv ? session->V[layer] : session->K[layer];
+            for (int head = 0; head < heads; head++) {
+                memcpy(state + head * stride, cursor, row_bytes);
+                cursor += row_bytes;
+            }
+        }
+    session->position = header.position;
+    free(payload);
+    return 0;
+}
+
+static const ColiSegmentAdapter olmoe_segment_adapter = {
+    sizeof(ColiSegmentAdapter), COLI_SEGMENT_ABI_VERSION, "olmoe",
+    olmoe_segment_engine_open, olmoe_segment_engine_destroy,
+    olmoe_segment_session_create, olmoe_segment_session_destroy,
+    olmoe_segment_session_run, olmoe_segment_session_snapshot,
+    olmoe_segment_session_restore, {0}
+};
+
+int coli_olmoe_segment_adapter_register(void) {
+    return coli_segment_adapter_register(&olmoe_segment_adapter);
+}
+#endif /* COLI_SEGMENT_ADAPTER */
+
+#ifdef COLI_EDGE_ADAPTER
+/* ---------- engine-owned model Edge adapter --------------------------- */
+
+typedef struct {
+    Model model;
+    Tok tokenizer;
+} OlmoeEdgeEngine;
+
+static void olmoe_edge_engine_destroy(void *engine_impl) {
+    OlmoeEdgeEngine *engine = (OlmoeEdgeEngine *)engine_impl;
+    if (!engine) return;
+    free(engine->model.embed);
+    free(engine->model.lm_head);
+    free(engine->model.final_norm);
+    st_destroy(&engine->model.S);
+    tok_free(&engine->tokenizer);
+    free(engine);
+}
+
+static int olmoe_edge_engine_open(
+    void **engine_impl, ColiEdgeCapabilities *capabilities,
+    const ColiEdgeEngineOptions *options, char *error, size_t error_size) {
+    if (!engine_impl || !capabilities || !options)
+        return coli_edge_adapter_error(error, error_size,
+                                       "invalid OLMoE Edge open");
+    *engine_impl = NULL;
+    if (options->backend_mask &&
+        (options->backend_mask & ~COLI_EDGE_CAP_CPU))
+        return coli_edge_adapter_error(error, error_size,
+                                       "OLMoE Edge supports CPU only");
+    OlmoeEdgeEngine *engine = calloc(1, sizeof(*engine));
+    if (!engine)
+        return coli_edge_adapter_error(error, error_size,
+                                       "out of memory opening OLMoE Edge");
+    load_cfg(&engine->model.c, options->model_dir);
+    st_init(&engine->model.S, options->model_dir);
+    engine->model.embed = load_t(&engine->model, "model.embed_tokens.weight");
+    engine->model.lm_head = load_t(&engine->model, "lm_head.weight");
+    engine->model.final_norm = load_t(&engine->model, "model.norm.weight");
+    char tokenizer_path[4096];
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
+             options->model_dir);
+    tok_load(&engine->tokenizer, tokenizer_path);
+
+    Cfg *config = &engine->model.c;
+    uint64_t cells = (uint64_t)config->vocab * config->hidden;
+    uint64_t resident = (2u * cells + (uint64_t)config->hidden) * sizeof(float);
+    if (options->memory_limit_bytes && resident > options->memory_limit_bytes) {
+        olmoe_edge_engine_destroy(engine);
+        return coli_edge_adapter_error(error, error_size,
+                                       "OLMoE Edge exceeds memory limit");
+    }
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->struct_size = sizeof(*capabilities);
+    capabilities->abi_version = COLI_EDGE_ABI_VERSION;
+    capabilities->flags = COLI_EDGE_CAP_TOKENIZE |
+                          COLI_EDGE_CAP_DETOKENIZE |
+                          COLI_EDGE_CAP_GREEDY | COLI_EDGE_CAP_LOGITS |
+                          COLI_EDGE_CAP_CPU;
+    coli_edge_capability_string(capabilities->engine_id,
+                                sizeof(capabilities->engine_id), "olmoe");
+    coli_edge_capability_string(capabilities->state_schema,
+                                sizeof(capabilities->state_schema),
+                                "olmoe/kv-f32-v1");
+    coli_edge_capability_string(capabilities->numeric_class,
+                                sizeof(capabilities->numeric_class),
+                                "olmoe/f32-int8/cpu-v1");
+    coli_edge_capability_string(capabilities->tokenizer_class,
+                                sizeof(capabilities->tokenizer_class),
+                                "olmoe/byte-bpe-v1");
+    capabilities->state_dtype = COLI_EDGE_DTYPE_F32;
+    capabilities->state_width = (uint32_t)config->hidden;
+    capabilities->vocab_size = (uint32_t)config->vocab;
+    capabilities->max_batch_rows = 128;
+    capabilities->max_context_tokens = 4096;
+    capabilities->num_layers = (uint32_t)config->n_layers;
+    capabilities->bos_token_id = -1;
+    capabilities->eos_token_id = -1;
+    capabilities->resident_bytes = resident;
+    *engine_impl = engine;
+    return 0;
+}
+
+static int olmoe_edge_tokenize(
+    void *engine_impl, const char *text, size_t text_bytes,
+    int32_t *token_ids, size_t token_capacity, size_t *token_count,
+    char *error, size_t error_size) {
+    OlmoeEdgeEngine *engine = (OlmoeEdgeEngine *)engine_impl;
+    return coli_edge_tok_tokenize(&engine->tokenizer, text, text_bytes,
+                                  token_ids, token_capacity, token_count,
+                                  error, error_size);
+}
+
+static int olmoe_edge_detokenize(
+    void *engine_impl, const int32_t *token_ids, size_t token_count,
+    char *text, size_t text_capacity, size_t *text_bytes,
+    char *error, size_t error_size) {
+    OlmoeEdgeEngine *engine = (OlmoeEdgeEngine *)engine_impl;
+    return coli_edge_tok_detokenize(&engine->tokenizer, token_ids, token_count,
+                                    text, text_capacity, text_bytes,
+                                    error, error_size);
+}
+
+static int olmoe_edge_embed(void *engine_impl,
+                            const ColiEdgeEmbedRequest *request,
+                            char *error, size_t error_size) {
+    OlmoeEdgeEngine *engine = (OlmoeEdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *output = (float *)request->output;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        int token = request->token_ids[row];
+        if (token < 0 || token >= config->vocab)
+            return coli_edge_adapter_error(error, error_size,
+                                           "OLMoE token ID is out of range");
+        memcpy(output + (size_t)row * config->hidden,
+               engine->model.embed + (size_t)token * config->hidden,
+               (size_t)config->hidden * sizeof(float));
+    }
+    return 0;
+}
+
+static int olmoe_edge_select(void *engine_impl,
+                             const ColiEdgeSelectRequest *request,
+                             char *error, size_t error_size) {
+    OlmoeEdgeEngine *engine = (OlmoeEdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *normalized = falloc(config->hidden);
+    float *logits = falloc(config->vocab);
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        if (request->should_cancel &&
+            request->should_cancel(request->cancel_user_data)) {
+            free(logits); free(normalized);
+            return coli_edge_adapter_error(error, error_size,
+                                           "OLMoE Edge selection cancelled");
+        }
+        rmsnorm_row(normalized, input + (size_t)row * config->hidden,
+                    engine->model.final_norm, config->hidden, config->eps);
+        matmul(logits, normalized, engine->model.lm_head,
+               1, config->hidden, config->vocab);
+        if (coli_edge_argmax(logits, (uint32_t)config->vocab,
+                            &request->token_ids[row],
+                            request->scores ? &request->scores[row] : NULL)) {
+            free(logits); free(normalized);
+            return coli_edge_adapter_error(error, error_size,
+                                           "OLMoE Edge head failed");
+        }
+    }
+    free(logits); free(normalized);
+    return 0;
+}
+
+static int olmoe_edge_logits(void *engine_impl,
+                             const ColiEdgeLogitsRequest *request,
+                             char *error, size_t error_size) {
+    OlmoeEdgeEngine *engine = (OlmoeEdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *normalized = falloc(config->hidden);
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        if (request->should_cancel &&
+            request->should_cancel(request->cancel_user_data)) {
+            free(normalized);
+            return coli_edge_adapter_error(error, error_size,
+                                           "OLMoE Edge logits cancelled");
+        }
+        rmsnorm_row(normalized, input + (size_t)row * config->hidden,
+                    engine->model.final_norm, config->hidden, config->eps);
+        matmul(request->logits + (size_t)row * config->vocab,
+               normalized, engine->model.lm_head,
+               1, config->hidden, config->vocab);
+    }
+    free(normalized);
+    return 0;
+}
+
+static const ColiEdgeAdapter olmoe_edge_adapter = {
+    sizeof(ColiEdgeAdapter), COLI_EDGE_ABI_VERSION, "olmoe",
+    olmoe_edge_engine_open, olmoe_edge_engine_destroy,
+    olmoe_edge_tokenize, olmoe_edge_detokenize,
+    olmoe_edge_embed, olmoe_edge_select, olmoe_edge_logits, {0}
+};
+
+int coli_olmoe_edge_adapter_register(void) {
+    return coli_edge_adapter_register(&olmoe_edge_adapter);
+}
+#endif /* COLI_EDGE_ADAPTER */

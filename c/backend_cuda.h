@@ -21,12 +21,97 @@ extern "C" {
 
 #define COLI_CUDA_MAX_DEVICES 16
 
+/* Weight formats the generic per-element device decoder (weight_at,
+ * backend_cuda.cu) can actually decode: f32, int8-row, int4 nibbles (fmt=2 and
+ * the grouped fmt=4, same packing), int2, and fmt=8 (fp8-e4m3 raw bytes,
+ * decoded through the c_e4m3 LUT -- absorb-path support; absorb_scale supplies
+ * its per-128x128-block scale). Nothing else.
+ *
+ * WHY THIS IS A PREDICATE AND NOT A COMMENT. weight_at used to END in the int2
+ * decode as an unguarded fall-through, so ANY other format handed to it -- a
+ * format with a different element width, a different scale geometry, or no
+ * device decoder at all -- was silently read as 2-bit values and returned
+ * plausible-looking numbers. The CPU twins refuse the same input loudly:
+ * qt_addrow and qt_matvec_rows (colibri.c) both exit(1) naming the function and
+ * the fmt. Two backends given identical unsupported input, one refusing and one
+ * fabricating, is the defect -- not the missing decoder.
+ *
+ * Defined here, in the host header, rather than inside the .cu: the host gates
+ * that keep unsupported formats off the device (absorb_fmt_ok and friends) and
+ * the device-side backstop must agree by construction rather than by two people
+ * writing the same list twice, and a CPU test build can then unit-test the truth
+ * table without a GPU or a CUDA toolchain (tests/test_cuda_fmt_guard.c) -- the
+ * same arrangement colibri.c uses for metal_fused_fmt_ok.
+ *
+ * NOT a statement about which formats the CUDA BACKEND supports: quant_matmul
+ * has its own explicit branches for fmt=6 (E8/IQ3) and fmt=7 (MXFP4) that
+ * never route through weight_at (and its own fmt=8 branch for the dense path
+ * -- weight_at's fmt=8 branch serves the absorb kernels, which share the same
+ * c_e4m3 LUT). This predicate is scoped to weight_at's own dispatch, which is
+ * what the absorb and grouped-expert kernels decode through.
+ *
+ * fmt=8 CAVEAT, stated because the truth table alone cannot carry it: a fmt=8
+ * decode additionally requires the e4m3 LUT to have been published to the
+ * configured devices (coli_cuda_fp8_set_lut). The exact mechanism, so the
+ * claim cannot outrun it: coli_cuda_fp8_set_lut copies the table into every
+ * context live AT CALL TIME and sets a process-wide flag; the flag gates
+ * fmt=8 uploads (coli_cuda_tensor_upload refuses until it is set).
+ * coli_cuda_shutdown clears the flag; coli_cuda_init never writes it. That is
+ * enough because init will not rebuild contexts underneath a live set: a
+ * re-init naming the same device set returns success and leaves the contexts,
+ * and the table published to them, untouched, while one naming a different
+ * device set is refused before any context is rebuilt. So the device set
+ * cannot widen past what the last publish covered without going through
+ * shutdown, and no fmt=8 ColiCudaTensor can reach a kernel whose device has
+ * an unwritten table. This predicate
+ * deliberately does not restate that gate: it answers "does weight_at have a
+ * decode branch for this fmt", which is the question the launch-site gates
+ * and the device-side __trap() backstop share. */
+static inline int coli_cuda_weight_at_supported(int fmt) {
+    return fmt == 0 || fmt == 1 || fmt == 2 || fmt == 3 || fmt == 4 || fmt == 8;
+}
+
+/* The two decisions the fmt=8 LUT gate rests on, as pure predicates. They live
+ * here rather than inline in backend_cuda.cu so a host-side test can pin them
+ * with no CUDA toolchain and no GPU (tests/test_cuda_lut_gate.c). backend_cuda.cu
+ * calls BOTH at the real decision sites, so the test pins the engine's own
+ * logic rather than a second copy that could drift from it -- which is the
+ * failure this factoring exists to prevent, the gate having no CI reach
+ * otherwise. */
+
+/* Does the upload gate admit this tensor? Only fmt=8 needs the published
+ * table; every other format decodes without one. */
+static inline int coli_cuda_fp8_gate_admits(int fmt, int lut_ready) {
+    return fmt != 8 || lut_ready != 0;
+}
+
+/* What coli_cuda_init must do with a request while a device set may be live.
+ * BUILD: nothing is live, build the contexts. ACCEPT: the same set is already
+ * live -- return success and touch nothing, so the table published to those
+ * contexts stays valid. REFUSE: a different set is live -- refuse before
+ * rebuilding anything, so the set cannot widen past the last publish. */
+enum { COLI_CUDA_INIT_BUILD = 0, COLI_CUDA_INIT_ACCEPT = 1, COLI_CUDA_INIT_REFUSE = -1 };
+static inline int coli_cuda_init_disposition(int nctx, int count,
+                                             const int *want, const int *live) {
+    int i;
+    if (nctx <= 0) return COLI_CUDA_INIT_BUILD;
+    if (count != nctx) return COLI_CUDA_INIT_REFUSE;
+    for (i = 0; i < count; i++) if (want[i] != live[i]) return COLI_CUDA_INIT_REFUSE;
+    return COLI_CUDA_INIT_ACCEPT;
+}
+
 /* Opaque, persistent device copy of one resident quantized tensor. */
 typedef struct ColiCudaTensor ColiCudaTensor;
 
-/* Devices are CUDA ordinals, not positions in the input list. */
+/* Devices are CUDA ordinals, not positions in the input list.
+ * Repeating the same ordered list preserves active contexts. Changing an
+ * active list returns 0 without replacing it; release tensors and shut down
+ * before selecting a different list. Init/shutdown require caller serialization. */
 COLI_CUDA_DLLEXPORT int coli_cuda_init(const int *devices, int count);
 COLI_CUDA_DLLEXPORT void coli_cuda_shutdown(void);
+/* Number of CUDA devices visible to this process, before a device list is
+ * selected. Returns 0 when the runtime cannot discover any device. */
+COLI_CUDA_DLLEXPORT int coli_cuda_available_device_count(void);
 COLI_CUDA_DLLEXPORT int coli_cuda_device_count(void);
 COLI_CUDA_DLLEXPORT int coli_cuda_device_at(int index);
 COLI_CUDA_DLLEXPORT int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_bytes);
@@ -83,6 +168,15 @@ COLI_CUDA_DLLEXPORT int coli_cuda_matmul_mxfp4(float *y, const float *x,
                                                const unsigned char *e8s,
                                                int S, int I, int O);
 
+/* Streaming Kimi expert: down(SiTU(gate(x), up(x))). Weights are MXFP4
+ * host buffers; intermediate activations remain on device. No weight cache.
+ * Returns 0 on failure; callers must accumulate y only after success. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_mxfp4(float *y, const float *x,
+        const unsigned char *gate_w, const unsigned char *gate_s,
+        const unsigned char *up_w, const unsigned char *up_s,
+        const unsigned char *down_w, const unsigned char *down_s,
+        int S, int D, int I, float b1, float b2);
+
 COLI_CUDA_DLLEXPORT int coli_cuda_matmul(ColiCudaTensor **tensor,
                      float *y, const float *x,
                      const void *weights, const float *scales,
@@ -119,6 +213,14 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                            ColiCudaTensor *const *downs,
                            const int *rows, int count,
                            float *y, const float *x);
+/* Same operation, but force the small-batch grouped kernel family when
+ * pin_small_batch is nonzero.  Speculative verification uses this to keep
+ * CUDA on the same numeric family as S=1 regardless of accepted draft depth. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_pinned(ColiCudaTensor *const *gates,
+                           ColiCudaTensor *const *ups,
+                           ColiCudaTensor *const *downs,
+                           const int *rows, int count,
+                           float *y, const float *x, int pin_small_batch);
 
 /* Decode-only MLA weight-absorption core for one token. kv_b is [H*(Q+V),K]. */
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb(ColiCudaTensor *kv_b,float *ctx,const float *q,
@@ -147,6 +249,8 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_ragged(ColiCudaTensor *kv_b,
 
 COLI_CUDA_DLLEXPORT void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
+COLI_CUDA_DLLEXPORT size_t coli_cuda_alloc_footprint(size_t bytes);
+COLI_CUDA_DLLEXPORT size_t coli_cuda_tensor_vram(const ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_device(const ColiCudaTensor *tensor);
 
 /* Replace a resident tensor's contents without reallocating its device slot. */

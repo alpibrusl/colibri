@@ -40,6 +40,12 @@ tiers, the reason for each placement, and the expected bottleneck. The default
 and router decisions unless `--topk` or `--topp` is passed; those explicit lossy
 overrides print a warning and proceed.
 
+The plan also emits a machine-readable `next_actions` list and renders it in
+the terminal. A missing storage measurement is marked `required`; subsequent
+profiling and tuning work is `recommended`. These actions produce the evidence
+needed to improve a plan on this machine—they do not silently enable an
+unmeasured optimization.
+
 Auto-tier plans size OpenMP from physical cores and bind workers across cores.
 Memory-bound quantized kernels can regress sharply when SMT siblings compete for
 limited memory channels. The GLM, Kimi K3, and OLMoE engines also apply that
@@ -52,6 +58,38 @@ physical-core cap when launched directly; explicit `OMP_NUM_THREADS` and the
 > one core (~20× slowdown). The engine now resets its affinity to all online CPUs
 > right before the re-exec, so explicit `OMP_*` pinning works as documented.
 > `COLI_OMP_TUNED=1` remains the escape hatch that skips the re-exec entirely.
+
+### Hybrid CUDA/CPU OpenMP override
+
+The main GLM engine intentionally skips its active-wait OpenMP tuning when
+`COLI_CUDA` is set. Active worker teams have measured severe regressions by
+contending with CUDA dispatch and synchronization, so a CUDA model that still
+routes some experts through RAM is not, by itself, a reason to change that
+default.
+
+On a specific hybrid host where profiling shows the CPU expert window on the
+critical path, the supported experiment is an explicit user-owned OpenMP
+policy:
+
+```bash
+OMP_WAIT_POLICY=active GOMP_SPINCOUNT=200000 KMP_BLOCKTIME=200 \
+OMP_PROC_BIND=close OMP_DYNAMIC=FALSE \
+COLI_CUDA=1 ./coli run --model /models/glm52_i4 "Benchmark prompt"
+```
+
+The OpenMP runtime reads these variables before `main()`, so they must be set
+on the engine invocation rather than exported after startup. The engine uses
+`overwrite=0`; explicit values remain authoritative. `GOMP_SPINCOUNT` applies
+to libgomp and `KMP_BLOCKTIME` to Intel/LLVM OpenMP runtimes, so carrying both
+keeps the command portable across common builds.
+
+Treat this as a measured per-host override, not a recommended CUDA default.
+Compare it against the unchanged command with stable page-cache state and an
+interleaved run order; report CPU expert time, GPU critical time, disk wait,
+and end-to-end throughput. Reject it if GPU time grows or the CPU window was
+already hidden behind the GPU. Do not use active waiting on Apple Silicon: CPU
+spin has measured slower there by stealing the shared CPU/GPU power budget.
+`COLI_NO_OMP_TUNE=1` remains the explicit passive-policy kill switch.
 
 ```bash
 coli plan --model /models/glm52_i4 --policy quality
@@ -71,20 +109,35 @@ coli tune --model /models/glm52_i4
 coli run --model /models/glm52_i4 --auto-tier "Explain MoE offloading"
 ```
 
-The calibration prompt is generated once. Every candidate then teacher-forces
-the same continuation, so answer length and sampling do not contaminate the
-comparison. The bounded sweep only includes execution knobs such as OpenMP
-thread count, NUMA placement, I/O overlap, direct I/O, and CUDA pipelining. It
-never changes weights, quantization, router decisions, `TOPK`, `TOPP`, or
-sampling.
+GLM generates one calibration continuation and teacher-forces it for every
+candidate. The sibling engines use their common serving protocol instead: one
+engine stays alive for all requests of a candidate, and deterministic prompts
+rotate in a fixed order. That preserves the expert cache and measures a real
+mixed chat instead of repeatedly loading one process or teaching the cache one
+exact prompt. Greedy output is compared per prompt across every candidate; any
+byte drift disqualifies the scheduling change.
+
+The bounded sweep includes execution knobs such as OpenMP thread count, NUMA
+placement, I/O overlap, direct I/O, CUDA pipelining, and DeepSeek V4 expert
+loader lanes. When cold experts remain on disk it also tests 75% and 50% of
+the planner's expert-cache allowance. Dense weights, KV/workspace reservations,
+and the OS reserve are never reduced, and no candidate may exceed the planner's
+safe baseline. GLM/Inkling/OLMoE/Qwen receive the measured slots-per-layer cap;
+V4 receives a whole-process `RAM_GB` ceiling; Kimi receives `K3_EXPERT_GB` under
+its unchanged whole-process ceiling. The sweep never changes weights,
+quantization, router decisions, `TOPK`, `TOPP`, or sampling. Add repeatable
+`--rotate-prompt` options to replace the secondary built-in workload prompt.
 
 A candidate is saved only when median throughput improves by at least 3% while
-expert hit rate remains within 0.5 percentage points and p99 latency stays
-within 20% of the baseline. The winner is then rerun before a final baseline;
-this reverse-order gate gives the baseline any remaining warm-cache advantage
-and rejects startup drift. Otherwise the baseline is recorded and no override
-is applied. Saved profiles are loaded by `--auto-tier`; explicit environment
-variables always win. Use `--no-tune-profile` to bypass a saved profile.
+expert hit rate remains within 0.5 percentage points and reported TTFT/p99
+latency stay within 20% of the baseline. The winner is then rerun before a final
+baseline; this reverse-order gate gives the baseline any remaining warm-cache
+advantage and rejects startup drift. Otherwise the baseline is recorded and no
+override is applied. Saved profiles are loaded by `--auto-tier`; `--ram`,
+`--cap`, `RAM_GB`, `K3_EXPERT_GB`, and other explicit settings always win. A
+resource winner is rechecked against the current plan at every launch, so a
+profile measured with more free RAM is ignored rather than overcommitted later.
+Use `--no-tune-profile` to bypass a saved profile.
 
 Profiles live under `$XDG_CONFIG_HOME/colibri/tuning` (normally
 `~/.config/colibri/tuning`) or `%LOCALAPPDATA%\colibri\tuning` on Windows. A
@@ -149,6 +202,50 @@ family. For byte-exact reproducibility across runs: `DRAFT=0`, plus `IDOT=0
 COLI_CUDA=0` if you also want kernel-family/GPU independence. Acceptance
 percentages are not comparable across engine versions under `--topp`
 ([#163](https://github.com/JustVugg/colibri/issues/163) has the full story).
+
+## Approximate mode: `DEGRADE_ZERO` (opt-in, OLMoE-calibrated)
+
+`DEGRADE_ZERO=1` enables an opt-in degraded inference policy: when a prefetch
+deadline is missed, experts whose per-position gate weight falls below
+`DEGRADE_TAU` (default 0.03) are **zero-filled instead of loaded from disk**.
+The slot contributes nothing to the layer output; the approximation is the
+dropped mass, not a rescaled version of it (renorm is catastrophically worse —
+see issue #865 for the measured A/B).
+
+This reduces blocking disk reads on NVMe-bound workloads at the cost of a small
+quality hit. Measured on OLMoE-1B-7B:
+
+| `DEGRADE_TAU` | slots zeroed | ppl delta |
+|---|---|---|
+| 0.03 | ~22% | +2.9% |
+| 0.05 | ~60% | +41% |
+
+**These numbers are OLMoE-specific.** GLM-5.2 (`norm_topk=1`) and Kimi K3 have
+different router contracts and expert counts — their operating points have not
+been measured. Until they are, treat `tau=0.03` as a starting point and verify
+quality on your model before relying on it.
+
+**These numbers assume a warm expert cache.** Cold-start sessions — where the cache
+begins empty and all experts miss initially — will see higher drop rates until the LRU
+fills. The steady-state perplexity delta above is what was measured; cold-start transient
+behavior has not been separately characterized.
+
+The feature is decode-only (`S≤4` guard, same as `EXPERT_BUDGET`): dropping
+experts during prefill corrupts the KV cache. A rescue rule ensures no token
+position is left with zero routed experts. Resident (pinned or LRU-cached)
+experts are never dropped regardless of weight.
+
+The `[PROF]` footer reports the total zeroed slot count and the top-3 layers by
+drop share when the flag is active, so a miscalibrated tau is visible rather
+than silent.
+
+```bash
+DEGRADE_ZERO=1 DEGRADE_TAU=0.03 COLI_MODEL=/nvme/glm52_i4 ./coli chat
+```
+
+See [ENVIRONMENT.md](ENVIRONMENT.md) for the full variable reference and
+[issue #865](https://github.com/JustVugg/colibri/issues/865) for the
+measurement methodology.
 
 ## Conversations reopen warm
 

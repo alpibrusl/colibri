@@ -445,6 +445,28 @@ class TestRansRepack(unittest.TestCase):
             self.assertEqual(r.returncode, 1, msg=f"{label}: {r.stdout}")
             self.assertIn("REFUSE", r.stdout, msg=f"{label}: no REFUSE line")
 
+    def test_verifier_survives_a_non_utf8_stdout(self):
+        """On a Korean or Japanese Windows (cp949, cp932) a redirected stdout
+        is encoded in a code page with no U+2014, and the verifier's own
+        `[note] ... no repack-manifest.json — ...` line raised
+        UnicodeEncodeError. Its E_INTERNAL fallback printed the same text and
+        raised again, so a valid shard without a manifest came back as exit 1,
+        a traceback and no verdict. PYTHONIOENCODING stands in for that code
+        page, so this runs the same on every platform, and the output is read
+        back in that code page, the way such a caller would read it."""
+        shard = self.repack(self.root / "codepage")[0]
+        (shard.parent / "repack-manifest.json").unlink()
+        env = dict(os.environ, PYTHONIOENCODING="cp949")
+        r = subprocess.run([sys.executable, str(TOOLS / "rans_verify.py"),
+                            str(shard)], capture_output=True, env=env)
+        out = r.stdout.decode("cp949")
+        err = r.stderr.decode("cp949", "backslashreplace")
+        self.assertNotIn("Traceback", err, msg=err)
+        self.assertEqual(r.returncode, 0, msg=out + err)
+        self.assertIn("no repack-manifest.json", out)
+        self.assertIn("whole-artifact digest check skipped", out)
+        self.assertIn("RESULT: TRUST", out)
+
     def test_partial_output_refusal(self):
         """An outdir already holding repack output is refused (crash
         evidence: an interrupted set must not be papered over); --force
@@ -608,6 +630,46 @@ class TestRansRepack(unittest.TestCase):
         r = run_tool("rans_verify.py", str(shard))
         self.assertEqual(r.returncode, 1, msg=r.stdout)
         self.assertIn("E_DIGEST_MISSING", r.stdout)
+
+    def test_census_layout_accounting(self):
+        """--census (#594): every record's bytes fully attributed — the framed
+        extent is exactly the round16 header plus the round16-padded payload,
+        offsets point at real record starts, and the per-shard sums close."""
+        out = self.root / "census"
+        shard = self.repack(out)[0]
+        r = run_tool("repack_rans.py", "--census", str(out))
+        self.assertEqual(r.returncode, 0, msg=r.stdout + r.stderr)
+        cen = json.loads((out / "rans-census.json").read_text())
+        self.assertEqual(cen["format"], rf.FORMAT_NAME)
+        sh = cen["shards"][0]
+        rows = {row["record_id"]: row for row in sh["records"]}
+        self.assertEqual(sorted(rows), sorted(self.weights))
+
+        header, data_start = rf.read_header(str(shard))
+        head_bytes = rf.record_header_bytes()
+        for name, (raw, _) in self.weights.items():
+            row = rows[name]
+            # logical length is the byte-exact int4 content
+            self.assertEqual(row["logical_bytes"], len(raw), name)
+            # full attribution: extent == header + payload + its round16 pad
+            pad = (row["physical_extent_bytes"] - head_bytes
+                   - row["encoded_payload_bytes"])
+            self.assertGreaterEqual(pad, 0, name)
+            self.assertLessEqual(pad, 15, name)
+            self.assertEqual(row["framing_bytes"],
+                             row["physical_extent_bytes"]
+                             - row["encoded_payload_bytes"], name)
+            self.assertNotIn("UNATTRIBUTED_BYTES", row, name)
+            # physical_offset really points at this record's bytes
+            blob, info = rf.read_tensor_bytes(str(shard), header, data_start, name)
+            self.assertEqual(row["physical_offset"],
+                             data_start + info["data_offsets"][0], name)
+            self.assertEqual(row["physical_extent_bytes"], len(blob), name)
+            # no per-record physical alignment in this layout, stated not omitted
+            self.assertEqual(row["alignment_bytes"], 0, name)
+        self.assertEqual(sh["sum_physical_extent_bytes"],
+                         sum(r_["physical_extent_bytes"] for r_ in sh["records"]))
+        self.assertEqual(sh["file_bytes"], shard.stat().st_size)
 
     def test_quantize_freq_ties_and_termination(self):
         """Exact fractional-remainder ties must break identically everywhere

@@ -20,6 +20,15 @@
  */
 #ifdef _WIN32
 
+/* FILE_ID_INFO / FileIdInfo (coli_win32_loader_probe, below) are gated behind
+ * _WIN32_WINNT >= _WIN32_WINNT_WIN8 in mingw-w64's winbase.h. MSVC exposes
+ * them unconditionally, so this only bites the MinGW build -- and only where
+ * the file-identity block is actually compiled, i.e. under COLI_HIP_DLL or
+ * COLI_LOADER_TEST_API. Set the floor before <windows.h> is pulled in. */
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0602   /* Windows 8 */
+#endif
+
 #include <stdio.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -53,6 +62,7 @@
 typedef int            (*fn_init)(const int *devices, int count);
 typedef void           (*fn_shutdown)(void);
 typedef int            (*fn_device_count)(void);
+typedef int            (*fn_available_device_count)(void);
 typedef int            (*fn_device_at)(int index);
 typedef int            (*fn_mem_info)(int device, size_t *free_bytes, size_t *total_bytes);
 typedef int            (*fn_device_integrated)(int device);
@@ -68,6 +78,12 @@ typedef int            (*fn_expert_mlp)(ColiCudaTensor *gate, ColiCudaTensor *up
 typedef int            (*fn_expert_group)(ColiCudaTensor *const *gates, ColiCudaTensor *const *ups,
                                           ColiCudaTensor *const *downs, const int *rows, int count,
                                           float *y, const float *x);
+typedef int            (*fn_expert_group_pinned)(ColiCudaTensor *const *gates,
+                                                 ColiCudaTensor *const *ups,
+                                                 ColiCudaTensor *const *downs,
+                                                 const int *rows, int count,
+                                                 float *y, const float *x,
+                                                 int pin_small_batch);
 typedef int            (*fn_expert_group_issue)(ColiCudaTensor *const *gates,
                                                 ColiCudaTensor *const *ups,
                                                 ColiCudaTensor *const *downs,
@@ -84,8 +100,17 @@ typedef int            (*fn_fp8_set_lut)(const float *lut);
 typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const float *x,
                                     const void *weights, const float *scales,
                                     int fmt, int S, int I, int O, int device, int gs);
+typedef int            (*fn_matmul_mxfp4)(float *y, const float *x, const unsigned char *q4,
+                                          const unsigned char *e8s, int S, int I, int O);
+typedef int (*fn_expert_mxfp4)(float *y, const float *x,
+        const unsigned char *gate_w, const unsigned char *gate_s,
+        const unsigned char *up_w, const unsigned char *up_s,
+        const unsigned char *down_w, const unsigned char *down_s,
+        int S, int D, int I, float b1, float b2);
 typedef void           (*fn_tensor_free)(ColiCudaTensor *tensor);
 typedef size_t         (*fn_tensor_bytes)(const ColiCudaTensor *tensor);
+typedef size_t         (*fn_tensor_vram)(const ColiCudaTensor *tensor);
+typedef size_t         (*fn_alloc_footprint)(size_t bytes);
 typedef int            (*fn_tensor_device)(const ColiCudaTensor *tensor);
 
 /* --- #111 GPU resident pipeline additions (matched to backend_cuda.h) --- */
@@ -140,6 +165,7 @@ static struct {
     fn_init            init;
     fn_shutdown        shutdown;
     fn_device_count    device_count;
+    fn_available_device_count available_device_count;
     fn_device_at       device_at;
     fn_mem_info        mem_info;
     fn_device_integrated device_integrated;
@@ -148,6 +174,7 @@ static struct {
     fn_group_stats_device group_stats_device;
     fn_expert_mlp      expert_mlp;
     fn_expert_group    expert_group;
+    fn_expert_group_pinned expert_group_pinned;
     fn_expert_group_issue expert_group_issue;
     fn_expert_group_take expert_group_take;
     fn_attention_absorb attention_absorb;
@@ -156,8 +183,12 @@ static struct {
     fn_e8_set_grid     e8_set_grid;
     fn_fp8_set_lut     fp8_set_lut;
     fn_matmul          matmul;
+    fn_matmul_mxfp4    matmul_mxfp4;
+    fn_expert_mxfp4    expert_mxfp4;
     fn_tensor_free     tensor_free;
     fn_tensor_bytes    tensor_bytes;
+    fn_tensor_vram     tensor_vram;
+    fn_alloc_footprint alloc_footprint;
     fn_tensor_device   tensor_device;
 
     fn_attention_absorb_batch attention_absorb_batch;
@@ -1236,11 +1267,15 @@ static int coli_cuda_load(void){
 
 #ifdef COLI_HIP_DLL
     /* No synchronisation here, and that is a traced conclusion rather than an
-     * assumption: coli_cuda_load has exactly two callers, coli_cuda_init and
-     * coli_cuda_attention_project_ragged. colibri.c calls init on the main
-     * thread before model initialisation and therefore before any worker
-     * thread exists, and the ragged path is reachable only after that init
-     * succeeded. If a third caller ever appears, or the guard in colibri.c
+     * assumption: coli_cuda_load has exactly three callers -- coli_cuda_init,
+     * coli_cuda_attention_project_ragged, and (via the wrapper of #1577)
+     * coli_cuda_available_device_count, which qwen36_tier.c calls while it is
+     * still choosing the devices to hand to init. colibri.c calls init on the
+     * main thread before model initialisation and therefore before any worker
+     * thread exists; the ragged path is reachable only after that init
+     * succeeded; and the tier's count is asked on that same main thread during
+     * start-up, before the tier has created any thread of its own. If a caller
+     * outside that start-up window ever appears, or the guard in colibri.c
      * moves, this needs an explicit lock instead. */
     if(!coli_hip_configure(&cfg)) return 0;
     runtime = coli_hip_acquire_runtime(&cfg);
@@ -1391,6 +1426,7 @@ static int coli_cuda_load(void){
     RESOLVE(group_stats_device, fn_group_stats_device)
     RESOLVE(expert_mlp,     fn_expert_mlp)
     RESOLVE(expert_group,   fn_expert_group)
+    RESOLVE_OPT(expert_group_pinned, fn_expert_group_pinned)
     RESOLVE(expert_group_issue, fn_expert_group_issue)
     RESOLVE(expert_group_take, fn_expert_group_take)
     RESOLVE(attention_absorb, fn_attention_absorb)
@@ -1399,8 +1435,21 @@ static int coli_cuda_load(void){
     RESOLVE_OPT(e8_set_grid, fn_e8_set_grid)
     RESOLVE_OPT(fp8_set_lut, fn_fp8_set_lut)
     RESOLVE(matmul,         fn_matmul)
+    /* Kimi K3's MXFP4 expert matmul. Optional: a DLL built before it exports
+     * nothing by this name, and the wrapper's 0 is the engine's own "fall back
+     * to CPU" result, so an older DLL still serves GLM and Qwen3.6 (#1405). */
+    RESOLVE_OPT(matmul_mxfp4,   fn_matmul_mxfp4)
+    RESOLVE_OPT(expert_mxfp4,   fn_expert_mxfp4)
+    RESOLVE_OPT(available_device_count, fn_available_device_count)   /* qwen36 tier (#1533); older DLLs fall back to device_count */
     RESOLVE(tensor_free,    fn_tensor_free)
     RESOLVE(tensor_bytes,   fn_tensor_bytes)
+    /* Optional, same reasoning as e8_set_grid above: a DLL predating #687
+     * leaves these NULL and the wrappers fall back to the logical byte
+     * count, which is exactly the behaviour that shipped before. Using
+     * RESOLVE here instead would unload the whole CUDA backend over one
+     * missing symbol - a far worse failure than the over-commit it fixes. */
+    RESOLVE_OPT(tensor_vram,     fn_tensor_vram)
+    RESOLVE_OPT(alloc_footprint, fn_alloc_footprint)
     RESOLVE(tensor_device,  fn_tensor_device)
 
     RESOLVE(attention_absorb_batch, fn_attention_absorb_batch)
@@ -1478,6 +1527,21 @@ int coli_cuda_device_count(void){
     return g_cuda.device_count();
 }
 
+/* qwen36_tier.c's device selection asks for the usable count; the loader had
+ * no wrapper for it, so the first CUDA_DLL build of qwen36 that compiled the
+ * tier in failed to link (#1533). It asks BEFORE coli_cuda_init -- the count
+ * decides which devices init is given -- so this wrapper has to load the DLL
+ * itself, exactly as coli_cuda_attention_project_ragged does: gating on
+ * g_cuda.available alone answered 0 on every Windows host and the tier fell
+ * back to the CPU path unless COLI_GPUS was set (#1577). Optional export:
+ * a DLL predating it leaves the pointer NULL and the count falls back to
+ * device_count(). */
+int coli_cuda_available_device_count(void){
+    if(!coli_cuda_load()) return 0;
+    if(!g_cuda.available_device_count) return g_cuda.device_count();   /* a DLL from before the export */
+    return g_cuda.available_device_count();
+}
+
 int coli_cuda_device_at(int index){
     if(!g_cuda.available) return -1;
     return g_cuda.device_at(index);
@@ -1532,6 +1596,19 @@ int coli_cuda_expert_group(ColiCudaTensor *const *gates, ColiCudaTensor *const *
     return g_cuda.expert_group(gates, ups, downs, rows, count, y, x);
 }
 
+int coli_cuda_expert_group_pinned(ColiCudaTensor *const *gates,
+                                  ColiCudaTensor *const *ups,
+                                  ColiCudaTensor *const *downs,
+                                  const int *rows, int count,
+                                  float *y, const float *x,
+                                  int pin_small_batch){
+    if(!g_cuda.available) return 0;
+    if(g_cuda.expert_group_pinned)
+        return g_cuda.expert_group_pinned(gates,ups,downs,rows,count,y,x,pin_small_batch);
+    if(pin_small_batch) return 0; /* old DLL: preserve SPEC_PIN via the CPU fallback */
+    return g_cuda.expert_group(gates,ups,downs,rows,count,y,x);
+}
+
 int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
                                  ColiCudaTensor *const *ups,
                                  ColiCudaTensor *const *downs,
@@ -1580,6 +1657,21 @@ int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x,
     return g_cuda.matmul(tensor, y, x, weights, scales, fmt, S, I, O, device, gs);
 }
 
+int coli_cuda_matmul_mxfp4(float *y, const float *x, const unsigned char *q4,
+                           const unsigned char *e8s, int S, int I, int O){
+    if(!g_cuda.available || !g_cuda.matmul_mxfp4) return 0;   /* 0 = CPU path */
+    return g_cuda.matmul_mxfp4(y, x, q4, e8s, S, I, O);
+}
+
+int coli_cuda_expert_mxfp4(float *y, const float *x,
+        const unsigned char *gate_w, const unsigned char *gate_s,
+        const unsigned char *up_w, const unsigned char *up_s,
+        const unsigned char *down_w, const unsigned char *down_s,
+        int S, int D, int I, float b1, float b2) {
+    if (!g_cuda.available || !g_cuda.expert_mxfp4) return 0;
+    return g_cuda.expert_mxfp4(y, x, gate_w, gate_s, up_w, up_s, down_w, down_s, S, D, I, b1, b2);
+}
+
 void coli_cuda_tensor_free(ColiCudaTensor *tensor){
     if(g_cuda.available && g_cuda.tensor_free) g_cuda.tensor_free(tensor);
 }
@@ -1587,6 +1679,22 @@ void coli_cuda_tensor_free(ColiCudaTensor *tensor){
 size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor){
     if(!g_cuda.available) return 0;
     return g_cuda.tensor_bytes(tensor);
+}
+
+/* Falls back to the LOGICAL size when the DLL predates #687. That is an
+ * under-count, and it is the pre-existing behaviour rather than a new
+ * failure mode: the tier over-commits exactly as much as it always did.
+ * Returning 0 here would be far worse - the caller would charge nothing
+ * for an expert it just placed. */
+size_t coli_cuda_tensor_vram(const ColiCudaTensor *tensor){
+    if(!g_cuda.available) return 0;
+    if(!g_cuda.tensor_vram) return g_cuda.tensor_bytes(tensor);
+    return g_cuda.tensor_vram(tensor);
+}
+
+size_t coli_cuda_alloc_footprint(size_t bytes){
+    if(!g_cuda.available || !g_cuda.alloc_footprint) return bytes;
+    return g_cuda.alloc_footprint(bytes);
 }
 
 int coli_cuda_tensor_device(const ColiCudaTensor *tensor){

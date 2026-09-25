@@ -27,10 +27,12 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <pthread.h>
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
 #include <sys/select.h>                              /* serve-loop stdin poll (POSIX); inkling serves on Linux */
 #endif
+#include "cli_args.h"
 #include "st.h"
 #include "tok.h"
 #ifdef _OPENMP
@@ -38,7 +40,20 @@
 #endif
 #include "omp_tune.h"
 #include "route_trace.h"
-#include "kv_prefix.h"                          /* KV prefix reuse (shared) */                          /* shared routing telemetry (#700) */
+#include "kv_prefix.h"
+#include "pin_pool.h"                          /* KV prefix reuse (shared) */                          /* shared routing telemetry (#700) */
+#include "serve_codec.h"
+#include "serve_budget.h"
+#ifdef COLI_SEGMENT_ADAPTER
+#include "segment_runtime.h"
+#include "segment_adapters.h"
+#include "segment_adapter_internal.h"
+#endif
+#ifdef COLI_EDGE_ADAPTER
+#include "edge_runtime.h"
+#include "edge_adapters.h"
+#include "edge_tok_internal.h"
+#endif
 #ifdef COLI_CUDA
 #include "backend_cuda_ink.h"
 static int g_cuda = 0;
@@ -123,7 +138,11 @@ typedef struct {
     int8_t *q13, *q2;                     /* bits>0: runtime-quantized int8 */
     float *f13, *f2;                      /* bits==0: raw f32 (oracle) */
 } Slot;
-typedef struct { Slot *slots; int n, cap; } LCache;
+typedef struct {
+    Slot *slots;
+    int *slot_by_expert;                  /* expert id -> local slot, -1 if absent */
+    int n, cap;
+} LCache;
 
 typedef struct {
     Cfg c;
@@ -141,11 +160,12 @@ typedef struct {
     LCache *cache;
     int64_t rb13, rb2;                    /* container row-bytes (0 = not container) */
     uint32_t **eusage;                    /* per-layer expert selection counts */
+    uint8_t **ehit;                       /* experts routed this turn, for HITS (dashboard Brain) */
     int npin;                             /* pinned experts per sparse layer */
     uint64_t clock, hits, miss;
     uint64_t ereq, euse;                  /* routed richiesti (topk) vs usati dopo TOPP */
     double t_fill, t_expert, t_shared, t_attn, t_route;   /* phase timers */
-    float **K, **V; int kv_len, max_t;    /* per-layer [kv][max_t][hd] */
+    float **K, **V; int kv_len, max_t;    /* per-layer [kv][kv_ring_rows][hd]; sliding layers are a t%window ring */
     float **cs[4];                        /* conv states, [n_layers][C*(K-1)] */
     double dense_load_s;
     /* KV prefix reuse: what the current K/V and conv states were built from.
@@ -207,16 +227,73 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
         #pragma omp parallel for schedule(static)
         for (int o = 0; o < O; o++) {
             const uint16_t *w = W + (int64_t)o * I;
-            for (int s = 0; s < S; s++) {
-                const uint16_t *xs = xh + (int64_t)s * I;
+            int s = 0;
+            for (; s + 3 < S; s += 4) {
+                const uint16_t *x0 = xh + (int64_t)(s+0)*I;
+                const uint16_t *x1 = xh + (int64_t)(s+1)*I;
+                const uint16_t *x2 = xh + (int64_t)(s+2)*I;
+                const uint16_t *x3 = xh + (int64_t)(s+3)*I;
+                __m512 a0 = _mm512_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+                for (int i = 0; i < I; i += 32) {
+                    __m512bh wb = (__m512bh)_mm512_loadu_si512(w + i);
+                    a0 = _mm512_dpbf16_ps(a0, (__m512bh)_mm512_loadu_si512(x0 + i), wb);
+                    a1 = _mm512_dpbf16_ps(a1, (__m512bh)_mm512_loadu_si512(x1 + i), wb);
+                    a2 = _mm512_dpbf16_ps(a2, (__m512bh)_mm512_loadu_si512(x2 + i), wb);
+                    a3 = _mm512_dpbf16_ps(a3, (__m512bh)_mm512_loadu_si512(x3 + i), wb);
+                }
+                y[(int64_t)(s+0)*O + o] = _mm512_reduce_add_ps(a0);
+                y[(int64_t)(s+1)*O + o] = _mm512_reduce_add_ps(a1);
+                y[(int64_t)(s+2)*O + o] = _mm512_reduce_add_ps(a2);
+                y[(int64_t)(s+3)*O + o] = _mm512_reduce_add_ps(a3);
+            }
+            for (; s < S; s++) {
+                const uint16_t *xs = xh + (int64_t)s*I;
                 __m512 acc = _mm512_setzero_ps();
                 for (int i = 0; i < I; i += 32)
                     acc = _mm512_dpbf16_ps(acc, (__m512bh)_mm512_loadu_si512(xs + i),
                                                 (__m512bh)_mm512_loadu_si512(w + i));
-                y[(int64_t)s * O + o] = _mm512_reduce_add_ps(acc);
+                y[(int64_t)s*O + o] = _mm512_reduce_add_ps(acc);
             }
         }
         free(xh);
+        return;
+    }
+#endif
+    /* Prefill tile: decode each bf16 weight once for four independent rows.
+     * Explicit mul+add (rather than a C expression that the compiler may fuse)
+     * matches the non-FMA scalar oracle bit for bit.  Every SIMD lane still
+     * accumulates i=0..I-1 in the original order. */
+#if defined(__AVX2__)
+    if (S > 1) {
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < O; o++) {
+            const uint16_t *w = W + (int64_t)o * I;
+            int s = 0;
+            for (; s + 3 < S; s += 4) {
+                const float *x0 = x + (int64_t)(s+0)*I;
+                const float *x1 = x + (int64_t)(s+1)*I;
+                const float *x2 = x + (int64_t)(s+2)*I;
+                const float *x3 = x + (int64_t)(s+3)*I;
+                __m128 acc = _mm_setzero_ps();
+                for (int i = 0; i < I; i++) {
+                    union { uint32_t u; float f; } v = { (uint32_t)w[i] << 16 };
+                    __m128 xv = _mm_set_ps(x3[i], x2[i], x1[i], x0[i]);
+                    acc = _mm_add_ps(acc, _mm_mul_ps(xv, _mm_set1_ps(v.f)));
+                }
+                float a[4]; _mm_storeu_ps(a, acc);
+                y[(int64_t)(s+0)*O + o] = a[0]; y[(int64_t)(s+1)*O + o] = a[1];
+                y[(int64_t)(s+2)*O + o] = a[2]; y[(int64_t)(s+3)*O + o] = a[3];
+            }
+            for (; s < S; s++) {
+                const float *xs = x + (int64_t)s * I;
+                float acc = 0.f;
+                for (int i = 0; i < I; i++) {
+                    union { uint32_t u; float f; } v = { (uint32_t)w[i] << 16 };
+                    acc += xs[i] * v.f;
+                }
+                y[(int64_t)s * O + o] = acc;
+            }
+        }
         return;
     }
 #endif
@@ -240,16 +317,71 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
  * una scala f32 ogni `gs` elementi lungo I (ng = ceil(I/gs) scale per riga).
  * Differenza da matmul_q4 (per-riga): la scala cambia DENTRO la riga, quindi
  * l'accumulo va chiuso a ogni gruppo invece che una volta sola a fine riga. */
+#if defined(__AVX2__) && defined(__FMA__)
+static inline float matmul_i4g_row_fma(const float *xs, const uint8_t *w,
+                                       const float *sc, int I, int gs, int ng) {
+    __m128 acc = _mm_setzero_ps();
+    for (int g = 0; g < ng; g++) {
+        int i0 = g*gs, i1 = i0+gs; if (i1 > I) i1 = I;
+        __m128 part = _mm_setzero_ps();
+        for (int i = i0; i < i1; i++) {
+            uint8_t b = w[i >> 1]; int q = (i & 1) ? (b >> 4) : (b & 15);
+            part = _mm_fmadd_ss(_mm_set_ss(xs[i]), _mm_set_ss((float)(q-8)), part);
+        }
+        acc = _mm_add_ss(acc, _mm_mul_ss(part, _mm_set_ss(sc[g])));
+    }
+    return _mm_cvtss_f32(acc);
+}
+#endif
 static void matmul_i4g(float *y, const float *x, const uint8_t *p, const float *scale,
                        int S, int I, int O, int gs) {
     int ng = (I + gs - 1) / gs;
     int64_t rb = (I + 1) / 2;
+#if defined(__AVX2__) && defined(__FMA__)
+    /* Four prompt rows share nibble unpack and scale loads.  The explicit FMA
+     * for each lane and the group-boundary mul+add match the scalar kernel's
+     * generated operation order bit for bit. */
+    if (S > 1) {
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < O; o++) {
+            const uint8_t *w = p + (int64_t)o * rb;
+            const float *sc = scale + (int64_t)o * ng;
+            int s = 0;
+            for (; s + 3 < S; s += 4) {
+                const float *x0 = x + (int64_t)(s+0)*I, *x1 = x + (int64_t)(s+1)*I;
+                const float *x2 = x + (int64_t)(s+2)*I, *x3 = x + (int64_t)(s+3)*I;
+                __m128 acc = _mm_setzero_ps();
+                for (int g = 0; g < ng; g++) {
+                    int i0 = g*gs, i1 = i0+gs; if (i1 > I) i1 = I;
+                    __m128 part = _mm_setzero_ps();
+                    for (int i = i0; i < i1; i++) {
+                        uint8_t b = w[i >> 1]; int q = (i & 1) ? (b >> 4) : (b & 15);
+                        __m128 xv = _mm_set_ps(x3[i], x2[i], x1[i], x0[i]);
+                        part = _mm_fmadd_ps(xv, _mm_set1_ps((float)(q-8)), part);
+                    }
+                    acc = _mm_add_ps(acc, _mm_mul_ps(part, _mm_set1_ps(sc[g])));
+                }
+                float a[4]; _mm_storeu_ps(a, acc);
+                y[(int64_t)(s+0)*O + o] = a[0]; y[(int64_t)(s+1)*O + o] = a[1];
+                y[(int64_t)(s+2)*O + o] = a[2]; y[(int64_t)(s+3)*O + o] = a[3];
+            }
+            for (; s < S; s++) {
+                const float *xs = x + (int64_t)s*I;
+                y[(int64_t)s*O + o] = matmul_i4g_row_fma(xs, w, sc, I, gs, ng);
+            }
+        }
+        return;
+    }
+#endif
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; o++) {
         const uint8_t *w = p + (int64_t)o * rb;
         const float *sc = scale + (int64_t)o * ng;
         for (int s = 0; s < S; s++) {
             const float *xs = x + (int64_t)s * I;
+#if defined(__AVX2__) && defined(__FMA__)
+            y[(int64_t)s * O + o] = matmul_i4g_row_fma(xs, w, sc, I, gs, ng);
+#else
             float acc = 0.f;
             for (int g = 0; g < ng; g++) {
                 int i0 = g * gs, i1 = i0 + gs; if (i1 > I) i1 = I;
@@ -262,6 +394,7 @@ static void matmul_i4g(float *y, const float *x, const uint8_t *p, const float *
                 acc += part * sc[g];               /* scala chiusa per gruppo */
             }
             y[(int64_t)s * O + o] = acc;
+#endif
         }
     }
 }
@@ -280,7 +413,13 @@ static void matmul_i8r(float *y, const float *x, const int8_t *q, const float *s
     }
 }
 
+#ifdef COLI_INKLING_SHARED_BATCH_TEST
+static uint64_t g_matmul_w_calls;
+#endif
 static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
+#ifdef COLI_INKLING_SHARED_BATCH_TEST
+    g_matmul_w_calls++;
+#endif
 #ifdef COLI_CUDA
     if (W.dev) {
         if (ink_cuda_matmul_bf16(y, x, W.dev, S, I, O) == 0) return;
@@ -321,7 +460,11 @@ static inline __m256i i8dot_block(__m256i acc, __m256i a, __m256i b) {
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
 #if defined(__AVX2__)
     static int idot = -1;
-    if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
+    /* Opt-in (IDOT=1), not default: the fast path only exists under __AVX2__
+     * and quantizes ACTIVATIONS per 32-block — the same model produced
+     * different tokens on x86 vs ARM with the old on-by-default. Same class
+     * and same fix as olmoe (#1044) and qwen36 (#712 review). */
+    if (idot < 0) { const char *e = getenv("IDOT"); idot = (e && atoi(e)); }
     if (idot && I % 32 == 0 && I <= 8192) {
         int nb = I / 32;
         int8_t xi[8192]; float xs[256];
@@ -366,7 +509,11 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
 static void matmul_q4(float *y, const float *x, const uint8_t *p, const float *scale, int I, int O) {
 #if defined(__AVX2__)
     static int idot = -1;
-    if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
+    /* Opt-in (IDOT=1), not default: the fast path only exists under __AVX2__
+     * and quantizes ACTIVATIONS per 32-block — the same model produced
+     * different tokens on x86 vs ARM with the old on-by-default. Same class
+     * and same fix as olmoe (#1044) and qwen36 (#712 review). */
+    if (idot < 0) { const char *e = getenv("IDOT"); idot = (e && atoi(e)); }
     if (idot && I % 32 == 0 && I <= 8192) {
         int nb = I / 32;
         int8_t xi[8192]; float xs[256];
@@ -749,7 +896,10 @@ static void unpack_rows(const uint8_t *raw, int8_t *q, int64_t rows, int64_t col
 
 static double mem_avail_bytes(void);
 
-static void model_init(Model *m, const char *snap, int cap, int bits) {
+static void model_init_range(Model *m, const char *snap, int cap, int bits,
+                             int layer_begin, int layer_end,
+                             int load_boundaries, int allocate_state,
+                             int init_telemetry) {
     memset(m, 0, sizeof(*m));
     m->quant_bits = bits;
     load_cfg(&m->c, snap);
@@ -767,6 +917,13 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         }
     }
     Cfg *c = &m->c;
+    if (layer_end == 0) layer_end = c->n_layers;
+    if (layer_begin < 0 || layer_begin >= layer_end ||
+        layer_end > c->n_layers) {
+        fprintf(stderr, "invalid Inkling layer range [%d,%d) for %d layers\n",
+                layer_begin, layer_end, c->n_layers);
+        exit(1);
+    }
     int D = c->hidden, K = c->conv_k;
     double t0 = now_s();
 #ifdef COLI_CUDA
@@ -793,15 +950,17 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         }
     }
 #endif
-    m->embed      = load_w(m, "model.embed_tokens.weight", 0);
-    m->embed_norm = st_has(&m->S,"model.embed_norm.weight") ? load_t(m,"model.embed_norm.weight") : NULL;
-    m->final_norm = load_t(m, "model.norm.weight");
-    m->lm_head    = load_w(m, "lm_head.weight", 1);
+    if (load_boundaries) {
+        m->embed      = load_w(m, "model.embed_tokens.weight", 0);
+        m->embed_norm = st_has(&m->S,"model.embed_norm.weight") ? load_t(m,"model.embed_norm.weight") : NULL;
+        m->final_norm = load_t(m, "model.norm.weight");
+        m->lm_head    = load_w(m, "lm_head.weight", 1);
+    }
     /* Inkling's audio "tower" is one embedding table + one RMSNorm. The int4
      * containers are text-only, so these usually arrive via an audio.safetensors
      * sidecar dropped in the snapshot dir (st_init indexes every *.safetensors).
      * Absent tensors = text-only engine, exactly as before. */
-    if (st_has(&m->S, "model.audio.encoder.weight")) {
+    if (load_boundaries && st_has(&m->S, "model.audio.encoder.weight")) {
         /* SEC (GHSA-w696): mel_bins/mel_vocab come straight from config.json with
          * no bounds. audio_embed_row indexes the table at (b*mel_vocab+v)*D with
          * b<mel_bins, v<mel_vocab — so the table must have exactly
@@ -823,8 +982,10 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
                 c->mel_bins, c->mel_vocab, D);
     }
     m->L = calloc(c->n_layers, sizeof(Layer));
+    for (int j = 0; j < 4; j++)
+        m->cs[j] = calloc(c->n_layers, sizeof(float*));
     char nm[320];
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = layer_begin; i < layer_end; i++) {
         Layer *l = &m->L[i];
         #define LD(field, suffix)  snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm)
         #define LDW(field, suffix) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_w(m,nm,1)
@@ -876,8 +1037,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         #undef LDW
         /* conv states: raw inputs of the previous K-1 steps, zero-init */
         int kvdim = L_KV(c,i) * L_HD(c,i);
-        for (int j = 0; j < 4; j++) {
-            if (!m->cs[j]) m->cs[j] = calloc(c->n_layers, sizeof(float*));
+        for (int j = 0; j < 4; j++) if (allocate_state) {
             int C = (j < 2) ? kvdim : D;
             m->cs[j][i] = calloc((int64_t)C * (K-1), sizeof(float));
         }
@@ -885,7 +1045,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     /* container detection: converted snapshots store experts as U8 + .qs.
      * rb13/rb2 = bytes per packed row (D/2|D and I/2|I for int4|int8) */
     int64_t I = c->moe_inter, E = c->n_experts;
-    for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) {
+    for (int i = layer_begin; i < layer_end; i++) if (c->sparse[i]) {
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj",i);
         st_tensor *t = st_find(&m->S, nm);
         if (t && t->dtype == 3) {
@@ -898,7 +1058,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         }
         break;
     }
-    int nsp = 0; for (int i = 0; i < c->n_layers; i++) nsp += c->sparse[i];
+    int nsp = 0; for (int i = layer_begin; i < layer_end; i++) nsp += c->sparse[i];
     int64_t slotb = m->xq ? m->rb13*2*I + m->rb2*D + (2*I+D)*4
                   : m->quant_bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4;
     if (cap <= 0) {   /* auto: fit the LRU in available RAM, 20% + 4 GB headroom */
@@ -910,7 +1070,16 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
                 cap, (double)cap*slotb*nsp/1e9);
     }
     m->cache = calloc(c->n_layers, sizeof(LCache));
-    for (int i = 0; i < c->n_layers; i++) { m->cache[i].cap = cap; m->cache[i].slots = calloc(cap, sizeof(Slot)); }
+    for (int i = layer_begin; i < layer_end; i++) {
+        LCache *lc = &m->cache[i];
+        lc->cap = cap;
+        if (c->sparse[i]) lc->slots = calloc(cap, sizeof(Slot));
+        if (c->sparse[i]) {
+            lc->slot_by_expert = malloc((size_t)E * sizeof(int));
+            if (!lc->slot_by_expert) { fprintf(stderr,"OOM expert cache index\n"); exit(1); }
+            for (int e = 0; e < E; e++) lc->slot_by_expert[e] = -1;
+        }
+    }
     /* container mode: slot storage is one page-aligned slab per sparse layer
      * (weights) plus one for the row scales, with every slot's pointers carved
      * out up front. Slots then recycle their region on eviction — no per-slot
@@ -921,7 +1090,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         size_t pg = 16384;
         size_t wlen = ((size_t)cap*(st13+st2) + pg - 1) / pg * pg;
         size_t slen = ((size_t)cap*(2*I+D)*4 + pg - 1) / pg * pg;
-        for (int i = 0; i < c->n_layers; i++) {
+        for (int i = layer_begin; i < layer_end; i++) {
             if (!c->sparse[i]) continue;
             void *wsl = NULL, *ssl = NULL;
             if (posix_memalign(&wsl, pg, wlen) || posix_memalign(&ssl, pg, slen)) {
@@ -939,47 +1108,77 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         }
     }
     /* usage counters; seeded from a previous run's history when present */
-    rt_init("inkling", c->n_layers, E);
-    for (int i = 0; i < c->n_layers; i++) if (!c->sparse[i]) rt_drop_row(i);
-    rt_drop_row(c->n_layers);                     /* inkling has no MTP row */
-    m->eusage = rt_counts_all();                  /* alias: the bump sites stay as they are */
+    if (init_telemetry) {
+        rt_init("inkling", c->n_layers, E);
+        for (int i = 0; i < c->n_layers; i++) if (!c->sparse[i]) rt_drop_row(i);
+        rt_drop_row(c->n_layers);                 /* inkling has no MTP row */
+        m->eusage = rt_counts_all();              /* alias: the bump sites stay as they are */
+    }
     m->dense_load_s = now_s() - t0;
 }
 
+static void model_init(Model *m, const char *snap, int cap, int bits) {
+    model_init_range(m, snap, cap, bits, 0, 0, 1, 1, 1);
+}
+
 static double mem_avail_bytes(void) {
-#if defined(__linux__)
-    FILE *f = fopen("/proc/meminfo", "r");
-    if (!f) return 0;
-    char ln[256]; double kb = 0;
-    while (fgets(ln, sizeof(ln), f)) if (sscanf(ln, "MemAvailable: %lf", &kb) == 1) break;
-    fclose(f);
-    return kb * 1024.0;
-#elif defined(__APPLE__)
-    /* free + inactive + purgeable ~ Linux MemAvailable. Without this the auto
-     * cap fell back to 16 experts/layer on a 128 GB Mac. */
-    vm_size_t page = 0; host_page_size(mach_host_self(), &page);
-    vm_statistics64_data_t vs; mach_msg_type_number_t n = HOST_VM_INFO64_COUNT;
-    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vs, &n) != KERN_SUCCESS)
-        return 0;
-    return (double)(vs.free_count + vs.inactive_count + vs.purgeable_count) * page;
-#else
+    /* Shared probe: Linux MemAvailable, macOS free+inactive+purgeable,
+     * Windows ullAvailPhys/commit. The #else here used to return 0, so
+     * Windows auto-cap was always 16 experts/layer and never warned. */
+    double gb = compat_mem_available_gb();
+    if (gb > 0.0) return gb * 1e9;
+    static int noted = 0;
+    if (!noted) {
+        noted = 1;
+        fprintf(stderr, "[inkling] could not measure available RAM on this platform; "
+                        "auto cache falls back to 16 experts/layer. Pass --cap to set it.\n");
+    }
     return 0;
-#endif
 }
 
 /* ---------- routed-expert slots: serial bookkeeping, parallel fills ---------- */
-static Slot *slot_find(Model *m, int layer, int eid) {
+#ifdef COLI_CACHE_INDEX_TEST
+static uint64_t g_slot_index_probes;
+#define SLOT_INDEX_PROBE() (g_slot_index_probes++)
+#else
+#define SLOT_INDEX_PROBE() ((void)0)
+#endif
+/* Cache identity is mutated only by slot_acquire(), which keeps this index in
+ * lockstep with the slot. Fills change bytes/filled but never identity. The
+ * validation makes a stale/corrupt entry a miss instead of serving another
+ * expert's weights; production slot_find then touches the LRU clock. */
+static Slot *slot_indexed(Model *m, int layer, int eid) {
     LCache *lc = &m->cache[layer];
-    for (int i = 0; i < lc->n; i++) if (lc->slots[i].eid == eid) {
-        lc->slots[i].used = ++m->clock;
-        return &lc->slots[i];
+    if (eid < 0 || eid >= m->c.n_experts || !lc->slot_by_expert) return NULL;
+    SLOT_INDEX_PROBE();
+    int i = lc->slot_by_expert[eid];
+    if (i < 0 || i >= lc->n || lc->slots[i].eid != eid) return NULL;
+    return &lc->slots[i];
+}
+/* One byte per expert: routed in this turn or not. The dashboard's Brain tab
+ * reads it as the HITS bitmap after every turn (serve_hits), and it is cleared
+ * there. Lives outside INKLING_NO_MAIN because the routing site that marks it
+ * is compiled into the segment adapter object too. */
+static void ehit_mark(Model *m, int layer, int eid) {
+    Cfg *c = &m->c;
+    if (!m->ehit) {
+        m->ehit = calloc((size_t)c->n_layers, sizeof(uint8_t *));
+        for (int i = 0; i < c->n_layers; i++) m->ehit[i] = calloc((size_t)c->n_experts, 1);
     }
-    return NULL;
+    if (layer >= 0 && layer < c->n_layers && eid >= 0 && eid < c->n_experts) m->ehit[layer][eid] = 1;
+}
+
+static Slot *slot_find(Model *m, int layer, int eid) {
+    Slot *s = slot_indexed(m, layer, eid);
+    if (s) s->used = ++m->clock;
+    return s;
 }
 
 /* allocate a slot (or evict the LRU non-pinned one); serial callers only */
 static Slot *slot_acquire(Model *m, int layer, int eid) {
     LCache *lc = &m->cache[layer]; Cfg *c = &m->c;
+    if (eid < 0 || eid >= c->n_experts || !lc->slot_by_expert) {
+        fprintf(stderr,"layer %d: invalid expert id %d for cache index\n",layer,eid); exit(1); }
     int64_t D = c->hidden, I = c->moe_inter, n13 = 2*I*D, n2 = D*I;
     Slot *s;
     if (lc->n < lc->cap) {
@@ -996,7 +1195,12 @@ static Slot *slot_acquire(Model *m, int layer, int eid) {
         if (lru < 0) { fprintf(stderr, "layer %d: cache cap %d entirely pinned\n", layer, lc->cap); exit(1); }
         s = &lc->slots[lru];
     }
+    int si = (int)(s - lc->slots);
+    if (s->eid >= 0 && s->eid < c->n_experts &&
+        lc->slot_by_expert[s->eid] == si)
+        lc->slot_by_expert[s->eid] = -1;
     s->eid = eid; s->used = ++m->clock; s->filled = 0; s->pinned = 0;
+    lc->slot_by_expert[eid] = si;
     return s;
 }
 
@@ -1069,8 +1273,7 @@ static void pins_load(Model *m, const char *snap) {
         for (int r = 0; r < m->npin; r++) {                /* top-N selection */
             int best = -1; uint32_t bv = 0;
             for (int e = 0; e < E; e++) {
-                int taken = 0;
-                for (int z = 0; z < r; z++) if (ps[np-r+z]->eid == e) { taken = 1; break; }
+                int taken = slot_indexed(m, i, e) != NULL;
                 if (!taken && tmp[e] >= bv && tmp[e] > 0) { bv = tmp[e]; best = e; }
             }
             if (best < 0) break;
@@ -1097,8 +1300,7 @@ static int usage_save(Model *m, const char *snap) {
     (void)m;                              /* the counters live in route_trace.h now */
     char up[2048];
     const char *env = getenv("PIN");
-    const char *sv = getenv("USAGE_SAVE");
-    if (sv && *sv == '0') return 0;
+    /* USAGE_SAVE=0 is honoured inside rt_save itself (#1039) */
     if (env && (!strcmp(env, "off") || !strcmp(env, "0"))) return 0;
     if (env) snprintf(up, sizeof(up), "%s", env);
     else snprintf(up, sizeof(up), "%s/.coli_usage", snap);
@@ -1108,11 +1310,23 @@ static int usage_save(Model *m, const char *snap) {
     return rt_save(up, 1);
 }
 
+/* KV rows actually kept per layer: sliding layers only ever attend to the last
+ * `window` positions (t0 clamp in attention), so their cache is a ring of
+ * `window` rows instead of max_t — at 32k context that is a ~64x cut on the
+ * 5-of-6 sliding layers. Global layers keep the full max_t. Must be computed
+ * from the SAME max_t the buffers were allocated with (m->max_t). */
+static inline int kv_ring_rows(const Cfg *c, int li, int max_t) {
+    return (c->local[li] && c->window > 0 && c->window < max_t) ? c->window : max_t;
+}
+
 /* ---------- attention (GQA + sliding/global + relative bias + K/V sconv) ---------- */
 static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, float *out) {
     Cfg *c = &m->c;
     int D = c->hidden, H = L_HEADS(c,li), KV = L_KV(c,li), hd = L_HD(c,li), ext = L_EXT(c,li);
     int local = c->local[li];
+    /* the ring made an over-run silent (t%win wraps instead of writing OOB), so
+     * fail fast here: every caller sizes the cache via kv_alloc before stepping */
+    if (pos0 + S > m->max_t) { fprintf(stderr, "attention: pos %d+%d exceeds kv alloc %d\n", pos0, S, m->max_t); exit(1); }
     int qdim = H*hd, kvdim = KV*hd, group = H/KV;
     float *q  = falloc((int64_t)S*qdim);
     float *k  = falloc((int64_t)S*kvdim);
@@ -1130,12 +1344,12 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
         for (int h = 0; h < H;  h++) rmsnorm_row(q + (int64_t)s*qdim  + h*hd, q + (int64_t)s*qdim  + h*hd, l->qn, hd, c->eps);
         for (int h = 0; h < KV; h++) rmsnorm_row(k + (int64_t)s*kvdim + h*hd, k + (int64_t)s*kvdim + h*hd, l->kn, hd, c->eps);
     }
-    /* append K,V to the cache */
-    for (int s = 0; s < S; s++) for (int h = 0; h < KV; h++) {
-        int t = pos0 + s;
-        memcpy(m->K[li] + ((int64_t)h*m->max_t + t)*hd, k  + (int64_t)s*kvdim + h*hd, hd*sizeof(float));
-        memcpy(m->V[li] + ((int64_t)h*m->max_t + t)*hd, vv + (int64_t)s*kvdim + h*hd, hd*sizeof(float));
-    }
+    /* Rows for positions inside this batch are read from the k/vv scratch, not
+     * the cache: with a ring, appending the whole batch up front could overwrite
+     * history rows that earlier queries in the batch still need. The scratch
+     * holds exactly what the cache would (post-sconv, post-rmsnorm), so the
+     * arithmetic is unchanged; the cache is appended after scoring. */
+    int win = kv_ring_rows(c, li, m->max_t);
     float scale = 1.f / (float)hd;
     float *ctx = falloc((int64_t)S*qdim);
     #pragma omp parallel
@@ -1147,6 +1361,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
             for (int s = 0; s < S; s++) {
                 int qpos = pos0 + s;
                 int t0 = local && qpos - c->window + 1 > 0 ? qpos - c->window + 1 : 0;
+                int tb = pos0 > t0 ? pos0 : t0;   /* first row served by the scratch */
                 /* mix the relative-bias bank for this (token, head): rl[dist] */
                 const float *rv = rr + (int64_t)s*H*c->d_rel + h*c->d_rel;
                 for (int e = 0; e < ext; e++) {
@@ -1161,9 +1376,11 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                     if (en > 1.0) tau = 1.f + c->log_alpha * (float)log(en);
                 }
                 const float *qv = q + (int64_t)s*qdim + h*hd;
-                const float *Kh = m->K[li] + ((int64_t)(h/group)*m->max_t)*hd;
+                const float *Kh = m->K[li] + ((int64_t)(h/group)*win)*hd;
+                const float *Kb = k  + (int64_t)(h/group)*hd;
                 for (int t = t0; t <= qpos; t++) {
-                    const float *kv = Kh + (int64_t)t*hd;
+                    const float *kv = t < tb ? Kh + (int64_t)(t % win)*hd
+                                             : Kb + (int64_t)(t - pos0)*kvdim;
                     float acc = 0.f;
                     for (int d = 0; d < hd; d++) acc += qv[d]*kv[d];
                     int dist = qpos - t;
@@ -1173,15 +1390,25 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                 softmax_row(sc, n);
                 float *cx = ctx + (int64_t)s*qdim + h*hd;
                 for (int d = 0; d < hd; d++) cx[d] = 0.f;
-                const float *Vh = m->V[li] + ((int64_t)(h/group)*m->max_t)*hd;
+                const float *Vh = m->V[li] + ((int64_t)(h/group)*win)*hd;
+                const float *Vb = vv + (int64_t)(h/group)*hd;
                 for (int t = t0; t <= qpos; t++) {
-                    const float *vrow = Vh + (int64_t)t*hd;
+                    const float *vrow = t < tb ? Vh + (int64_t)(t % win)*hd
+                                               : Vb + (int64_t)(t - pos0)*kvdim;
                     float a = sc[t - t0];
                     for (int d = 0; d < hd; d++) cx[d] += a * vrow[d];
                 }
             }
         }
         free(rl); free(sc);
+    }
+    /* append K,V to the cache (ring on sliding layers); rows the ring would
+     * overwrite within this same batch are skipped, they can never be read */
+    int s0 = S - win > 0 ? S - win : 0;
+    for (int s = s0; s < S; s++) for (int h = 0; h < KV; h++) {
+        int t = pos0 + s;
+        memcpy(m->K[li] + ((int64_t)h*win + t % win)*hd, k  + (int64_t)s*kvdim + h*hd, hd*sizeof(float));
+        memcpy(m->V[li] + ((int64_t)h*win + t % win)*hd, vv + (int64_t)s*kvdim + h*hd, hd*sizeof(float));
     }
     matmul_w(out, ctx, l->o, S, qdim, D);
     free(q); free(k); free(vv); free(rr); free(ctx);
@@ -1206,24 +1433,70 @@ static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
  * (3) compute. */
 /* shared experts for all S positions: gamma inside (before down_proj is
  * linear, so applied at the end). Factored out so the Metal path can run it
- * on the CPU while the last routed-expert round is in flight on the GPU. */
+ * on the CPU while the last routed-expert round is in flight on the GPU.
+ *
+ * Prefill batches positions so each shared matrix is traversed once per chunk,
+ * rather than once per token. Decode (S=1) deliberately stays on the original
+ * scalar path: its scratch remains tiny and the compiler sees a one-row GEMV.
+ * Bound the batch scratch to 64 MiB so a long prompt cannot turn this speedup
+ * into a memory spike. INK_SHARED_BATCH=0 restores the scalar path; a positive
+ * value sets a smaller maximum row count for deterministic A/B tests. */
+static int shared_batch_rows(int S, int D, int I) {
+    if (S <= 1) return 1;
+    const char *env = getenv("INK_SHARED_BATCH");
+    if (env) {
+        int requested = atoi(env);
+        if (requested <= 0) return 1;
+        if (requested < S) S = requested;
+    }
+    int64_t row_bytes = ((int64_t)2*I + D) * (int64_t)sizeof(float);
+    int64_t bounded = (64LL << 20) / (row_bytes > 0 ? row_bytes : 1);
+    if (bounded < 1) bounded = 1;
+    if (S > bounded) S = (int)bounded;
+    return S;
+}
 static void shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
                                float *out, const float *wgt,
                                float *g, float *u, float *hh) {
     Cfg *c = &m->c;
     int D = c->hidden, K = c->topk, I = c->moe_inter, ns = c->n_shared;
-    for (int s = 0; s < S; s++) {
-        const float *xs = x + (int64_t)s*D;
-        float *os = out + (int64_t)s*D;
-        const float *w = wgt + (int64_t)s*(K+ns);
+    if (ns <= 0 || S <= 0) return;
+    int B = shared_batch_rows(S, D, I);
+    if (B == 1) {
+        for (int s = 0; s < S; s++) {
+            const float *xs = x + (int64_t)s*D;
+            float *os = out + (int64_t)s*D;
+            const float *w = wgt + (int64_t)s*(K+ns);
+            for (int j = 0; j < ns; j++) {
+                matmul_w(g, xs, wt_off_i(l->sh_g, (int64_t)j*I*D, D), 1, D, I);
+                matmul_w(u, xs, wt_off_i(l->sh_u, (int64_t)j*I*D, D), 1, D, I);
+                for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
+                matmul_w(hh, g, wt_off_i(l->sh_d, (int64_t)j*D*I, I), 1, I, D);
+                for (int d = 0; d < D; d++) os[d] += w[K+j] * hh[d];
+            }
+        }
+        return;
+    }
+    float *bg = falloc((int64_t)2*B*I), *bu = bg + (int64_t)B*I;
+    float *bh = falloc((int64_t)B*D);
+    for (int base = 0; base < S; base += B) {
+        int rows = S - base < B ? S - base : B;
         for (int j = 0; j < ns; j++) {
-            matmul_w(g, xs, wt_off_i(l->sh_g, (int64_t)j*I*D, D), 1, D, I);
-            matmul_w(u, xs, wt_off_i(l->sh_u, (int64_t)j*I*D, D), 1, D, I);
-            for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
-            matmul_w(hh, g, wt_off_i(l->sh_d, (int64_t)j*D*I, I), 1, I, D);
-            for (int d = 0; d < D; d++) os[d] += w[K+j] * hh[d];
+            matmul_w(bg, x + (int64_t)base*D,
+                     wt_off_i(l->sh_g, (int64_t)j*I*D, D), rows, D, I);
+            matmul_w(bu, x + (int64_t)base*D,
+                     wt_off_i(l->sh_u, (int64_t)j*I*D, D), rows, D, I);
+            for (int64_t q = 0; q < (int64_t)rows*I; q++) bg[q] = siluf(bg[q]) * bu[q];
+            matmul_w(bh, bg, wt_off_i(l->sh_d, (int64_t)j*D*I, I), rows, I, D);
+            for (int s = 0; s < rows; s++) {
+                float *os = out + (int64_t)(base+s)*D;
+                const float *w = wgt + (int64_t)(base+s)*(K+ns);
+                const float *hs = bh + (int64_t)s*D;
+                for (int d = 0; d < D; d++) os[d] += w[K+j] * hs[d];
+            }
         }
     }
+    free(bg); free(bh);
 }
 
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
@@ -1350,7 +1623,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
         }
         sxoff[ns] = ns*S;
-        sh_h = coli_metal_moe_block_begin(ns, D, I, 5, sgp, sup, sdp,
+        sh_h = coli_metal_moe_block_begin(ns, D, I, 5, 0, sgp, sup, sdp,
                                           sscale, sscale, sscale,
                                           sxg, sxoff, snr, srows, srw);
         free(srows);
@@ -1364,7 +1637,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             int s = (int)(t / K), kk = (int)(t % K);
             if (kk >= keff[s]) { use[t - base] = NULL; continue; }   /* scartato da TOPP */
             int eid = idx[(int64_t)s*K + kk];
-            if (m->eusage[layer]) m->eusage[layer][eid]++;
+            if (m->eusage && m->eusage[layer]) m->eusage[layer][eid]++;
+            ehit_mark(m, layer, eid);
             Slot *e = slot_find(m, layer, eid);
             if (e) m->hits++;
             else {
@@ -1433,7 +1707,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                  * the round; shared_done stays set either way. */
                 if (base + cap >= npair && !sh_h) {
                     ColiMetalMoeHandle *h = coli_metal_moe_block_begin(
-                        nb, D, I, q4 ? 2 : 1, mgp, mup, mdp, mgs, mus, mds,
+                        nb, D, I, q4 ? 2 : 1, 0, mgp, mup, mdp, mgs, mus, mds,
                         mxg, mxoff, mnr, mrows, mrw);
                     if (h) {
                         double ts = now_s();
@@ -1447,7 +1721,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                         te = now_s();                      /* fault: CPU redo below */
                     }
                 }
-                if (coli_metal_moe_block(nb, D, I, q4 ? 2 : 1, mgp, mup, mdp, mgs, mus, mds,
+                if (coli_metal_moe_block(nb, D, I, q4 ? 2 : 1, 0, mgp, mup, mdp, mgs, mus, mds,
                                          mxg, mxoff, mnr, mrows, mrw, out, S)) {
                     m->t_expert += now_s() - te;
                     continue;                              /* round done on the GPU */
@@ -1539,11 +1813,118 @@ static int audio_tok_count(Model *m, const int *ids, int n) {
     return k;
 }
 
+static void inkling_layers_forward_range(Model *m, float *x, int S, int pos0,
+                                          int layer_begin, int layer_end) {
+    Cfg *c = &m->c; int D = c->hidden;
+    float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
+    for (int i = layer_begin; i < layer_end; i++) {
+        Layer *l = &m->L[i];
+        for (int s = 0; s < S; s++)
+            rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D,
+                        l->in_ln, D, c->eps);
+        double ta = now_s();
+        attention(m, l, i, nrm, S, pos0, tmp);
+        m->t_attn += now_s() - ta;
+        sconv_apply(tmp, S, D, l->a_cw, m->cs[2][i], c->conv_k);
+        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        for (int s = 0; s < S; s++)
+            rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D,
+                        l->post_ln, D, c->eps);
+        if (c->sparse[i]) moe(m, l, i, nrm, S, tmp);
+        else dense_mlp(m, l, nrm, S, tmp);
+        sconv_apply(tmp, S, D, l->m_cw, m->cs[3][i], c->conv_k);
+        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+    }
+    free(nrm); free(tmp);
+}
+
 /* ---------- one forward pass over S new tokens ----------
  * Returns malloc'd logits of the last token (unpadded vocab). If tf_out is
  * non-NULL also writes the per-position argmax (teacher-forcing check).
  * dmel: u8 [naud, mel_bins] frames consumed left-to-right by the <|audio|>
  * placeholder positions in ids (prefill only; decode steps pass NULL). */
+/* Canale logprobs: coda numerica per token, lettura del prefill, fotografia
+ * dello stato. Attenzione: questo motore NON e ad attenzione pura. Oltre alle
+ * righe K/V, che sono indicizzate per posizione e quindi si riavvolgono da
+ * sole, porta quattro stati di convoluzione corta per strato (cs[0..3], gli
+ * ingressi grezzi degli ultimi conv_k-1 passi). Quelli non si riavvolgono: se
+ * non li si fotografa, l'opzione successiva parte con la coda dell'opzione
+ * precedente dentro la convoluzione e i logprob sono sbagliati in modo
+ * silenzioso. Sono piccoli (tre passi per canale), quindi la fotografia costa
+ * poco. */
+static int    g_echo_k = 0;
+static const char *g_echo_id = NULL;
+static ColiPinPool g_pins;               /* piu scatti annidati, vedi pin_pool.h */
+static const float *g_pin_logit = NULL;
+static int    g_pin_use_logit = 0;
+static Tok   *g_echo_tok = NULL;
+
+/* Lo stato che questo motore deve fotografare oltre alle righe K/V: i quattro
+ * banchi di convoluzione corta per strato. Piccoli (conv_k-1 passi per canale)
+ * ma indispensabili: senza, l'alternativa successiva parte con la coda della
+ * precedente dentro la convoluzione. */
+typedef struct { float **cs[4]; int n_layers; } InkPinState;
+
+static void ink_echo(const char *id, int pos, int token, const float *lo, int V, int k){
+    char tail[1024]; coli_logprob_tail(tail, sizeof tail, lo, V, token, k);
+    char piece[512]; int n = g_echo_tok ? tok_decode(g_echo_tok, &token, 1, piece, (int)sizeof piece) : 0;
+    if (n < 0) n = 0;
+    printf("ECHO %s %d %d%s\n", id, n, pos, tail);
+    if (n > 0) fwrite(piece, 1, (size_t)n, stdout);
+    fputc('\n', stdout); fflush(stdout);
+}
+
+/* larghezza in float di uno stato di convoluzione, per strato e per banco */
+static int64_t ink_cs_cells(Cfg *c, int bank, int layer){
+    int kvdim = L_KV(c,layer) * L_HD(c,layer);
+    int C = (bank < 2) ? kvdim : c->hidden;
+    return (int64_t)C * (c->conv_k - 1);
+}
+
+static void ink_pin_state_free(void *v){
+    InkPinState *st = (InkPinState *)v;
+    if (!st) return;
+    for (int j = 0; j < 4; j++){
+        if (!st->cs[j]) continue;
+        for (int i = 0; i < st->n_layers; i++) free(st->cs[j][i]);
+        free(st->cs[j]);
+    }
+    free(st);
+}
+
+static InkPinState *ink_pin_state_save(Model *m, InkPinState *reuse){
+    Cfg *c = &m->c;
+    InkPinState *st = reuse;
+    if (st && st->n_layers != c->n_layers) { ink_pin_state_free(st); st = NULL; }
+    if (!st){
+        st = (InkPinState *)calloc(1, sizeof(*st));
+        if (!st) return NULL;
+        st->n_layers = c->n_layers;
+        for (int j = 0; j < 4; j++){
+            st->cs[j] = (float**)calloc((size_t)c->n_layers, sizeof(float*));
+            if (!st->cs[j]){ ink_pin_state_free(st); return NULL; }
+            for (int i = 0; i < c->n_layers; i++){
+                st->cs[j][i] = (float*)malloc((size_t)ink_cs_cells(c,j,i) * sizeof(float));
+                if (!st->cs[j][i]){ ink_pin_state_free(st); return NULL; }
+            }
+        }
+    }
+    for (int j = 0; j < 4; j++)
+        for (int i = 0; i < c->n_layers; i++)
+            memcpy(st->cs[j][i], m->cs[j][i],
+                   (size_t)ink_cs_cells(c,j,i) * sizeof(float));
+    return st;
+}
+
+static void ink_pin_state_restore(Model *m, const InkPinState *st){
+    Cfg *c = &m->c;
+    if (!st) return;
+    for (int j = 0; j < 4; j++)
+        for (int i = 0; i < c->n_layers; i++)
+            memcpy(m->cs[j][i], st->cs[j][i],
+                   (size_t)ink_cs_cells(c,j,i) * sizeof(float));
+}
+
 static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
                       const uint8_t *dmel, int naud) {
     Cfg *c = &m->c; int D = c->hidden;
@@ -1560,21 +1941,7 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
         if (m->embed_norm) rmsnorm_row(x + (int64_t)s*D, x + (int64_t)s*D, m->embed_norm, D, c->eps);
     }
     free(arow);
-    float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
-    for (int i = 0; i < c->n_layers; i++) {
-        Layer *l = &m->L[i];
-        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
-        double ta = now_s();
-        attention(m, l, i, nrm, S, pos0, tmp);
-        m->t_attn += now_s() - ta;
-        sconv_apply(tmp, S, D, l->a_cw, m->cs[2][i], c->conv_k);
-        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
-        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
-        if (c->sparse[i]) moe(m, l, i, nrm, S, tmp);
-        else dense_mlp(m, l, nrm, S, tmp);
-        sconv_apply(tmp, S, D, l->m_cw, m->cs[3][i], c->conv_k);
-        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
-    }
+    inkling_layers_forward_range(m, x, S, pos0, 0, c->n_layers);
     m->kv_len = pos0 + S;
     /* record what was just fed, at the positions it went to (kv_prefix.h).
      * Audio taints the record: every frame carries the same token id while the
@@ -1583,6 +1950,19 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
     if (dmel && naud > 0) kv_prefix_taint(&m->kvp);
     float *last = falloc(D);
     float *logit = falloc(c->unpad_vocab);
+    /* Lettura del prefill: un passaggio di lm_head per posizione, pagato solo
+     * da chi ha chiesto il canale. La posizione p predice il token p+1; il
+     * primo token fresco e predetto dalla fotografia. */
+    if (g_echo_k > 0 && g_echo_id && S > 0) {
+        if (g_pin_use_logit && g_pin_logit)
+            ink_echo(g_echo_id, pos0, ids[0], g_pin_logit, c->unpad_vocab, g_echo_k);
+        for (int p = 0; p + 1 < S; p++) {
+            rmsnorm_row(last, x + (int64_t)p*D, m->final_norm, D, c->eps);
+            for (int d = 0; d < D; d++) last[d] /= c->mup;
+            matmul_w(logit, last, m->lm_head, 1, D, c->unpad_vocab);
+            ink_echo(g_echo_id, pos0 + p + 1, ids[p+1], logit, c->unpad_vocab, g_echo_k);
+        }
+    }
     if (tf_out) {
         for (int s = 0; s < S; s++) {
             rmsnorm_row(last, x + (int64_t)s*D, m->final_norm, D, c->eps);
@@ -1595,7 +1975,7 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     for (int d = 0; d < D; d++) last[d] /= c->mup;
     matmul_w(logit, last, m->lm_head, 1, D, c->unpad_vocab);
-    free(x); free(nrm); free(tmp); free(last);
+    free(x); free(last);
     return logit;
 }
 
@@ -1627,29 +2007,52 @@ static void kv_alloc(Model *m, int max_t) {
      * for a larger max_t every turn, so the state was thrown away just before
      * the point of using it.
      *
-     * K/V are laid out [kv_head][max_t][hd], so a larger max_t changes the
-     * stride: the old contents cannot be realloc'd, they have to be re-laid-out
-     * head by head. That copy costs a memcpy of what is already computed, which
-     * is nothing beside re-running the prefill that produced it. */
+     * K/V are laid out [kv_head][rows][hd] with rows = kv_ring_rows(), so a
+     * larger max_t changes the stride wherever rows follows max_t: those
+     * contents cannot be realloc'd, they have to be re-laid-out head by head.
+     * That copy costs a memcpy of what is already computed, which is nothing
+     * beside re-running the prefill that produced it.
+     *
+     * Sliding layers whose ring is already window rows are the exception in
+     * BOTH directions: their size does not depend on max_t (nothing to grow),
+     * and a ring that has wrapped is not linear (position t lives at row
+     * t % window), so the linear copy below would silently rotate it. Steal
+     * the buffer instead — the slot map is unchanged, so it stays valid.
+     * Every layer that does reach the copy IS linear: rows != old_rows only
+     * happens when old_rows == old_max (a wrapped ring keeps rows == window
+     * forever), and keep <= old_max <= rows there, so the copy fits. */
     float **oldK = m->K, **oldV = m->V;
     int old_max = m->max_t;
     int keep = (m->K && m->kv_len > 0 && m->kv_len <= max_t) ? m->kv_len : 0;
 
     m->max_t = max_t;
     m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
+    int64_t ring = 0, full = 0;
     for (int i = 0; i < c->n_layers; i++) {
         int kv = L_KV(c,i), hd = L_HD(c,i);
-        m->K[i] = falloc((int64_t)kv * max_t * hd);
-        m->V[i] = falloc((int64_t)kv * max_t * hd);
-        for (int h = 0; h < kv && keep; h++) {
-            memcpy(m->K[i] + (int64_t)h * max_t * hd,
-                   oldK[i] + (int64_t)h * old_max * hd, (size_t)keep * hd * sizeof(float));
-            memcpy(m->V[i] + (int64_t)h * max_t * hd,
-                   oldV[i] + (int64_t)h * old_max * hd, (size_t)keep * hd * sizeof(float));
+        int64_t rows     = kv_ring_rows(c, i, max_t);
+        int64_t old_rows = oldK ? kv_ring_rows(c, i, old_max) : 0;
+        if (oldK && rows == old_rows) {
+            m->K[i] = oldK[i]; m->V[i] = oldV[i];
+            oldK[i] = NULL;    oldV[i] = NULL;
+        } else {
+            m->K[i] = falloc((int64_t)kv * rows * hd);
+            m->V[i] = falloc((int64_t)kv * rows * hd);
+            for (int h = 0; h < kv && keep; h++) {
+                memcpy(m->K[i] + (int64_t)h * rows * hd,
+                       oldK[i] + (int64_t)h * old_max * hd, (size_t)keep * hd * sizeof(float));
+                memcpy(m->V[i] + (int64_t)h * rows * hd,
+                       oldV[i] + (int64_t)h * old_max * hd, (size_t)keep * hd * sizeof(float));
+            }
         }
+        ring += 2 * (int64_t)kv * rows  * hd * (int64_t)sizeof(float);
+        full += 2 * (int64_t)kv * max_t * hd * (int64_t)sizeof(float);
     }
     if (oldK) for (int i = 0; i < c->n_layers; i++) { free(oldK[i]); free(oldV[i]); }
     free(oldK); free(oldV);
+    if (ring < full)
+        fprintf(stderr, "[kv] %.1f MiB (ring buffers on sliding layers; full cache would be %.1f MiB)\n",
+                ring/1048576.0, full/1048576.0);
 
     /* the record describes those same positions, so it survives with them --
      * unless its own allocation fails, in which case reuse simply stops. */
@@ -1790,18 +2193,47 @@ static void apply_rep_penalty(float *logit, int n, const int *hist, int nhist, f
     }
 }
 
-/* reject a prompt that would overrun the served KV bound (CTX_MAX, default 8192) */
-static const char *prompt_reject(int np, int want) {
+/* Refuse only a prompt that does not fit the served KV bound (CTX_MAX,
+ * default 8192). max_tokens is a ceiling: coli chat's interactive default
+ * (16384) used to 400 every turn because 2 + 16384 > 8192. The refusal is
+ * the frame the gateway turns into a 400 context_length_exceeded (#506,
+ * #1381); free text here reached the client as a 500. One request is served
+ * at a time, so the returned buffer is only read before the next call. */
+static int ink_ctx_max(void) {
     const char *cm = getenv("CTX_MAX");
-    int ctx_max = cm ? atoi(cm) : 8192;
-    if (np + want > ctx_max) return "context exceeds CTX_MAX";
-    return NULL;
+    return cm ? atoi(cm) : 8192;
+}
+static const char *prompt_reject(int np, int want) {
+    static char message[96];
+    int ctx_max = ink_ctx_max();
+    if (coli_serve_budget(np, want, ctx_max, 0) >= 0) return NULL;
+    snprintf(message, sizeof(message),
+             "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
+             np, want, ctx_max);
+    return message;
 }
 
 typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen;
-                 uint8_t *audio; int alen; } SReq;   /* raw DMel bytes after the payload */
+                 uint8_t *audio; int alen;
+                 int logprobs, pin; } SReq;   /* raw DMel bytes after the payload; SUBMIT logprobs=k / pin=1 */
 #define SRV_QMAX 16
 static SReq g_q[SRV_QMAX]; static int g_qn = 0;
+static const ColiServeWireProfile inkling_wire = {
+    .max_header_bytes = 511,
+    .max_payload_bytes = 1u << 22,
+    .max_extension_bytes = 1u << 26,
+    .max_tokens = 1 << 20,
+    .require_exact_lf = 1,
+    .require_finite_sampling = 0,
+    .allow_extension_bytes = 1,
+    .allow_prefix_hint = 0,
+};
+
+static void serve_request_dispose(SReq *request) {
+    if (!request) return;
+    free(request->payload);
+    memset(request, 0, sizeof(*request));
+}
 
 static int stdin_readable(void) {
     /* Windows non ha fd_set/select in questa forma: la build falliva del tutto.
@@ -1811,15 +2243,16 @@ static int stdin_readable(void) {
 
 /* read one control line (+ payload for SUBMIT). cur_id: request in flight;
  * returns 1 if that request was cancelled, 0 otherwise, -1 on stdin EOF. */
-static int serve_read_cmd(const char *cur_id) {
-    char ln[512];
-    if (!fgets(ln, sizeof(ln), stdin)) return -1;
-    char cmd[16], id[64];
-    if (sscanf(ln, "%15s %63s", cmd, id) < 2) return 0;
-    if (!strcmp(cmd, "CANCEL")) return cur_id && !strcmp(id, cur_id);
-    if (!strcmp(cmd, "SUBMIT")) {
-        int slot, plen, max_tok, alen = 0; float temp, top_p;
-        int nf = sscanf(ln, "%*s %*s %d %d %d %f %f %d", &slot, &plen, &max_tok, &temp, &top_p, &alen);
+static int serve_read_cmd(FILE *input, FILE *output, const char *cur_id) {
+    ColiServeCommand command;
+    ColiServeReadResult result=coli_serve_read_command(input,&inkling_wire,&command);
+    if(result==COLI_SERVE_READ_EOF) return -1;
+    if(result==COLI_SERVE_READ_BAD_FRAME) return -2;
+    if(result==COLI_SERVE_READ_NOMEM){
+        coli_serve_write_error(output,command.id,"out of memory"); return -2;
+    }
+    if(result==COLI_SERVE_READ_BAD_REQUEST&&
+       command.kind==COLI_SERVE_COMMAND_SUBMIT){
         /* 6th field (optional, backward compatible): DMel byte count appended
          * verbatim after the text payload — frames x mel_bins u8 levels */
         /* SEC: max_tok was the one field nobody validated, and it is the one
@@ -1835,45 +2268,83 @@ static int serve_read_cmd(const char *cur_id) {
          * anything bridging it (socat, a custom gateway, a sidecar) exposes it
          * directly, so the check belongs here, next to the one plen already
          * has, rather than in one of its callers. */
-        if (nf < 5 || plen < 0 || plen > (1<<22) || alen < 0 || alen > (1<<26) ||
-            max_tok < 1 || max_tok > (1<<20)) {
-            printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
-        (void)slot;
-        char *pl = malloc((size_t)plen + 1);
-        if (fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) { free(pl); return -1; }
-        pl[plen] = 0;
-        uint8_t *au = NULL;
-        if (alen > 0) {
-            au = malloc((size_t)alen);
-            if (fread(au, 1, (size_t)alen, stdin) != (size_t)alen) { free(pl); free(au); return -1; }
-        }
-        int nl = fgetc(stdin); (void)nl;
+        coli_serve_write_error(output,command.id,"bad submit header"); return -2;
+    }
+    if(result!=COLI_SERVE_READ_OK) return 0;
+    if(command.kind==COLI_SERVE_COMMAND_CANCEL){
+        int matched=cur_id&&!strcmp(command.id,cur_id);
+        coli_serve_command_dispose(&command); return matched;
+    }
+    if(command.kind==COLI_SERVE_COMMAND_STOP){
+        coli_serve_command_dispose(&command); return 0;
+    }
+    if(command.kind==COLI_SERVE_COMMAND_SUBMIT){
         if (g_qn < SRV_QMAX) {
             SReq *q = &g_q[g_qn++];
-            snprintf(q->id, sizeof(q->id), "%s", id);
-            q->max_tok = max_tok; q->temp = temp; q->top_p = top_p;
-            q->payload = pl; q->plen = plen;
-            q->audio = au; q->alen = alen;
-        } else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); free(au); }
+            snprintf(q->id, sizeof(q->id), "%s", command.id);
+            q->max_tok=command.max_tokens; q->temp=command.temperature;
+            q->logprobs=command.logprobs; q->pin=command.pin;
+            q->top_p=command.top_p; q->plen=(int)command.payload_bytes;
+            q->alen=(int)command.extension_bytes;
+            q->audio=coli_serve_command_extension(&command);
+            q->payload=(char*)coli_serve_command_take_payload(&command);
+        } else coli_serve_write_error(output,command.id,"queue full");
     }
+    coli_serve_command_dispose(&command);
     return 0;
 }
 
-static void serve_one(Model *m, Tok *T, SReq *q) {
+/* HITS rows cols hex: which experts this turn routed, one bit each over the
+ * sparse layers (same rows and columns as EMAP), packed 8 per hex pair. Same
+ * line colibri.c emits; the Brain tab lights up from it. A turn that routed
+ * nothing still reports a bitmap, all zero, so the tab shows THIS turn. */
+static void serve_hits(Model *m) {
+    Cfg *c = &m->c; int E = c->n_experts;
+    if (!m->ehit) ehit_mark(m, -1, -1);
+    int nsp = 0;
+    for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) nsp++;
+    int nb = (nsp * E + 7) / 8;
+    uint8_t *bm = calloc((size_t)nb, 1); int bit = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        if (!c->sparse[i]) continue;
+        for (int e = 0; e < E; e++, bit++)
+            if (m->ehit[i][e]) { bm[bit >> 3] |= (uint8_t)(1 << (bit & 7)); m->ehit[i][e] = 0; }
+    }
+    char *hex = malloc((size_t)nb * 2 + 1); int w = 0;
+    for (int b = 0; b < nb; b++) { hex[w++] = "0123456789abcdef"[bm[b] >> 4]; hex[w++] = "0123456789abcdef"[bm[b] & 15]; }
+    hex[w] = 0;
+    printf("HITS %d %d %s\n", nsp, E, hex);
+    fflush(stdout); free(hex); free(bm);
+}
+
+static int serve_one(Model *m, Tok *T, SReq *q) {
     Cfg *c = &m->c;
     int cap = q->plen + 16;
     int *ids = malloc((size_t)cap * sizeof(int));
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
-    if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
-    const char *bad = prompt_reject(np, q->max_tok);
-    if (bad) { printf("ERROR %s %s\n", q->id, bad); fflush(stdout); free(ids); return; }
+    if (np <= 0) { coli_serve_write_error(stdout,q->id,"empty prompt"); free(ids); return 0; }
+    int ctx_max = ink_ctx_max();
+    int budget = coli_serve_budget(np, q->max_tok, ctx_max, q->logprobs > 0);
+    if (budget < 0) {
+        const char *bad = prompt_reject(np, q->max_tok);
+        coli_serve_write_error(stdout,q->id,bad ? bad : "CONTEXT_EXCEEDED");
+        free(ids); return 0;
+    }
+    if (budget < q->max_tok) {
+        fprintf(stderr, "[serve] max_tokens %d clamped to %d (context %d - prompt %d); "
+                        "raise CTX_MAX for longer answers\n",
+                q->max_tok, budget, ctx_max, np);
+        q->max_tok = budget;
+    }
     /* audio: every <|audio|> placeholder must have exactly one DMel frame */
     int naud = q->alen / m->c.mel_bins;
     if (q->alen % m->c.mel_bins != 0 || audio_tok_count(m, ids, np) != naud) {
-        printf("ERROR %s audio frames (%d) do not match <|audio|> placeholders (%d)%s\n",
-               q->id, naud, audio_tok_count(m, ids, np),
-               m->audio_norm ? "" : " — snapshot has no audio tensors");
-        fflush(stdout); free(ids); return;
+        char message[256];
+        snprintf(message,sizeof(message),
+                 "audio frames (%d) do not match <|audio|> placeholders (%d)%s",
+                 naud,audio_tok_count(m,ids,np),
+                 m->audio_norm?"":" — snapshot has no audio tensors");
+        coli_serve_write_error(stdout,q->id,message); free(ids); return 0;
     }
     /* KV PREFIX REUSE (#639 for GLM; this engine re-prefilled every turn).
      * A chat client resends the whole transcript each turn, so turn N used to
@@ -1896,6 +2367,32 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
      * brings its own audio must not match a text-only state either. */
     if (naud > 0) kv_prefix_taint(&m->kvp);
     int reuse = kv_prefix_reuse(&m->kvp, ids, np);
+    /* La fotografia si prova sempre, non solo quando il riuso vivo fallisce:
+     * altrimenti la prima opzione trova ancora lo stato del prompt, passa dal
+     * riuso normale e il suo primo token resta senza predittore. */
+    g_pin_use_logit = 0; g_pin_logit = NULL;
+    if (naud == 0) {
+        /* Il piu profondo degli scatti valido per questo prompt. Uno scatto le
+         * cui righe K/V non ci sono piu si butta e si riprova col precedente,
+         * invece di rinunciare e rifare tutto da zero. */
+        int s = coli_pin_best(&g_pins, ids, np);
+        while (s >= 0) {
+            ColiPin *k = &g_pins.slot[s];
+            if (kv_prefix_holds(&m->kvp, k->ids, k->len)) {
+                ink_pin_state_restore(m, (const InkPinState *)k->state);
+                kv_prefix_clear(&m->kvp);
+                kv_prefix_record(&m->kvp, k->ids, 0, k->len);
+                m->kv_len = k->len;
+                reuse = k->len;
+                g_pin_logit = k->logit; g_pin_use_logit = k->logit != NULL;
+                coli_pin_touch(&g_pins, s);
+                break;
+            }
+            k->len = 0;
+            s = coli_pin_best(&g_pins, ids, np);
+        }
+    }
+    g_echo_k = q->logprobs; g_echo_id = q->id; g_echo_tok = T;
     if (getenv("INK_PREFIX_LOG")) {
         /* Report the decision either way, with the reason when it is no. "It
          * did not get faster" is otherwise indistinguishable from "reuse is not
@@ -1918,6 +2415,18 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     /* `reuse` is the ABSOLUTE position of the first fresh token: attention and
      * the KV slots are position-indexed, so this has to be the real offset. */
     float *logit = step_mm(m, ids + reuse, np - reuse, reuse, NULL, q->audio, naud);
+    if (q->pin && logit && naud == 0) {
+        coli_pin_pool_init(&g_pins, c->unpad_vocab);
+        ColiPin *k = coli_pin_store(&g_pins, ids, np, logit);
+        if (k) {
+            InkPinState *st = ink_pin_state_save(m, (InkPinState *)k->state);
+            if (st) { k->state = st; fprintf(stderr, "[PIN] scatto a %d token\n", np); }
+            else    { k->len = 0; }          /* senza stato lo scatto e' una bugia */
+            fflush(stderr);
+        }
+    }
+    g_echo_k = 0; g_echo_id = NULL;   /* la lettura riguarda il prefill, non la decodifica */
+    int forwards = 1;                      /* il prefill e' il primo forward */
     int len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
     /* repetition-penalty history: prompt tail + emitted tokens, ring of 128 */
@@ -1927,34 +2436,40 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     for (int s = 0; s < q->max_tok && !cancelled; s++) {
         apply_rep_penalty(logit, c->unpad_vocab, hist, nhist, rep);
         int tk = sample_logits(logit, c->unpad_vocab, q->temp, q->top_p);
+        char lptail[1024]; lptail[0] = 0;
+        if (q->logprobs > 0) coli_logprob_tail(lptail, sizeof lptail, logit, c->unpad_vocab, tk, q->logprobs);
         free(logit); logit = NULL;
         if (tk == c->eos) { limited = 0; break; }
         if (nhist < 128) hist[nhist++] = tk;
         else { memmove(hist, hist+1, 127*sizeof(int)); hist[127] = tk; }
         int nb = tok_decode(T, &tk, 1, buf, sizeof(buf)-1);
-        printf("DATA %s %d\n", q->id, nb);
-        fwrite(buf, 1, (size_t)nb, stdout);
-        fputc('\n', stdout); fflush(stdout);
+        if (q->logprobs > 0) coli_serve_write_data_lp(stdout,q->id,buf,(size_t)nb,lptail);
+        else coli_serve_write_data(stdout,q->id,buf,(size_t)nb);
         gen++; len++;
         while (stdin_readable()) {
-            int r = serve_read_cmd(q->id);
-            if (r < 0) { free(ids); return; }
+            int r = serve_read_cmd(stdin, stdout, q->id);
+            if (r < 0) { free(ids); return -1; }
             if (r > 0) { cancelled = 1; limited = 0; }
         }
         if (cancelled || s == q->max_tok - 1) break;
-        logit = step(m, &tk, 1, len - 1, NULL);
+        logit = step(m, &tk, 1, len - 1, NULL); forwards++;
     }
     free(logit);
     double dt = now_s() - t0;
     double tot = (double)(m->hits - h0 + m->miss - m0);
-    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen,
-           dt > 0 ? gen/dt : 0.0, tot ? 100.0*(m->hits-h0)/tot : 0.0, rss_gb(), np, limited);
+    ColiServeDone done={gen,dt>0?gen/dt:0.0,
+                        tot?100.0*(m->hits-h0)/tot:0.0,rss_gb(),np,limited};
+    char done_line[256];
+    int done_bytes=coli_serve_format_done(done_line,sizeof(done_line),q->id,&done);
+    if(done_bytes>0) fwrite(done_line,1,(size_t)done_bytes,stdout);
     /* PROF: per-turn phase timings for the dashboard (gateway schema — we map
      * expert_wait -> shared-expert compute, lm_head folded into 0). */
     printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n", dt, np, gen,
-           m->t_fill - f0, m->t_shared - s0, m->t_expert - e0, m->t_attn - a0, 0.0, gen + 1);
+           m->t_fill - f0, m->t_shared - s0, m->t_expert - e0, m->t_attn - a0, 0.0, forwards);
     fflush(stdout);
+    serve_hits(m);
     free(ids);
+    return 0;
 }
 
 /* ---------- dashboard protocol (HWINFO / TIERS / EMAP) ----------
@@ -1978,6 +2493,25 @@ static void serve_hwinfo(Model *m) {
             if (sscanf(ln, "MemTotal: %lf", &v) == 1) rt = v/1e6;
             if (sscanf(ln, "MemAvailable: %lf", &v) == 1) ra = v/1e6;
         } fclose(mi); }
+    if (rt <= 0.0 || ra <= 0.0) {
+        double t2 = 0, a2 = 0;
+        compat_meminfo_gb(&t2, &a2);
+        if (rt <= 0.0) rt = t2;
+        if (ra <= 0.0) ra = a2;
+    }
+#ifdef _WIN32
+    if (cores <= 0) {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        cores = (int)si.dwNumberOfProcessors;
+    }
+#endif
+#ifdef __APPLE__
+    if (!cpu[0]) {
+        size_t sl = sizeof(cpu);
+        if (sysctlbyname("machdep.cpu.brand_string", cpu, &sl, NULL, 0)) cpu[0] = 0;
+    }
+#endif
     int ngpu = 0; double vram = 0;
     const char *gpu = "";
 #ifdef COLI_CUDA
@@ -2000,10 +2534,9 @@ static void serve_tiers_emap(Model *m) {
     char *hex = malloc((size_t)nsp*E*2 + 1); int w = 0;
     for (int i = 0; i < c->n_layers; i++) {
         if (!c->sparse[i]) continue;
-        LCache *lc = &m->cache[i];
         for (int e = 0; e < E; e++) {
-            int tier = 0;
-            for (int z = 0; z < lc->n; z++) if (lc->slots[z].eid == e && lc->slots[z].filled) { tier = 1; break; }
+            Slot *resident = slot_indexed(m, i, e);
+            int tier = resident && resident->filled;
             uint32_t u = m->eusage[i] ? m->eusage[i][e] : 0;
             int heat = 0; while (u) { heat++; u >>= 1; } if (heat > 63) heat = 63;
             int b = (tier << 6) | heat;
@@ -2021,25 +2554,23 @@ static void serve_loop(Model *m, Tok *T) {
      * as \r\n, the gateway never matches it and waits forever (#748). Lives in
      * compat.h because colibri.c has had it since #195 and this engine was
      * written without it. */
-    coli_serve_binary_mode();
-    setvbuf(stdin, NULL, _IONBF, 0);
+    coli_serve_stdio_init();
     const char *sd = getenv("SEED");
     if (sd) g_rng ^= (uint64_t)strtoull(sd, NULL, 10);
     else g_rng ^= (uint64_t)time(NULL) * 2654435761u;
     /* the gateway reads a STAT line right after the READY sentinel (colibri
      * reports its load stats there) — match the handshake */
-    fputs("\x01\x01READY\x01\x01\n", stdout);
-    printf("STAT 0 0.0 0.0 %.2f 0 0\n", rss_gb());
-    fflush(stdout);
+    coli_serve_write_ready(stdout,rss_gb());
     serve_hwinfo(m);
     serve_tiers_emap(m);
     for (;;) {
-        while (!g_qn) if (serve_read_cmd(NULL) < 0) return;   /* blocks on stdin */
+        while (!g_qn) if (serve_read_cmd(stdin, stdout, NULL) < 0) return;   /* blocks on stdin */
         SReq q = g_q[0];
         memmove(g_q, g_q+1, (size_t)(--g_qn) * sizeof(SReq));
-        serve_one(m, T, &q);
+        int fatal=serve_one(m,T,&q);
         serve_tiers_emap(m);
-        free(q.payload); free(q.audio);
+        serve_request_dispose(&q);
+        if(fatal<0){ while(g_qn) serve_request_dispose(&g_q[--g_qn]); return; }
     }
 }
 
@@ -2052,6 +2583,7 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
     *n_out = a->len; return r;
 }
 
+#ifndef INKLING_NO_MAIN
 int main(int argc, char **argv) {
     /* OpenMP hot-thread tuning, same trick (and rationale) as glm.c: the
      * per-expert matmul regions are tiny and back-to-back; the default passive
@@ -2079,7 +2611,7 @@ int main(int argc, char **argv) {
 #endif  /* !COLI_CUDA && !__APPLE__ */
     coli_omp_tune_threads("inkling");
     const char *snap = getenv("SNAP");
-    if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
+    if (!snap) { coli_print_launcher_help("Inkling"); return 1; }
     g_topp = getenv("TOPP") ? (float)atof(getenv("TOPP")) : 0.f;
     if (g_topp > 0.f && g_topp < 1.f)
         fprintf(stderr, "[TOPP] %.2f: routed experts kept to cumulative weight — "
@@ -2095,11 +2627,11 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-p") && i+1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "-f") && i+1 < argc) pfile = argv[++i];
-        else if (!strcmp(argv[i], "-n") && i+1 < argc) n_new = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-n") && i+1 < argc) n_new = coli_arg_int(argv[++i], "-n");
         else if (!strcmp(argv[i], "--chat")) chat = 1;
         else if (!strcmp(argv[i], "--audio") && i+1 < argc) audiopath = argv[++i];
-        else if (npos == 0) { cap = atoi(argv[i]); npos++; }
-        else if (npos == 1) { bits = atoi(argv[i]); npos++; }
+        else if (npos == 0) { cap = coli_arg_int(argv[i], "cache/layer"); npos++; }
+        else if (npos == 1) { bits = coli_arg_int(argv[i], "expert bits"); npos++; }
         else refpath = argv[i];
     }
     /* --audio <file>: raw u8 DMel frames, [n_frames, mel_bins] row-major —
@@ -2165,6 +2697,7 @@ int main(int argc, char **argv) {
         pins_load(&m, snap);
         char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
         Tok T; tok_load(&T, tkp);
+        coli_rt_term_arm();   /* SIGTERM must reach the save below (#1629) */
         serve_loop(&m, &T);
         usage_save(&m, snap);
         return 0;
@@ -2277,3 +2810,628 @@ int main(int argc, char **argv) {
     free(buf); free(arena);
     return (match == ngen) ? 0 : 1;
 }
+#endif /* INKLING_NO_MAIN */
+
+#ifdef COLI_SEGMENT_ADAPTER
+/* ---------- engine-owned Segment adapter ------------------------------ */
+
+typedef struct {
+    Model model;
+    uint32_t layer_begin, layer_end, context_tokens;
+    pthread_mutex_t run_lock;
+} InklingSegmentEngine;
+
+typedef struct {
+    InklingSegmentEngine *engine;
+    float **K, **V;
+    float **cs[4];
+    uint32_t context_tokens, position;
+} InklingSegmentSession;
+
+static void inkling_segment_wt_destroy(Wt *weight) {
+    if (!weight) return;
+    free(weight->f); free(weight->h);
+    free(weight->q4); free(weight->qs);
+    memset(weight, 0, sizeof(*weight));
+}
+
+static void inkling_segment_layer_destroy(Layer *layer) {
+    if (!layer) return;
+    free(layer->in_ln); free(layer->post_ln);
+    inkling_segment_wt_destroy(&layer->q);
+    inkling_segment_wt_destroy(&layer->k);
+    inkling_segment_wt_destroy(&layer->v);
+    inkling_segment_wt_destroy(&layer->r);
+    inkling_segment_wt_destroy(&layer->o);
+    free(layer->qn); free(layer->kn); free(layer->relp);
+    free(layer->k_cw); free(layer->v_cw);
+    free(layer->a_cw); free(layer->m_cw);
+    inkling_segment_wt_destroy(&layer->dg);
+    inkling_segment_wt_destroy(&layer->du);
+    inkling_segment_wt_destroy(&layer->dd);
+    free(layer->router); free(layer->rbias);
+    inkling_segment_wt_destroy(&layer->sh_g);
+    inkling_segment_wt_destroy(&layer->sh_u);
+    inkling_segment_wt_destroy(&layer->sh_d);
+}
+
+static void inkling_segment_model_destroy(InklingSegmentEngine *engine) {
+    if (!engine) return;
+    Model *model = &engine->model;
+    for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+         layer++) {
+        inkling_segment_layer_destroy(&model->L[layer]);
+        LCache *cache = &model->cache[layer];
+        if (model->xq && cache->cap > 0 && cache->slots) {
+            free(cache->slots[0].p13);
+            free(cache->slots[0].s13);
+        } else if (cache->slots) {
+            for (int slot = 0; slot < cache->cap; slot++) {
+                free(cache->slots[slot].q13); free(cache->slots[slot].q2);
+                free(cache->slots[slot].s13); free(cache->slots[slot].s2);
+                free(cache->slots[slot].f13); free(cache->slots[slot].f2);
+            }
+        }
+        free(cache->slot_by_expert); free(cache->slots);
+    }
+    inkling_segment_wt_destroy(&model->embed);
+    inkling_segment_wt_destroy(&model->lm_head);
+    inkling_segment_wt_destroy(&model->audio_enc);
+    free(model->embed_norm); free(model->final_norm); free(model->audio_norm);
+    free(model->K); free(model->V);
+    for (int state = 0; state < 4; state++) free(model->cs[state]);
+    free(model->cache); free(model->L);
+    kv_prefix_free(&model->kvp);
+    st_destroy(&model->Sq); st_destroy(&model->S);
+}
+
+static int inkling_segment_engine_open(
+    void **engine_impl, ColiSegmentCapabilities *capabilities,
+    const ColiSegmentEngineOptions *options, char *error, size_t error_size) {
+    if (!engine_impl || !capabilities || !options)
+        return coli_segment_adapter_error(error, error_size,
+                                           "invalid Inkling Segment open");
+    *engine_impl = NULL;
+    if (options->backend_mask &&
+        (options->backend_mask & ~COLI_SEGMENT_CAP_CPU))
+        return coli_segment_adapter_error(error, error_size,
+                                           "Inkling Segment currently supports CPU");
+
+    Cfg config;
+    memset(&config, 0, sizeof(config));
+    load_cfg(&config, options->model_dir);
+    if (options->layer_end > (uint32_t)config.n_layers)
+        return coli_segment_adapter_error(error, error_size,
+                                           "Inkling Segment range exceeds model");
+    int bits = getenv("INK_SEGMENT_BITS")
+        ? atoi(getenv("INK_SEGMENT_BITS")) : 0;
+    if (bits && (bits < 2 || bits > 8))
+        return coli_segment_adapter_error(error, error_size,
+                                           "INK_SEGMENT_BITS must be 0 or 2..8");
+    int sparse_layers = 0;
+    for (uint32_t layer = options->layer_begin; layer < options->layer_end;
+         layer++) sparse_layers += config.sparse[layer] != 0;
+    int cap = 0;
+    if (options->memory_limit_bytes && sparse_layers) {
+        uint64_t slot_bytes = bits
+            ? 3u * (uint64_t)config.moe_inter * config.hidden +
+              (uint64_t)(2 * config.moe_inter + config.hidden) * sizeof(float)
+            : 3u * (uint64_t)config.moe_inter * config.hidden * sizeof(float);
+        uint64_t slots = slot_bytes
+            ? options->memory_limit_bytes / slot_bytes /
+              (uint64_t)sparse_layers : 0;
+        cap = slots > (uint64_t)config.n_experts
+            ? config.n_experts : (int)slots;
+        if (cap < 1) cap = 1;
+    }
+
+    InklingSegmentEngine *engine = calloc(1, sizeof(*engine));
+    if (!engine)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory opening Inkling Segment");
+    engine->layer_begin = options->layer_begin;
+    engine->layer_end = options->layer_end;
+    engine->context_tokens = options->context_tokens;
+    if (pthread_mutex_init(&engine->run_lock, NULL)) {
+        free(engine);
+        return coli_segment_adapter_error(error, error_size,
+                                           "cannot initialize Inkling Segment lock");
+    }
+    model_init_range(&engine->model, options->model_dir, cap, bits,
+                     (int)options->layer_begin, (int)options->layer_end,
+                     0, 0, 0);
+    for (int state = 0; state < 4; state++) {
+        free(engine->model.cs[state]);
+        engine->model.cs[state] = NULL;
+    }
+
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->struct_size = sizeof(*capabilities);
+    capabilities->abi_version = COLI_SEGMENT_ABI_VERSION;
+    capabilities->flags = COLI_SEGMENT_CAP_SNAPSHOT |
+                          COLI_SEGMENT_CAP_RANGE_NATIVE |
+                          COLI_SEGMENT_CAP_MULTI_SESSION |
+                          COLI_SEGMENT_CAP_CPU;
+    coli_segment_capability_string(capabilities->engine_id,
+                                   sizeof(capabilities->engine_id), "inkling");
+    coli_segment_capability_string(capabilities->state_schema,
+                                   sizeof(capabilities->state_schema),
+                                   "inkling/kv-ring-conv-f32-v1");
+    snprintf(capabilities->numeric_class,
+             sizeof(capabilities->numeric_class),
+             "inkling/expert-q%d/f32/cpu-v1", bits);
+    capabilities->state_dtype = COLI_SEGMENT_DTYPE_F32;
+    capabilities->state_width = (uint32_t)config.hidden;
+    capabilities->max_batch_rows = 128;
+    capabilities->max_context_tokens = options->context_tokens;
+    capabilities->num_layers = (uint32_t)config.n_layers;
+    *engine_impl = engine;
+    return 0;
+}
+
+static void inkling_segment_engine_destroy(void *engine_impl) {
+    InklingSegmentEngine *engine = (InklingSegmentEngine *)engine_impl;
+    if (!engine) return;
+    inkling_segment_model_destroy(engine);
+    pthread_mutex_destroy(&engine->run_lock);
+    free(engine);
+}
+
+static void inkling_segment_session_free(InklingSegmentSession *session) {
+    if (!session) return;
+    if (session->engine) {
+        for (uint32_t layer = session->engine->layer_begin;
+             layer < session->engine->layer_end; layer++) {
+            free(session->K ? session->K[layer] : NULL);
+            free(session->V ? session->V[layer] : NULL);
+            for (int state = 0; state < 4; state++)
+                free(session->cs[state] ? session->cs[state][layer] : NULL);
+        }
+    }
+    free(session->K); free(session->V);
+    for (int state = 0; state < 4; state++) free(session->cs[state]);
+    free(session);
+}
+
+static int inkling_segment_session_create(
+    void *engine_impl, void **session_impl,
+    const ColiSegmentSessionOptions *options, char *error, size_t error_size) {
+    InklingSegmentEngine *engine = (InklingSegmentEngine *)engine_impl;
+    if (!engine || !session_impl || !options)
+        return coli_segment_adapter_error(error, error_size,
+                                           "invalid Inkling Segment session");
+    *session_impl = NULL;
+    InklingSegmentSession *session = calloc(1, sizeof(*session));
+    if (!session)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory creating Inkling session");
+    session->engine = engine;
+    session->context_tokens = options->context_tokens;
+    size_t layers = (size_t)engine->model.c.n_layers;
+    session->K = calloc(layers, sizeof(*session->K));
+    session->V = calloc(layers, sizeof(*session->V));
+    for (int state = 0; state < 4; state++)
+        session->cs[state] = calloc(layers, sizeof(*session->cs[state]));
+    if (!session->K || !session->V || !session->cs[0] || !session->cs[1] ||
+        !session->cs[2] || !session->cs[3]) goto oom;
+
+    Cfg *config = &engine->model.c;
+    uint64_t state_bytes = 0;
+    for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+         layer++) {
+        size_t cells;
+        int kvdim = L_KV(config, layer) * L_HD(config, layer);
+        int rows = kv_ring_rows(config, (int)layer,
+                                (int)options->context_tokens);
+        if (coli_segment_size_mul((size_t)L_KV(config, layer),
+                                  (size_t)rows, &cells) ||
+            coli_segment_size_mul(cells, (size_t)L_HD(config, layer),
+                                  &cells)) goto oom;
+        session->K[layer] = calloc(cells, sizeof(float));
+        session->V[layer] = calloc(cells, sizeof(float));
+        state_bytes += 2u * (uint64_t)cells * sizeof(float);
+        for (int state = 0; state < 4; state++) {
+            int width = state < 2 ? kvdim : config->hidden;
+            if (coli_segment_size_mul((size_t)width,
+                                      (size_t)(config->conv_k - 1),
+                                      &cells)) goto oom;
+            session->cs[state][layer] = calloc(cells, sizeof(float));
+            state_bytes += (uint64_t)cells * sizeof(float);
+        }
+        if (!session->K[layer] || !session->V[layer] ||
+            !session->cs[0][layer] || !session->cs[1][layer] ||
+            !session->cs[2][layer] || !session->cs[3][layer]) goto oom;
+    }
+    if (options->memory_limit_bytes &&
+        state_bytes > options->memory_limit_bytes) {
+        inkling_segment_session_free(session);
+        return coli_segment_adapter_error(error, error_size,
+                                           "Inkling session state exceeds memory limit");
+    }
+    *session_impl = session;
+    return 0;
+
+oom:
+    inkling_segment_session_free(session);
+    return coli_segment_adapter_error(error, error_size,
+                                       "out of memory allocating Inkling state");
+}
+
+static void inkling_segment_session_destroy(void *session_impl) {
+    inkling_segment_session_free((InklingSegmentSession *)session_impl);
+}
+
+static int inkling_segment_session_run(void *session_impl,
+                                       const ColiSegmentRunRequest *request,
+                                       char *error, size_t error_size) {
+    InklingSegmentSession *session = (InklingSegmentSession *)session_impl;
+    if (!session || !request || request->position != session->position)
+        return coli_segment_adapter_error(
+            error, error_size, "Inkling Segment requires contiguous positions");
+    if (request->should_cancel &&
+        request->should_cancel(request->cancel_user_data))
+        return coli_segment_adapter_error(error, error_size,
+                                           "Inkling Segment run cancelled");
+    InklingSegmentEngine *engine = session->engine;
+    if (request->output != request->input)
+        memcpy(request->output, request->input, request->input_bytes);
+    pthread_mutex_lock(&engine->run_lock);
+    Model *model = &engine->model;
+    model->K = session->K; model->V = session->V;
+    for (int state = 0; state < 4; state++) model->cs[state] = session->cs[state];
+    model->max_t = (int)session->context_tokens;
+    model->kv_len = (int)session->position;
+    inkling_layers_forward_range(model, (float *)request->output,
+                                  (int)request->rows, (int)request->position,
+                                  (int)engine->layer_begin,
+                                  (int)engine->layer_end);
+    model->K = NULL; model->V = NULL;
+    for (int state = 0; state < 4; state++) model->cs[state] = NULL;
+    model->max_t = 0; model->kv_len = 0;
+    pthread_mutex_unlock(&engine->run_lock);
+    session->position += request->rows;
+    return 0;
+}
+
+static int inkling_segment_spans(
+    InklingSegmentSession *session, uint32_t position,
+    ColiSegmentStateSpan **spans_output, size_t *count_output,
+    char *error, size_t error_size) {
+    Cfg *config = &session->engine->model.c;
+    size_t capacity = 0;
+    for (uint32_t layer = session->engine->layer_begin;
+         layer < session->engine->layer_end; layer++)
+        capacity += (size_t)(2 * L_KV(config, layer) + 4);
+    ColiSegmentStateSpan *spans = capacity
+        ? calloc(capacity, sizeof(*spans)) : NULL;
+    if (capacity && !spans)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory describing Inkling state");
+    size_t count = 0;
+    for (uint32_t layer = session->engine->layer_begin;
+         layer < session->engine->layer_end; layer++) {
+        int kv = L_KV(config, layer), hd = L_HD(config, layer);
+        int rows = kv_ring_rows(config, (int)layer,
+                                (int)session->context_tokens);
+        size_t live_rows = config->local[layer] ? (size_t)rows : position;
+        size_t stride = (size_t)rows * hd;
+        size_t row_bytes = live_rows * hd * sizeof(float);
+        for (int which = 0; which < 2; which++) {
+            float *state = which ? session->V[layer] : session->K[layer];
+            for (int head = 0; head < kv; head++)
+                spans[count++] = (ColiSegmentStateSpan){
+                    state + (size_t)head * stride, row_bytes};
+        }
+        int kvdim = kv * hd;
+        for (int state = 0; state < 4; state++) {
+            int width = state < 2 ? kvdim : config->hidden;
+            spans[count++] = (ColiSegmentStateSpan){
+                session->cs[state][layer],
+                (size_t)width * (config->conv_k - 1) * sizeof(float)};
+        }
+    }
+    *spans_output = spans; *count_output = count;
+    return 0;
+}
+
+static int inkling_segment_session_snapshot(
+    void *session_impl, ColiSegmentWriteFn write_fn, void *write_user_data,
+    char *error, size_t error_size) {
+    InklingSegmentSession *session = (InklingSegmentSession *)session_impl;
+    ColiSegmentStateSpan *spans = NULL;
+    size_t count = 0, payload_bytes;
+    if (!session || inkling_segment_spans(session, session->position, &spans,
+                                          &count, error, error_size))
+        return -1;
+    if (coli_segment_spans_size(spans, count, &payload_bytes)) {
+        free(spans);
+        return coli_segment_adapter_error(error, error_size,
+                                           "Inkling snapshot size overflow");
+    }
+    ColiSegmentSnapshotHeader header;
+    coli_segment_snapshot_header_init(
+        &header, "inkling", session->engine->layer_begin,
+        session->engine->layer_end, session->context_tokens, session->position,
+        payload_bytes, coli_segment_spans_hash(spans, count));
+    int result = coli_segment_stream_write(
+        write_fn, write_user_data, &header, sizeof(header), error, error_size);
+    if (!result)
+        result = coli_segment_spans_write(spans, count, write_fn,
+                                          write_user_data, error, error_size);
+    free(spans);
+    return result;
+}
+
+static int inkling_segment_session_restore(
+    void *session_impl, ColiSegmentReadFn read_fn, void *read_user_data,
+    char *error, size_t error_size) {
+    InklingSegmentSession *session = (InklingSegmentSession *)session_impl;
+    ColiSegmentSnapshotHeader header;
+    if (!session || coli_segment_stream_read(read_fn, read_user_data, &header,
+                                             sizeof(header), error, error_size))
+        return -1;
+    ColiSegmentStateSpan *spans = NULL;
+    size_t count = 0, payload_bytes;
+    if (inkling_segment_spans(session, header.position, &spans, &count,
+                              error, error_size)) return -1;
+    if (coli_segment_spans_size(spans, count, &payload_bytes) ||
+        coli_segment_snapshot_header_valid(
+            &header, "inkling", session->engine->layer_begin,
+            session->engine->layer_end, session->context_tokens,
+            payload_bytes, error, error_size)) {
+        free(spans); return -1;
+    }
+    int result = coli_segment_spans_restore(
+        spans, count, header.payload_hash, read_fn, read_user_data,
+        error, error_size);
+    free(spans);
+    if (!result) session->position = header.position;
+    return result;
+}
+
+static const ColiSegmentAdapter inkling_segment_adapter = {
+    sizeof(ColiSegmentAdapter), COLI_SEGMENT_ABI_VERSION, "inkling",
+    inkling_segment_engine_open, inkling_segment_engine_destroy,
+    inkling_segment_session_create, inkling_segment_session_destroy,
+    inkling_segment_session_run, inkling_segment_session_snapshot,
+    inkling_segment_session_restore, {0}
+};
+
+int coli_inkling_segment_adapter_register(void) {
+    return coli_segment_adapter_register(&inkling_segment_adapter);
+}
+#endif /* COLI_SEGMENT_ADAPTER */
+
+#ifdef COLI_EDGE_ADAPTER
+/* ---------- engine-owned model Edge adapter --------------------------- */
+
+typedef struct {
+    Model model;
+    Tok tokenizer;
+} InklingEdgeEngine;
+
+static void inkling_edge_wt_destroy(Wt *weight) {
+    if (!weight) return;
+    free(weight->f); free(weight->h); free(weight->q4); free(weight->qs);
+    memset(weight, 0, sizeof(*weight));
+}
+
+static uint64_t inkling_edge_wt_bytes(const Wt *weight, uint64_t rows,
+                                      uint64_t columns) {
+    if (weight->f) return rows * columns * sizeof(float);
+    if (weight->h) return rows * columns * sizeof(uint16_t);
+    if (!weight->q4) return 0;
+    uint64_t scales = weight->qbits == 4 && weight->gs > 0
+        ? rows * ((columns + (uint64_t)weight->gs - 1u) /
+                  (uint64_t)weight->gs)
+        : rows;
+    return (uint64_t)weight->qn + scales * sizeof(float);
+}
+
+static void inkling_edge_engine_destroy(void *engine_impl) {
+    InklingEdgeEngine *engine = (InklingEdgeEngine *)engine_impl;
+    if (!engine) return;
+    inkling_edge_wt_destroy(&engine->model.embed);
+    inkling_edge_wt_destroy(&engine->model.lm_head);
+    free(engine->model.embed_norm); free(engine->model.final_norm);
+    st_destroy(&engine->model.Sq); st_destroy(&engine->model.S);
+    tok_free(&engine->tokenizer);
+    free(engine);
+}
+
+static int inkling_edge_engine_open(
+    void **engine_impl, ColiEdgeCapabilities *capabilities,
+    const ColiEdgeEngineOptions *options, char *error, size_t error_size) {
+    if (!engine_impl || !capabilities || !options)
+        return coli_edge_adapter_error(error, error_size,
+                                       "invalid Inkling Edge open");
+    *engine_impl = NULL;
+    if (options->backend_mask &&
+        (options->backend_mask & ~COLI_EDGE_CAP_CPU))
+        return coli_edge_adapter_error(error, error_size,
+                                       "Inkling Edge supports CPU only");
+    InklingEdgeEngine *engine = calloc(1, sizeof(*engine));
+    if (!engine)
+        return coli_edge_adapter_error(error, error_size,
+                                       "out of memory opening Inkling Edge");
+    Model *model = &engine->model;
+    load_cfg(&model->c, options->model_dir);
+    st_init(&model->S, options->model_dir);
+    char quantized_dir[4096];
+    snprintf(quantized_dir, sizeof(quantized_dir), "%s/dense-int4g64",
+             options->model_dir);
+    const char *disable_quantized = getenv("INK_DENSE_Q4");
+    struct stat quantized_stat;
+    if (!(disable_quantized && *disable_quantized == '0') &&
+        stat(quantized_dir, &quantized_stat) == 0 &&
+        S_ISDIR(quantized_stat.st_mode)) {
+        st_init(&model->Sq, quantized_dir);
+        model->has_q = model->Sq.n > 0;
+    }
+    model->embed = load_w(model, "model.embed_tokens.weight", 0);
+    model->embed_norm = st_has(&model->S, "model.embed_norm.weight")
+        ? load_t(model, "model.embed_norm.weight") : NULL;
+    model->final_norm = load_t(model, "model.norm.weight");
+    model->lm_head = load_w(model, "lm_head.weight", 1);
+    char tokenizer_path[4096];
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
+             options->model_dir);
+    tok_load(&engine->tokenizer, tokenizer_path);
+
+    Cfg *config = &model->c;
+    uint64_t resident = inkling_edge_wt_bytes(
+        &model->embed, (uint64_t)config->vocab, (uint64_t)config->hidden);
+    resident += inkling_edge_wt_bytes(
+        &model->lm_head, (uint64_t)config->vocab, (uint64_t)config->hidden);
+    resident += (uint64_t)config->hidden * sizeof(float);
+    if (model->embed_norm)
+        resident += (uint64_t)config->hidden * sizeof(float);
+    if (options->memory_limit_bytes && resident > options->memory_limit_bytes) {
+        inkling_edge_engine_destroy(engine);
+        return coli_edge_adapter_error(error, error_size,
+                                       "Inkling Edge exceeds memory limit");
+    }
+    int bits = getenv("INK_SEGMENT_BITS")
+        ? atoi(getenv("INK_SEGMENT_BITS")) : 0;
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->struct_size = sizeof(*capabilities);
+    capabilities->abi_version = COLI_EDGE_ABI_VERSION;
+    capabilities->flags = COLI_EDGE_CAP_TOKENIZE |
+                          COLI_EDGE_CAP_DETOKENIZE |
+                          COLI_EDGE_CAP_GREEDY | COLI_EDGE_CAP_LOGITS |
+                          COLI_EDGE_CAP_CPU;
+    coli_edge_capability_string(capabilities->engine_id,
+                                sizeof(capabilities->engine_id), "inkling");
+    coli_edge_capability_string(capabilities->state_schema,
+                                sizeof(capabilities->state_schema),
+                                "inkling/kv-ring-conv-f32-v1");
+    snprintf(capabilities->numeric_class,
+             sizeof(capabilities->numeric_class),
+             "inkling/expert-q%d/f32/cpu-v1", bits);
+    coli_edge_capability_string(capabilities->tokenizer_class,
+                                sizeof(capabilities->tokenizer_class),
+                                "inkling/o200k-byte-bpe-v1");
+    capabilities->state_dtype = COLI_EDGE_DTYPE_F32;
+    capabilities->state_width = (uint32_t)config->hidden;
+    capabilities->vocab_size = (uint32_t)config->unpad_vocab;
+    capabilities->max_batch_rows = 128;
+    capabilities->max_context_tokens = UINT32_MAX;
+    capabilities->num_layers = (uint32_t)config->n_layers;
+    capabilities->bos_token_id = -1;
+    capabilities->eos_token_id = config->eos;
+    capabilities->resident_bytes = resident;
+    *engine_impl = engine;
+    return 0;
+}
+
+static int inkling_edge_tokenize(
+    void *engine_impl, const char *text, size_t text_bytes,
+    int32_t *token_ids, size_t token_capacity, size_t *token_count,
+    char *error, size_t error_size) {
+    InklingEdgeEngine *engine = (InklingEdgeEngine *)engine_impl;
+    return coli_edge_tok_tokenize(&engine->tokenizer, text, text_bytes,
+                                  token_ids, token_capacity, token_count,
+                                  error, error_size);
+}
+
+static int inkling_edge_detokenize(
+    void *engine_impl, const int32_t *token_ids, size_t token_count,
+    char *text, size_t text_capacity, size_t *text_bytes,
+    char *error, size_t error_size) {
+    InklingEdgeEngine *engine = (InklingEdgeEngine *)engine_impl;
+    return coli_edge_tok_detokenize(&engine->tokenizer, token_ids, token_count,
+                                    text, text_capacity, text_bytes,
+                                    error, error_size);
+}
+
+static int inkling_edge_embed(void *engine_impl,
+                              const ColiEdgeEmbedRequest *request,
+                              char *error, size_t error_size) {
+    InklingEdgeEngine *engine = (InklingEdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *output = (float *)request->output;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        int token = request->token_ids[row];
+        if (token < 0 || token >= config->vocab)
+            return coli_edge_adapter_error(error, error_size,
+                                           "Inkling token ID is out of range");
+        float *state = output + (size_t)row * config->hidden;
+        wt_row_f32(engine->model.embed, (int64_t)token * config->hidden,
+                   state, config->hidden);
+        if (engine->model.embed_norm)
+            rmsnorm_row(state, state, engine->model.embed_norm,
+                        config->hidden, config->eps);
+    }
+    return 0;
+}
+
+static int inkling_edge_select(void *engine_impl,
+                               const ColiEdgeSelectRequest *request,
+                               char *error, size_t error_size) {
+    InklingEdgeEngine *engine = (InklingEdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *normalized = falloc(config->hidden);
+    float *logits = falloc(config->unpad_vocab);
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        if (request->should_cancel &&
+            request->should_cancel(request->cancel_user_data)) {
+            free(logits); free(normalized);
+            return coli_edge_adapter_error(error, error_size,
+                                           "Inkling Edge selection cancelled");
+        }
+        rmsnorm_row(normalized, input + (size_t)row * config->hidden,
+                    engine->model.final_norm, config->hidden, config->eps);
+        for (int item = 0; item < config->hidden; item++)
+            normalized[item] /= config->mup;
+        matmul_w(logits, normalized, engine->model.lm_head,
+                 1, config->hidden, config->unpad_vocab);
+        if (coli_edge_argmax(logits, (uint32_t)config->unpad_vocab,
+                            &request->token_ids[row],
+                            request->scores ? &request->scores[row] : NULL)) {
+            free(logits); free(normalized);
+            return coli_edge_adapter_error(error, error_size,
+                                           "Inkling Edge head failed");
+        }
+    }
+    free(logits); free(normalized);
+    return 0;
+}
+
+static int inkling_edge_logits(void *engine_impl,
+                               const ColiEdgeLogitsRequest *request,
+                               char *error, size_t error_size) {
+    InklingEdgeEngine *engine = (InklingEdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *normalized = falloc(config->hidden);
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        if (request->should_cancel &&
+            request->should_cancel(request->cancel_user_data)) {
+            free(normalized);
+            return coli_edge_adapter_error(error, error_size,
+                                           "Inkling Edge logits cancelled");
+        }
+        rmsnorm_row(normalized, input + (size_t)row * config->hidden,
+                    engine->model.final_norm, config->hidden, config->eps);
+        for (int item = 0; item < config->hidden; item++)
+            normalized[item] /= config->mup;
+        matmul_w(request->logits + (size_t)row * config->unpad_vocab,
+                 normalized, engine->model.lm_head,
+                 1, config->hidden, config->unpad_vocab);
+    }
+    free(normalized);
+    return 0;
+}
+
+static const ColiEdgeAdapter inkling_edge_adapter = {
+    sizeof(ColiEdgeAdapter), COLI_EDGE_ABI_VERSION, "inkling",
+    inkling_edge_engine_open, inkling_edge_engine_destroy,
+    inkling_edge_tokenize, inkling_edge_detokenize,
+    inkling_edge_embed, inkling_edge_select, inkling_edge_logits, {0}
+};
+
+int coli_inkling_edge_adapter_register(void) {
+    return coli_edge_adapter_register(&inkling_edge_adapter);
+}
+#endif /* COLI_EDGE_ADAPTER */

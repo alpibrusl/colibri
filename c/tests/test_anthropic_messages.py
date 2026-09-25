@@ -11,6 +11,7 @@ is the reference client from the issue — not merely that the handler returns 2
   - the Anthropic error envelope, which is not the OpenAI one.
 """
 import json
+import os
 import re
 import threading
 import unittest
@@ -19,7 +20,8 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from openai_server import (APIServer, anthropic_to_openai, anthropic_tools, APIError,
-                           render_chat, render_chat_inkling, render_chat_kimi, render_chat_v4)
+                           render_chat, render_chat_glm53, render_chat_inkling,
+                           render_chat_kimi, render_chat_v4)
 
 
 class FakeEngine:
@@ -30,7 +32,8 @@ class FakeEngine:
         self.prompts = []
 
     def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None, grammar=None, stopped=None, on_accept=None):
+                 cancelled=None, grammar=None, stopped=None, on_accept=None,
+                 on_tool=None):
         self.prompts.append(prompt)
         self.emitted = 0
         for chunk in self.script:
@@ -154,6 +157,24 @@ class MessagesHTTPTest(unittest.TestCase):
         self.assertEqual(payload["usage"], {"input_tokens": 11, "output_tokens": 3})
         self.assertTrue(payload["id"].startswith("msg_"))
 
+    def test_trailing_assistant_turn_follows_shared_continuation_switch(self):
+        """Off preserves the existing cue; on continues the turn on both endpoints."""
+        messages = [{"role": "user", "content": "The capital of France is?"},
+                    {"role": "assistant", "content": "The capital is"}]
+        with patch("openai_server.ARCH", "glm53"):
+            with patch.dict(os.environ, {"COLI_CONTINUE_ASSISTANT": "0"}):
+                with self.post(self.base_body(messages=messages)) as response:
+                    self.assertEqual(response.status, 200)
+                self.assertEqual(self.engine.prompts[-1], render_chat_glm53(messages))
+                self.assertTrue(self.engine.prompts[-1].endswith("<|assistant|><think>"))
+
+            with patch.dict(os.environ, {"COLI_CONTINUE_ASSISTANT": "1"}):
+                with self.post(self.base_body(messages=messages)) as response:
+                    self.assertEqual(response.status, 200)
+                self.assertEqual(self.engine.prompts[-1],
+                                 render_chat_glm53(messages, add_generation_prompt=False))
+                self.assertTrue(self.engine.prompts[-1].endswith("The capital is"))
+
     def test_each_architecture_receives_its_native_chat_prompt(self):
         messages = [{"role": "user", "content": "Hi"}]
         renderers = {
@@ -168,15 +189,29 @@ class MessagesHTTPTest(unittest.TestCase):
                 self.assertEqual(self.engine.prompts[-1], renderer(messages))
 
     def test_non_glm_architectures_reject_tools_before_generation(self):
+        # kimi left this list in #1143: K3 tool calling is wired up now.
         body = self.base_body(tools=[{"name": "f", "input_schema": {"type": "object"}}])
-        for arch in ("inkling", "kimi"):
+        for arch in ("inkling",):
             with self.subTest(arch=arch), patch("openai_server.ARCH", arch):
                 before = len(self.engine.prompts)
                 with self.assertRaises(HTTPError) as caught:
                     self.post(body)
+                self.addCleanup(caught.exception.close)
                 self.assertEqual(caught.exception.code, 400)
                 self.assertIn("tool", json.load(caught.exception)["error"]["message"].lower())
                 self.assertEqual(len(self.engine.prompts), before)
+
+    def test_kimi_renders_tools_as_k3chat1_records(self):
+        body = self.base_body(tools=[{"name": "f", "input_schema": {
+            "type": "object", "properties": {"x": {"type": "string"}}}}])
+        with patch("openai_server.ARCH", "kimi"):
+            with self.post(body) as response:
+                self.assertEqual(response.status, 200)
+        prompt = self.engine.prompts[-1]
+        self.assertIn("K3CHAT1", prompt)
+        self.assertIn("tool-declare# Tools", prompt)
+        self.assertIn('"name":"f"', prompt)
+        self.assertNotIn("<|open|>", prompt)   # records, never raw XTML
 
     def test_deepseek_v4_renders_tools_as_dsml_block(self):
         body = self.base_body(tools=[{"name": "f", "input_schema": {
@@ -197,11 +232,13 @@ class MessagesHTTPTest(unittest.TestCase):
             self.assertEqual(response.status, 200)
         with self.assertRaises(HTTPError) as caught:
             self.post(self.base_body(), {"x-api-key": "wrong"})
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 401)
 
     def test_error_envelope_is_anthropic_shaped(self):
         with self.assertRaises(HTTPError) as caught:
             self.post({"model": "test-model", "messages": [{"role": "user", "content": "x"}]})
+        self.addCleanup(caught.exception.close)
         payload = json.load(caught.exception)
         self.assertEqual(payload["type"], "error")
         self.assertEqual(payload["error"]["type"], "invalid_request_error")
@@ -403,6 +440,7 @@ class MessagesHTTPTest(unittest.TestCase):
         for field, value in (("stop_sequences", ["STOP"]), ("top_k", 40)):
             with self.assertRaises(HTTPError) as caught:
                 self.post(self.base_body(**{field: value}))
+            self.addCleanup(caught.exception.close)
             self.assertEqual(caught.exception.code, 400)
             self.assertIn(field, json.load(caught.exception)["error"]["message"])
 
